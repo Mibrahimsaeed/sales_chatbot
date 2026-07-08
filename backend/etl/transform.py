@@ -1,0 +1,209 @@
+"""
+Splits the merged-by-WID rows into one list per star-schema table, matching
+app/database/models.py. Each function below owns exactly the columns that
+belong to its table — this is the enforcement point for "one table per
+business entity, not per sheet tab."
+"""
+
+
+def _num(v):
+    try:
+        return float(v) if v not in (None, "", "-") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wid(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def transform(src: dict) -> dict:
+    """src is the dict returned by etl.extract.extract_all().
+    Returns {"advisors": [...], "sales_funnel": [...], ...} ready for load.py.
+    """
+    advisors: dict[int, dict] = {}
+    sales_funnel: dict[int, dict] = {}
+    pipeline: dict[int, dict] = {}
+    attendance: dict[int, dict] = {}
+    performance: list[dict] = []
+    portfolio: dict[int, dict] = {}
+    bookings: dict[int, dict] = {}
+    calls: dict[int, dict] = {}
+
+    def ensure_advisor(wid_raw, name=None):
+        wid = _wid(wid_raw)
+        if wid is None:
+            return None
+        a = advisors.setdefault(wid, {"wid": wid})
+        if name:
+            a["name"] = name
+        return wid, a
+
+    # ---- sales_funnel + org columns on advisors (CCMC DATA MTD) ----
+    for row in src["ccmc_mtd"]:
+        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        if not res:
+            continue
+        wid, a = res
+        a.update({
+            "team": row.get("Team"), "bm": row.get("BM"), "zm": row.get("ZM"), "rm": row.get("RM"),
+            "company": row.get("Company"), "region": row.get("Region"), "office": row.get("Office"),
+        })
+        sales_funnel[wid] = {
+            "wid": wid,
+            "mtd_new_connect": _num(row.get("New Connect")),
+            "mtd_followup_connect": _num(row.get("Follow-up Connect")),
+            "mtd_cr": _num(row.get("CR")),
+            "mtd_new_meeting": _num(row.get("New Meeting")),
+            "mtd_followup_meeting": _num(row.get("Follow-up Meeting")),
+            "mtd_todo": _num(row.get("Todo")),
+            "mtd_booking_stored": _num(row.get("Booking Stored")),
+            "mtd_conversion": _num(row.get("Conversion")),
+        }
+
+    # ---- system-verified connect count layered onto sales_funnel (Connect Session) ----
+    for row in src.get("connect_session", []):
+        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        if not res:
+            continue
+        wid, _ = res
+        sales_funnel.setdefault(wid, {"wid": wid})
+        sales_funnel[wid]["system_connect"] = _num(row.get("Total Connect Through System"))
+
+    # ---- org hierarchy + leads (MasterSheet) ----
+    for row in src["master_sheet"]:
+        res = ensure_advisor(row.get("User ID"), row.get("Advisor Name"))
+        if not res:
+            continue
+        _, a = res
+        a.setdefault("company", row.get("Company"))
+        a.setdefault("region", row.get("Regional"))
+        a.setdefault("team", row.get("Teams"))
+        a["portfolio_lead"] = row.get("Portfolio Lead")
+        a["management_lead"] = row.get("Management Lead")
+
+    # ---- pipeline (P1 & Overdue) ----
+    for row in src["p1_overdue"]:
+        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        if not res:
+            continue
+        wid, _ = res
+        pipeline[wid] = {
+            "wid": wid,
+            "pipeline": _num(row.get("Pipeline")),
+            "overdue": _num(row.get("Total Overdue")),
+        }
+
+    # ---- attendance: biometric half ----
+    for row in src["biometric"]:
+        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        if not res:
+            continue
+        wid, _ = res
+        attendance.setdefault(wid, {"wid": wid})
+        attendance[wid].update({
+            "biometric_time": row.get("Time"),
+            "biometric_status": row.get("Comment"),
+            "biometric_mtd_ontime": _num(row.get("MTD On Time")),
+            "biometric_mtd_late": _num(row.get("MTD Late")),
+            "biometric_mtd_not_marked": _num(row.get("MTD Not Marked")),
+        })
+
+    # ---- attendance: login half ----
+    for row in src["login_report"]:
+        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        if not res:
+            continue
+        wid, _ = res
+        attendance.setdefault(wid, {"wid": wid})
+        attendance[wid].update({
+            "login_time": row.get("Login In Time"),
+            "login_status": row.get("Comment"),
+            "login_mtd_ontime": _num(row.get("MTD On Time")),
+            "login_mtd_late": _num(row.get("MTD Late")),
+        })
+
+    # ---- performance: one row per (wid, period) ----
+    def perf_rows(rows, period):
+        for row in rows:
+            res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+            if not res:
+                continue
+            wid, _ = res
+            performance.append({
+                "wid": wid, "period": period,
+                "target": _num(row.get("Target")),
+                "cleared": _num(row.get("Cleared")),
+                "pct": _num(row.get("%")),
+            })
+
+    perf_rows(src["mtd_perf"], "MTD")
+    perf_rows(src["ytd_perf"], "YTD")
+    perf_rows(src["three_m_perf"], "3M")
+
+    # ---- portfolio ----
+    for row in src["portfolio"]:
+        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        if not res:
+            continue
+        wid, _ = res
+        portfolio[wid] = {
+            "wid": wid,
+            "value": _num(row.get("Portfolio")),
+            "returned": _num(row.get("Returned")),
+            "retention_pct": _num(row.get("Retention %")),
+        }
+
+    # ---- bookings (NPR) ----
+    for row in src["npr"]:
+        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        if not res:
+            continue
+        wid, _ = res
+        bookings[wid] = {
+            "wid": wid,
+            "confirmed": _num(row.get("Confirmed")),
+            "expected": _num(row.get("Expected")),
+            "token": _num(row.get("Token")),
+        }
+
+    # ---- calls (Answered Calls) ----
+    for row in src["answered_calls"]:
+        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        if not res:
+            continue
+        wid, _ = res
+        calls[wid] = {
+            "wid": wid,
+            "answered_calls_mtd": _num(row.get("Answered Calls MTD")),
+            "answered_calls_daily": _num(row.get("Answered Calls Daily")),
+            "connects_mtd": _num(row.get("Connects MTD")),
+        }
+
+    # ---- team_targets (Target Achievement) — standalone, not keyed by wid ----
+    team_targets = []
+    for row in src.get("target_achievement", []):
+        team = row.get("Team")
+        if not team:
+            continue
+        team_targets.append({
+            "team": team,
+            "target": _num(row.get("Target")),
+            "achieved": _num(row.get("Total Achieved")),
+            "achievement_pct": _num(row.get("Achievement %")),
+        })
+
+    return {
+        "advisors": [a for a in advisors.values() if a.get("name")],
+        "sales_funnel": list(sales_funnel.values()),
+        "pipeline": list(pipeline.values()),
+        "attendance": list(attendance.values()),
+        "performance": performance,
+        "portfolio": list(portfolio.values()),
+        "bookings": list(bookings.values()),
+        "calls": list(calls.values()),
+        "team_targets": team_targets,
+    }
