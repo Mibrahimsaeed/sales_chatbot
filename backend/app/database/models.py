@@ -106,7 +106,13 @@ class Performance(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     wid = Column(Integer, ForeignKey("advisors.wid"), nullable=False, index=True)
-    period = Column(Enum(PerformancePeriod), nullable=False)
+    period = Column(
+    Enum(
+        PerformancePeriod,
+        values_callable=lambda enum_cls: [e.value for e in enum_cls],
+    ),
+    nullable=False,
+)
     target = Column(Float, default=0)
     cleared = Column(Float, default=0)
     pct = Column(Float, default=0)

@@ -15,8 +15,8 @@ def fetch_tab(spreadsheet_id: str, tab_name: str) -> list[dict]:
 
 
 def extract_all() -> dict:
-    ccmc = settings.ccmc_spreadsheet_id
-    bio = settings.biometric_spreadsheet_id
+    ccmc = settings.ccmc_sheet_id
+    bio = settings.biometric_sheet_id
     return {
         "master_sheet": fetch_tab(ccmc, "MasterSheet"),
         "ccmc_mtd": fetch_tab(ccmc, "CCMC DATA MTD"),

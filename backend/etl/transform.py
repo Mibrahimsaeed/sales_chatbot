@@ -4,6 +4,7 @@ app/database/models.py. Each function below owns exactly the columns that
 belong to its table — this is the enforcement point for "one table per
 business entity, not per sheet tab."
 """
+from app.database.models import PerformancePeriod
 
 
 def _num(v):
@@ -127,22 +128,29 @@ def transform(src: dict) -> dict:
         })
 
     # ---- performance: one row per (wid, period) ----
-    def perf_rows(rows, period):
+    # ---- performance: one row per (wid, period) ----
+    def perf_rows(rows, period: PerformancePeriod):
         for row in rows:
             res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
             if not res:
                 continue
+
             wid, _ = res
+
             performance.append({
-                "wid": wid, "period": period,
+                "wid": wid,
+                "period": period,
                 "target": _num(row.get("Target")),
                 "cleared": _num(row.get("Cleared")),
                 "pct": _num(row.get("%")),
             })
 
-    perf_rows(src["mtd_perf"], "MTD")
-    perf_rows(src["ytd_perf"], "YTD")
-    perf_rows(src["three_m_perf"], "3M")
+    perf_rows(src["mtd_perf"], PerformancePeriod.MTD)
+    perf_rows(src["ytd_perf"], PerformancePeriod.YTD)
+    perf_rows(src["three_m_perf"], PerformancePeriod.THREE_M)
+    
+
+
 
     # ---- portfolio ----
     for row in src["portfolio"]:
