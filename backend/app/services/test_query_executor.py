@@ -1,5 +1,5 @@
 from app.services.query_executor import execute_query
-from app.services.query_planner import QueryPlan
+from app.services.test_query_planner import QueryPlan
 
 
 class FakeDB:
