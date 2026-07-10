@@ -1,30 +1,111 @@
 from sqlalchemy.orm import Session
-from app.llm.intent_detector import classify_intent
-from app.services import advisor_service, team_service, leaderboard_service
-from app.core.exception import NotFoundError, UnsupportedMetricError
+
+from app.llm.nlu_pipeline import resolve_intent
+from app.llm.intent_detector import find_missing_slots
+from app.llm.response_formatter import (
+    format_response,
+    format_clarification_reply
+)
+
+from app.services.query_planner import build_query_plan
+from app.services.query_executor import execute_query
+
+from app.database.models import ChatLog
 
 
-def handle_chat_message(db: Session, message: str) -> dict:
-    intent = classify_intent(message)
+def handle_chat_message(
+    db: Session,
+    message: str,
+    session_id: str | None = None
+):
 
-    if intent["type"] == "advisor_lookup":
-        advisor = advisor_service.find_advisor_by_name(db, intent["name"])
-        if not advisor:
-            return {"type": "not_found", "data": None}
-        return {"type": "advisor", "data": advisor}
+    # ----------------------------
+    # 1. NLU Processing
+    # ----------------------------
+    intent_result = resolve_intent(
+        text=message,
+        db=db
+    )
 
-    if intent["type"] == "team_summary":
-        try:
-            summary = team_service.get_team_summary(db, intent["team"])
-        except NotFoundError:
-            return {"type": "not_found", "data": None}
-        return {"type": "team", "data": summary}
 
-    if intent["type"] == "leaderboard":
-        try:
-            rows = leaderboard_service.get_leaderboard(db, intent["metric"])
-        except UnsupportedMetricError:
-            return {"type": "unknown", "data": None}
-        return {"type": "leaderboard", "data": rows}
+    # ----------------------------
+    # 2. Check Missing Information
+    # ----------------------------
+    missing_slots = find_missing_slots(
+        intent_result
+    )
 
-    return {"type": "unknown", "data": None}
+
+    if missing_slots:
+
+        response = format_clarification_reply(
+            intent=intent_result.intent,
+            missing_slots=missing_slots
+        )
+
+
+    else:
+
+        # ----------------------------
+        # 3. Build Query Plan
+        # ----------------------------
+        plan = build_query_plan(
+            intent_result
+        )
+
+
+        # ----------------------------
+        # 4. Execute Query
+        # ----------------------------
+        result = execute_query(
+            db=db,
+            plan=plan
+        )
+
+
+        # Add metadata needed by formatter
+        result["intent"] = intent_result.intent
+        result["metric"] = (
+            intent_result.entities.get("metric")
+            if intent_result.entities
+            else None
+        )
+
+
+        # ----------------------------
+        # 5. Format Final Response
+        # ----------------------------
+        response = format_response(
+            result
+        )
+
+
+    # ----------------------------
+    # 6. Save Conversation Log
+    # ----------------------------
+    chat_log = ChatLog(
+        session_id=session_id,
+        user_message=message,
+        detected_intent=intent_result.intent,
+        confidence=intent_result.confidence,
+        used_llm_fallback=getattr(
+            intent_result,
+            "used_llm_fallback",
+            False
+        ),
+        response_type="text"
+    )
+
+    db.add(chat_log)
+    db.commit()
+
+
+    # ----------------------------
+    # 7. Return API Response
+    # ----------------------------
+    return {
+        "session_id": session_id,
+        "message": response,
+        "intent": intent_result.intent,
+        "confidence": intent_result.confidence
+    }

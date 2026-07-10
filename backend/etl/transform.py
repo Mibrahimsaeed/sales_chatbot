@@ -7,10 +7,25 @@ business entity, not per sheet tab."
 from app.database.models import PerformancePeriod
 
 
-def _num(v):
+def _num(value):
+    if value is None:
+        return 0.0
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    value = str(value).strip()
+
+    if value in ["-", "", "N/A", "nan"]:
+        return 0.0
+
+    # remove commas and percentage signs
+    value = value.replace(",", "")
+    value = value.replace("%", "")
+
     try:
-        return float(v) if v not in (None, "", "-") else 0.0
-    except (TypeError, ValueError):
+        return float(value)
+    except ValueError:
         return 0.0
 
 

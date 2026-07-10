@@ -52,6 +52,3 @@ def test_unknown_with_no_entities():
     result = classify_intent("asdkjalksjd nonsense query", {})
     assert result.intent == "unknown"
     assert result.confidence == 0.0
-
-
-    

@@ -1,22 +1,239 @@
+"""
+Fast, cheap, first-pass intent classification.
+
+This layer:
+- does NOT call any LLM
+- detects common business intents using rules
+- extracts/uses entities provided by entity_extractor
+- returns confidence so nlu_pipeline decides whether LLM fallback is needed
+"""
+
 import re
+from dataclasses import dataclass, field
 
 
-def classify_intent(text: str) -> dict:
-    q = text.lower()
+@dataclass
+class IntentResult:
+    intent: str
+    confidence: float
+    entities: dict = field(default_factory=dict)
+    missing_slots: list = field(default_factory=list)
+    used_llm_fallback: bool = False
 
-    if re.search(r"top.*(revenue|cleared|sale)", q):
-        return {"type": "leaderboard", "metric": "mtd_cleared"}
-    if re.search(r"top.*connect", q):
-        return {"type": "leaderboard", "metric": "mtd_new_connect"}
-    if re.search(r"(worst|most).*overdue", q):
-        return {"type": "leaderboard", "metric": "overdue"}
 
-    team_match = re.search(r"team\s+(.+)", q)
-    if team_match:
-        return {"type": "team_summary", "team": team_match.group(1).strip()}
+REQUIRED_SLOTS = {
+    "advisor_lookup": ["advisor_name"],
+    "team_summary": ["team"],
+    "company_summary": ["company"],
+    "leaderboard": ["metric"],
+    "attendance_check": [],
+    "greeting": [],
+    "help": [],
+    "unknown": [],
+}
 
-    cleaned = re.sub(r"tell me about|how is|show me|what about", "", text, flags=re.I).strip()
-    if len(cleaned) > 2:
-        return {"type": "advisor_lookup", "name": cleaned}
 
-    return {"type": "unknown"}
+def classify_intent(text: str, entities: dict) -> IntentResult:
+
+    q = text.lower().strip()
+
+
+    # ----------------------------
+    # Greeting
+    # ----------------------------
+    if re.search(r"^(hi|hello|hey|salam|assalam)\b", q):
+        return IntentResult(
+            intent="greeting",
+            confidence=1.0,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Help
+    # ----------------------------
+    if re.search(r"\b(help|what can you do|commands)\b", q):
+        return IntentResult(
+            intent="help",
+            confidence=1.0,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Attendance Queries
+    # ----------------------------
+    if re.search(
+        r"(late|not marked|absent|missing|missed|biometric|login|attendance)",
+        q
+    ):
+        return IntentResult(
+            intent="attendance_check",
+            confidence=0.9,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Leaderboard - Sales / Revenue
+    # Examples:
+    # who has highest sales
+    # top advisors by revenue
+    # best performer
+    # ----------------------------
+    if re.search(
+        r"(top|highest|best|maximum|most|who.*(highest|most|best)|rank|ranking)"
+        r".*(sales|sale|revenue|cleared|closed|performance)",
+        q
+    ):
+        entities.setdefault(
+            "metric",
+            "mtd_cleared"
+        )
+
+        return IntentResult(
+            intent="leaderboard",
+            confidence=0.9,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Leaderboard - Connects
+    # ----------------------------
+    if re.search(
+        r"(top|highest|best|most|who.*(highest|most|best))"
+        r".*(connect|connections|new connect)",
+        q
+    ):
+        entities.setdefault(
+            "metric",
+            "mtd_new_connect"
+        )
+
+        return IntentResult(
+            intent="leaderboard",
+            confidence=0.9,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Leaderboard - Overdue
+    # ----------------------------
+    if re.search(
+        r"(worst|highest|most|maximum|top)"
+        r".*(overdue|overdues)",
+        q
+    ):
+        entities.setdefault(
+            "metric",
+            "overdue"
+        )
+
+        return IntentResult(
+            intent="leaderboard",
+            confidence=0.9,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Company Summary
+    # ----------------------------
+    if (
+        entities.get("company")
+        and re.search(
+            r"\b(company|doing|performing|performance|how is)\b",
+            q
+        )
+    ):
+        return IntentResult(
+            intent="company_summary",
+            confidence=0.75,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Team Summary
+    # ----------------------------
+    if (
+        entities.get("team")
+        and re.search(
+            r"\b(team|group|department)\b",
+            q
+        )
+    ):
+        return IntentResult(
+            intent="team_summary",
+            confidence=0.75,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Advisor Lookup
+    # ----------------------------
+    if (
+        entities.get("advisor_name")
+        and entities.get("advisor_match_score", 1.0) >= 0.65
+    ):
+        return IntentResult(
+            intent="advisor_lookup",
+            confidence=0.7,
+            entities=entities
+        )
+
+
+    # Weak advisor match
+    if entities.get("advisor_name"):
+
+        return IntentResult(
+            intent="advisor_lookup",
+            confidence=0.4,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Unknown
+    # ----------------------------
+    return IntentResult(
+        intent="unknown",
+        confidence=0.0,
+        entities=entities
+    )
+
+
+
+def find_missing_slots(result: IntentResult) -> list[str]:
+
+    required = REQUIRED_SLOTS.get(
+        result.intent,
+        []
+    )
+
+    return [
+        slot
+        for slot in required
+        if not result.entities.get(slot)
+    ]
+
+
+
+# ----------------------------
+# Unit Tests (temporary)
+# Move these later to tests/llm/
+# ----------------------------
+
+def test_highest_sales_query():
+
+    result = classify_intent(
+        "who has highest sales",
+        {}
+    )
+
+    assert result.intent == "leaderboard"
+    assert result.entities["metric"] == "mtd_cleared"
+    assert result.confidence >= 0.85
