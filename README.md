@@ -129,3 +129,27 @@ sales-chatbot/
 │
 ├── .gitignore
 └── README.md
+
+
+
+
+
+<!-- # on time percentage(attentance- NO OF LEADS)
+# worksapp ki login (PERCENTAGE ATTENDANCE AND NO OF LATES)
+answered calls, meetings, CR, pipeline, target ach
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ -->

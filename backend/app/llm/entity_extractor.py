@@ -24,7 +24,12 @@ PERIOD_KEYWORDS = {
     "ytd": "YTD", "this year": "YTD", "year": "YTD",
     "3m": "3M", "quarter": "3M", "three month": "3M",
 }
-
+ATTENDANCE_STATUS_KEYWORDS = {
+    "not marked": "Not Marked",
+    "late": "Late",
+    "present": "Present",
+    "absent": "Absent",
+}
 
 def _refresh_cache(db: Session):
     now = time.time()
@@ -61,6 +66,10 @@ def extract_entities(text: str, db: Session) -> dict:
     _refresh_cache(db)
     q = text.lower()
     entities: dict = {}
+    for keyword, status in ATTENDANCE_STATUS_KEYWORDS.items():
+        if keyword in q:
+            entities["attendance_status"] = status
+            break
 
     for kw, period in PERIOD_KEYWORDS.items():
         if kw in q:
