@@ -29,7 +29,24 @@ from app.llm.entity_extractor import get_known_teams, get_known_companies
 from app.llm.query_ir import QueryIR, Subject
 
 _MATCH_FLOOR = 0.55
+_CONFIDENCE_FLOOR = 0.5     # below this, treat an LLM-supplied field as if it weren't provided
 _NON_METRIC_FILTER_FIELDS = {"team", "company", "advisor", "attendance_status"}
+_UNSUPPORTED_INTENTS = {
+    # "lookup" is intentionally handled by the pre-existing rule-based
+    # query_planner.py path (nlu_pipeline.py never routes a plain single-
+    # advisor lookup into the IR pipeline). If the LLM emits it anyway —
+    # e.g. for a compound query that also contains a lookup-shaped clause
+    # — the compiler has no lookup-specific query (it would otherwise
+    # silently treat it as a one-metric leaderboard, which is wrong:
+    # a lookup wants ALL of an advisor's fields, not a ranking by one).
+    "lookup": "lookup queries are answered through advisor search, not the metric compiler",
+    # "trend" needs the append-only monthly snapshot table described in
+    # the redesign's Phase 4 — Performance only stores the CURRENT row
+    # per period, so there is no "last month" to diff against yet.
+    # Silently running a snapshot query and calling it a trend would be a
+    # wrong answer, not a degraded one, so this is a hard reject.
+    "trend": "trend/period-over-period comparisons need historical snapshots not yet stored (Phase 4, not implemented)",
+}
 
 
 @dataclass
@@ -75,22 +92,36 @@ def _ground_subject(subject: Subject, db: Session) -> tuple[Subject, str | None]
 def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
     missing: list[str] = []
 
-    # ---- metric (sort/primary) ----
-    if ir.intent in ("leaderboard", "comparison", "filtered_list", "trend"):
+    if ir.intent in _UNSUPPORTED_INTENTS:
+        missing.append(f"unsupported_intent:{ir.intent}:{_UNSUPPORTED_INTENTS[ir.intent]}")
+        ir.missing = missing
+        return ValidationResult(ir=ir, missing=missing)
+
+    # ---- metric (sort/primary) — presence AND confidence floor ----
+    if ir.intent in ("leaderboard", "comparison", "filtered_list"):
         metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+        metric_confidence = ir.metric.confidence if ir.metric else 1.0
         if not metric_key:
             missing.append("metric")
         elif metric_key not in METRICS:
             missing.append(f"metric:{metric_key}")
+        elif metric_confidence < _CONFIDENCE_FLOOR:
+            # the field is present but the parser itself wasn't sure —
+            # per-field confidence (Part 5.1) means this is treated the
+            # same as "missing", not silently trusted.
+            missing.append(f"metric_low_confidence:{metric_key}")
         elif ir.subject_level not in METRICS[metric_key].bindings:
             # requested level has no resolver for this metric — fall back
             # to the metric's primary level rather than hard-failing,
             # mirroring the old query_planner.py behavior.
             ir.subject_level = METRICS[metric_key].primary_level
 
-    # ---- filters ----
+    # ---- filters — presence, validity, AND confidence floor ----
     grounded_filters = []
     for f in ir.filters:
+        if f.confidence < _CONFIDENCE_FLOOR:
+            missing.append(f"filter_low_confidence:{f.field}")
+            continue
         if f.field in _NON_METRIC_FILTER_FIELDS:
             grounded_filters.append(f)
             continue
@@ -103,6 +134,9 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
     # ---- subjects (comparisons / named entities) ----
     grounded_subjects = []
     for s in ir.subjects:
+        if s.match_confidence < _CONFIDENCE_FLOOR:
+            missing.append(f"subject_low_confidence:{s.type}:{s.value}")
+            continue
         grounded, problem = _ground_subject(s, db)
         if problem:
             missing.append(problem)
@@ -130,14 +164,24 @@ def build_targeted_clarification(missing: list[str]) -> str:
             asks.append("which metric you'd like (revenue, connects, achievement %, overdue, etc.)")
         elif item.startswith("metric:"):
             asks.append(f"'{item.split(':', 1)[1]}' isn't a metric I track")
+        elif item.startswith("metric_low_confidence:"):
+            asks.append(f"you meant '{item.split(':', 1)[1]}' as the metric — I wasn't confident enough to assume that")
         elif item.startswith("filter:"):
             asks.append(f"what you mean by '{item.split(':', 1)[1]}'")
+        elif item.startswith("filter_low_confidence:"):
+            asks.append(f"the '{item.split(':', 1)[1]}' condition — I wasn't confident I understood it correctly")
+        elif item.startswith("subject_low_confidence:"):
+            _, s_type, s_value = item.split(":", 2)
+            asks.append(f"which {s_type} you meant by '{s_value}' — I wasn't confident enough to assume that")
         elif item.startswith("subject:team:"):
             asks.append(f"which team you meant by '{item.split(':', 2)[2]}'")
         elif item.startswith("subject:company:"):
             asks.append(f"which company you meant by '{item.split(':', 2)[2]}'")
         elif item == "subjects":
             asks.append("which two (or more) things you'd like to compare")
+        elif item.startswith("unsupported_intent:"):
+            _, intent, reason = item.split(":", 2)
+            asks.append(f"I can't answer a '{intent}'-style question yet ({reason})")
         else:
             asks.append(item)
 

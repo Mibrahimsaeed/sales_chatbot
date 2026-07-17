@@ -84,3 +84,5 @@ def build_query_plan(text: str, entities: dict) -> QueryPlan:
         return QueryPlan(action="summary", level="company", entity_value=entities["company"])
 
     return QueryPlan(action="unresolved", reason="no metric or entity matched")
+
+

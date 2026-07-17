@@ -152,6 +152,13 @@ def _log_interaction(
             detected_intent = "clarify"
             confidence = 0.0
 
+        # Part 6 / Phase 6 observability: persist the full QueryIR whenever
+        # one was produced (kind == "ir", or kind == "clarify" that still
+        # carries a partially-resolved IR from the validator) so a
+        # production miss is debuggable from the filters/subjects/metric
+        # the parser actually produced, not just the final label.
+        resolved_ir_json = resolution.ir.model_dump_json() if resolution.ir is not None else None
+
         db.add(
             ChatLog(
                 session_id=session_id,
@@ -160,6 +167,7 @@ def _log_interaction(
                 confidence=confidence,
                 used_llm_fallback=resolution.used_llm_fallback,
                 response_type=response["type"],
+                resolved_ir=resolved_ir_json,
             )
         )
         db.commit()

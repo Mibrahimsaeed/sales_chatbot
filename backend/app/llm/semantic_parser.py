@@ -27,7 +27,7 @@ from app.llm import conversation_memory
 from app.llm.entity_extractor import get_known_teams, get_known_companies
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.ir_validator import validate_ir
-from app.llm.llm_client import call_llm_json
+from app.llm.llm_client import call_llm_structured, QUERY_IR_JSON_SCHEMA
 from app.llm.prompt_builder import build_ir_prompt
 from app.llm.query_ir import QueryIR, plan_to_ir
 from app.llm.query_planner import QueryPlan, build_query_plan
@@ -95,7 +95,7 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None) -> Par
         grounded_entities=entities,
         prior_ir_json=prior_ir.model_dump_json() if prior_ir else None,
     )
-    raw = call_llm_json(prompt)
+    raw = call_llm_structured(prompt, QUERY_IR_JSON_SCHEMA, schema_name="query_ir")
 
     ir: QueryIR | None = None
     if raw:

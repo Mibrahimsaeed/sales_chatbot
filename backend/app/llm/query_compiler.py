@@ -19,6 +19,25 @@ binding allows; a metric filtered/sorted at a level with no binding
 degrades to "I don't have a way to answer that yet" — the same fail-soft
 behavior sql_generator.py had, just derived from the ontology instead of a
 missing dict entry.
+
+KNOWN LIMITATION (found during the Phase 0-6 audit, not yet fixed): joins
+are deduplicated by MODEL CLASS only (`joined_models: set`), not by
+(model, period). If a query both sorts by one Performance-backed metric
+and filters by a DIFFERENT Performance-backed metric with a different
+period (e.g. "sort by MTD cleared, filter YTD cleared > X"), the second
+join is skipped as already-satisfied and the filter is silently applied
+against the FIRST join's period instead of its own — a wrong answer, not
+a degraded one. This only affects filter+sort pairs that share the same
+underlying model with different `period` values; it does not affect the
+"high sales but poor attendance" / "late but still hit target" style
+compound queries the redesign brief's examples focus on (those combine
+DIFFERENT models: Performance + Attendance, or Performance + TeamTarget).
+Fixing this properly needs SQLAlchemy `aliased()` per (model, period)
+pair in `_apply_metric_filters` / `_run_advisor_rooted` — left as follow-up
+work rather than done here, since it overlaps with Phase 4 (trend/period
+comparison), which needs the same distinct-period-join machinery and is
+already explicitly out of scope pending the historical-snapshot schema
+change.
 """
 
 from __future__ import annotations
@@ -37,6 +56,16 @@ _LEVEL_GROUP_COLUMN = {"team": Advisor.team, "company": Advisor.company}
 _COMPARATORS = {
     "=": op.eq, "!=": op.ne, ">": op.gt, ">=": op.ge, "<": op.lt, "<=": op.le,
 }
+
+
+def _apply_comparator(column, operator: str, value):
+    """`in` needs SQLAlchemy's Column.in_() — it isn't a Python `operator`
+    module function like the rest of _COMPARATORS, so it's handled as an
+    explicit branch rather than jammed into that dict."""
+    if operator == "in":
+        values = value if isinstance(value, (list, tuple)) else [value]
+        return column.in_(values)
+    return _COMPARATORS.get(operator, op.eq)(column, value)
 
 
 def _order(column, direction: str):
@@ -161,8 +190,7 @@ def _apply_metric_filters(query, ir: QueryIR, level: str, joined_models: set):
             joined_models.add(f_binding.model)
             if f_binding.period is not None:
                 query = query.filter(f_binding.model.period == f_binding.period)
-        comparator = _COMPARATORS.get(f.operator, op.eq)
-        query = query.filter(comparator(f_binding.expr, f.value))
+        query = query.filter(_apply_comparator(f_binding.expr, f.operator, f.value))
     return query
 
 

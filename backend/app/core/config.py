@@ -22,23 +22,5 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-# from pydantic_settings import BaseSettings
 
 
-# class Settings(BaseSettings):
-#     database_url: str
-#     google_service_account_path: str
-#     ccmc_spreadsheet_id: str
-#     biometric_spreadsheet_id: str
-#     jwt_secret: str
-#     jwt_algorithm: str = "HS256"
-#     anthropic_api_key: str | None = None
-#     sync_interval_minutes: int = 10
-#     sync_hour: int = 2      # daily sync fires at this hour (server time)
-#     sync_minute: int = 0
-
-#     class Config:
-#         env_file = ".env"
-
-
-# settings = Settings()
