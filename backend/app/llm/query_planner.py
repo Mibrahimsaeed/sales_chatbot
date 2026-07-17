@@ -6,7 +6,6 @@ action) combination the ontology declares is automatically plannable.
 """
 
 from dataclasses import dataclass
-from html import entities
 from app.llm.metric_ontology import METRICS, resolve_metric
 
 LEVEL_KEYWORDS = {
@@ -46,14 +45,6 @@ def build_query_plan(text: str, entities: dict) -> QueryPlan:
     if entities.get("advisor_name") and entities.get("advisor_match_score", 1.0) >= 0.6 and not is_ranking:
         return QueryPlan(action="lookup", level="advisor", entity_value=entities["advisor_name"])
 
-    # metric = entities.get("metric") or resolve_metric(text)
-
-    # if entities.get("team") and not is_ranking and not metric:
-    #     return QueryPlan(action="summary", level="team", entity_value=entities["team"])
-    # if entities.get("company") and not is_ranking and not metric:
-    #     return QueryPlan(action="summary", level="company", entity_value=entities["company"])
-
-    
     metric = entities.get("metric") or resolve_metric(text)
 
     # Attendance filtering (e.g. "show not marked people in Blue Area")

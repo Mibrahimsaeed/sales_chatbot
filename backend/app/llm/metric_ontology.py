@@ -1,606 +1,57 @@
-# # """
-# # Semantic layer: maps how people actually phrase a metric to a canonical key
-# # the rest of the pipeline understands, and declares which entity levels
-# # (advisor / team / company) that metric can be queried at.
-
-# # Adding a new metric means adding one entry here and one resolver in
-# # sql_generator.py — nothing else in the pipeline needs to change.
-# # """
-
-# # from dataclasses import dataclass
-
-
-# # @dataclass
-# # class MetricDef:
-# #     key: str
-# #     label: str
-# #     synonyms: list[str]
-# #     entity_levels: list[str]     # levels with a working resolver in sql_generator.py
-# #     primary_level: str           # level used when the query doesn't specify one
-
-
-# # METRICS: dict[str, MetricDef] = {
-# #     "achievement_pct": MetricDef(
-# #         key="achievement_pct",
-# #         label="Target Achievement %",
-# #         synonyms=["target achievement", "achievement", "hit rate", "on target", "achieved target", "target hit", "performance against target", "top performer", "performer"],
-# #         entity_levels=["advisor", "team"],
-# #         primary_level="team",   # Target Achievement is genuinely team-level source data
-# #     ),
-# #     "mtd_cleared": MetricDef(
-# #         key="mtd_cleared",
-# #         label="MTD Revenue Cleared",
-# #         synonyms=["revenue", "cleared", "sales", "closed revenue", "closed"],
-# #         entity_levels=["advisor"],
-# #         primary_level="advisor",
-# #     ),
-# #     "mtd_new_connect": MetricDef(
-# #         key="mtd_new_connect",
-# #         label="MTD Connects",
-# #         synonyms=["connect", "connects", "connections"],
-# #         entity_levels=["advisor"],
-# #         primary_level="advisor",
-# #     ),
-# #     "overdue": MetricDef(
-# #         key="overdue",
-# #         label="Overdue Pipeline Items",
-# #         synonyms=["overdue", "past due"],
-# #         entity_levels=["advisor", "team"],
-# #         primary_level="advisor",
-# #     ),
-# #     "pipeline": MetricDef(
-# #         key="pipeline",
-# #         label="Open Pipeline",
-# #         synonyms=["pipeline", "open deals", "open pipeline"],
-# #         entity_levels=["advisor"],
-# #         primary_level="advisor",
-# #     ),
-# #     "mtd_conversion": MetricDef(
-# #         key="mtd_conversion",
-# #         label="Conversion (Bookings)",
-# #         synonyms=["conversion", "conversions", "booked"],
-# #         entity_levels=["advisor"],
-# #         primary_level="advisor",
-# #     ),
-# #     "portfolio_value": MetricDef(
-# #         key="portfolio_value",
-# #         label="Portfolio Value",
-# #         synonyms=["portfolio", "portfolio value", "book size"],
-# #         entity_levels=["advisor"],
-# #         primary_level="advisor",
-# #     ),
-# # }
-
-# # # Longest synonym first, so "target achievement" matches before the bare word "target" could.
-# # _SYNONYM_INDEX: list[tuple[str, str]] = sorted(
-# #     ((syn, m.key) for m in METRICS.values() for syn in m.synonyms + [m.label.lower()]),
-# #     key=lambda pair: -len(pair[0]),
-# # )
-
-
-# # def resolve_metric(text: str) -> str | None:
-# #     q = text.lower()
-# #     for synonym, key in _SYNONYM_INDEX:
-# #         if synonym in q:
-# #             return key
-# #     return None
-
-
-# # def describe_available_metrics() -> str:
-# #     """Used by the fallback clarification message — grounds the 'I don't
-# #     understand' response in what's actually queryable instead of a canned
-# #     generic apology."""
-# #     return ", ".join(f"{m.label.lower()} ({'/'.join(m.entity_levels)})" for m in METRICS.values())
-
-
-# # # Metric Ontology
-
-# # # Performance
-# # # ├── mtd_cleared
-# # # ├── mtd_target
-# # # ├── mtd_achievement_pct
-# # # ├── ytd_cleared
-# # # ├── ytd_target
-# # # ├── ytd_achievement_pct
-# # # ├── three_month_cleared
-# # # ├── three_month_target
-# # # └── three_month_achievement_pct
-
-# # # Sales Funnel
-# # # ├── new_connects
-# # # ├── followup_connects
-# # # ├── total_connects
-# # # ├── new_meetings
-# # # ├── followup_meetings
-# # # ├── conversion
-# # # ├── bookings
-# # # └── todo
-
-# # # Pipeline
-# # # ├── pipeline_value
-# # # ├── overdue_items
-# # # └── overdue_amount
-
-# # # Portfolio
-# # # ├── portfolio_value
-# # # ├── returned_value
-# # # └── retention_percentage
-
-# # # Calls
-# # # ├── answered_calls
-# # # ├── daily_calls
-# # # └── connects
-
-# # # Attendance
-# # # ├── biometric_ontime
-# # # ├── biometric_late
-# # # ├── login_ontime
-# # # └── login_late
-
-# # # Organization
-# # # ├── advisor
-# # # ├── team
-# # # ├── company
-# # # ├── region
-# # # ├── office
-# # # ├── unit
-# # # └── management hierarchy
-# # # must be grown according to this ontology
-
-# """
-# Semantic Layer / Metric Ontology
-
-# Maps business language used by employees into canonical metrics
-# understood by the query planner and SQL resolver.
-
-# Flow:
-
-# User Query
-#     |
-#     v
-# Metric Ontology
-#     |
-#     v
-# Canonical Metric Key
-#     |
-#     v
-# Query Planner
-#     |
-#     v
-# SQL Resolver
-
-# Adding a new metric:
-# 1. Add MetricDef entry here
-# 2. Add resolver in sql_generator.py
-
-# No other pipeline changes required.
-# """
-
-# from dataclasses import dataclass
-
-
-# @dataclass
-# class MetricDef:
-#     key: str
-#     label: str
-#     synonyms: list[str]
-#     entity_levels: list[str]
-#     primary_level: str
-
-
-# # ==========================================================
-# # Metric Definitions
-# # ==========================================================
-
-# METRICS: dict[str, MetricDef] = {
-
-
-#     # =========================
-#     # PERFORMANCE METRICS
-#     # =========================
-
-#     "mtd_cleared": MetricDef(
-#         key="mtd_cleared",
-#         label="MTD Revenue Cleared",
-#         synonyms=[
-#             "sales",
-#             "revenue",
-#             "cleared",
-#             "closed revenue",
-#             "closed sales",
-#             "mtd sales",
-#             "monthly sales"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "mtd_target": MetricDef(
-#         key="mtd_target",
-#         label="MTD Target",
-#         synonyms=[
-#             "target",
-#             "mtd target",
-#             "monthly target",
-#             "sales target",
-#             "goal"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "achievement_pct": MetricDef(
-#         key="achievement_pct",
-#         label="Target Achievement %",
-#         synonyms=[
-#             "target achievement",
-#             "achievement",
-#             "achievement percentage",
-#             "achievement %",
-#             "target hit",
-#             "target reached",
-#             "hit rate",
-#             "on target"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="team",
-#     ),
-
-
-#     "ytd_cleared": MetricDef(
-#         key="ytd_cleared",
-#         label="YTD Revenue Cleared",
-#         synonyms=[
-#             "year sales",
-#             "ytd sales",
-#             "year revenue",
-#             "yearly revenue"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "three_month_cleared": MetricDef(
-#         key="three_month_cleared",
-#         label="3 Month Revenue Cleared",
-#         synonyms=[
-#             "3 month sales",
-#             "three month sales",
-#             "quarter sales",
-#             "3m revenue"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-
-#     # =========================
-#     # SALES FUNNEL
-#     # =========================
-
-#     "new_connects": MetricDef(
-#         key="new_connects",
-#         label="New Connects",
-#         synonyms=[
-#             "new connects",
-#             "fresh connects",
-#             "new calls",
-#             "new customer connects"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "followup_connects": MetricDef(
-#         key="followup_connects",
-#         label="Followup Connects",
-#         synonyms=[
-#             "followup connects",
-#             "follow up calls",
-#             "followups"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "total_connects": MetricDef(
-#         key="total_connects",
-#         label="Total Connects",
-#         synonyms=[
-#             "connects",
-#             "total connects",
-#             "connections",
-#             "customer connections"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "conversion": MetricDef(
-#         key="conversion",
-#         label="Conversion Rate",
-#         synonyms=[
-#             "conversion",
-#             "conversion rate",
-#             "booking conversion",
-#             "converted"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "bookings": MetricDef(
-#         key="bookings",
-#         label="Bookings",
-#         synonyms=[
-#             "bookings",
-#             "total bookings",
-#             "confirmed bookings"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-
-#     # =========================
-#     # PIPELINE
-#     # =========================
-
-#     "pipeline_value": MetricDef(
-#         key="pipeline_value",
-#         label="Pipeline Value",
-#         synonyms=[
-#             "pipeline",
-#             "open pipeline",
-#             "active pipeline",
-#             "deal value",
-#             "pending deals"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "overdue": MetricDef(
-#         key="overdue",
-#         label="Overdue Pipeline Items",
-#         synonyms=[
-#             "overdue",
-#             "past due",
-#             "late pipeline",
-#             "pending overdue"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "overdue_amount": MetricDef(
-#         key="overdue_amount",
-#         label="Overdue Amount",
-#         synonyms=[
-#             "overdue amount",
-#             "late amount"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-
-#     # =========================
-#     # PORTFOLIO
-#     # =========================
-
-#     "portfolio_value": MetricDef(
-#         key="portfolio_value",
-#         label="Portfolio Value",
-#         synonyms=[
-#             "portfolio",
-#             "portfolio value",
-#             "book size",
-#             "managed portfolio"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-#     "returned_value": MetricDef(
-#         key="returned_value",
-#         label="Returned Value",
-#         synonyms=[
-#             "returned",
-#             "returns",
-#             "returned business"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-
-#     # =========================
-#     # CALL METRICS
-#     # =========================
-
-#     "answered_calls": MetricDef(
-#         key="answered_calls",
-#         label="Answered Calls",
-#         synonyms=[
-#             "answered calls",
-#             "picked calls",
-#             "received calls"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-
-
-#     # =========================
-#     # ATTENDANCE
-#     # =========================
-
-#     "late_count": MetricDef(
-#         key="late_count",
-#         label="Late Attendance Count",
-#         synonyms=[
-#             "late",
-#             "late arrivals",
-#             "attendance issues",
-#             "late employees"
-#         ],
-#         entity_levels=[
-#             "advisor",
-#             "team",
-#             "company"
-#         ],
-#         primary_level="advisor",
-#     ),
-
-# }
-
-
-# # ==========================================================
-# # Resolver Index
-# # Longest synonym first to avoid partial collisions
-# # ==========================================================
-
-# _SYNONYM_INDEX: list[tuple[str, str]] = sorted(
-#     (
-#         (synonym.lower(), metric.key)
-#         for metric in METRICS.values()
-#         for synonym in metric.synonyms + [metric.label.lower()]
-#     ),
-#     key=lambda x: -len(x[0])
-# )
-
-
-
-# def resolve_metric(text: str) -> str | None:
-#     """
-#     Convert user language into canonical metric key.
-
-#     Example:
-
-#     "highest sales"
-#         ->
-#     "mtd_cleared"
-
-#     "target achievement"
-#         ->
-#     "achievement_pct"
-#     """
-
-#     query = text.lower()
-
-#     for synonym, key in _SYNONYM_INDEX:
-#         if synonym in query:
-#             return key
-
-#     return None
-
-
-
-# def describe_available_metrics() -> str:
-#     """
-#     Used for clarification responses.
-#     """
-
-#     return ", ".join(
-#         f"{metric.label} ({'/'.join(metric.entity_levels)})"
-#         for metric in METRICS.values()
-#     )
-
-
-
 """
 Semantic layer: canonical business-friendly metric names, their phrasing
-synonyms, and which entity levels each one supports.
+synonyms, which entity levels each one supports, and — new in this
+version — the actual column/table binding the generic query compiler
+(query_compiler.py) needs to build SQL without a hand-written resolver
+function per (metric, level) pair.
 
-INVARIANT this file and sql_generator.py must both uphold: every
-(metric.key, level) pair listed in entity_levels below MUST have a
-matching @resolver(metric_key, level) in sql_generator.py. Add a metric
-here and forget the resolver -> it silently returns "I don't have a way
-to rank by that" instead of data. There's a test for this — see
-tests/llm/test_ontology_sync.py.
+INVARIANT this file alone now upholds (sql_generator.py's RESOLVERS
+registry is retired — see query_compiler.py): every (metric.key, level)
+pair listed in entity_levels below MUST have a matching entry in
+`bindings`. Add a metric here without a binding for a level you listed
+in entity_levels and the compiler will treat that level as unsupported
+for that metric (same fail-soft "I don't have a way to rank by that yet"
+behavior as before, just declared in one place instead of two).
+
+Adding a new metric:
+1. Add a MetricDef entry with its synonyms and entity_levels.
+2. Add one ColumnBinding per level in `bindings`.
+No other pipeline change is required — the compiler reads this generically.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from app.database.models import (
+    Advisor, SalesFunnel, Pipeline, Performance, PerformancePeriod,
+    TeamTarget, Portfolio, Calls, Attendance,
+)
+
+
+@dataclass
+class ColumnBinding:
+    """Tells the compiler how to reach a metric's value for one entity level.
+
+    - model:     the fact-table model holding the column/expression.
+    - expr:      the SQLAlchemy column or computed expression on `model`
+                 (e.g. SalesFunnel.mtd_cleared, or
+                 SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect).
+    - team_named: True for tables like TeamTarget that are keyed directly by
+                 team name (no advisor `wid` join, no roll-up possible —
+                 the row IS the team-level truth). False means join `model`
+                 to Advisor via `wid`, and for team/company level the
+                 compiler aggregates with `agg`.
+    - agg:       "sum" | "avg" — how to roll an advisor-level column up to
+                 team/company. Rate-like metrics (conversion, achievement)
+                 must average, not sum.
+    - period:    for the shared `Performance` table, which PerformancePeriod
+                 row this metric reads.
+    """
+    model: type
+    expr: Any
+    team_named: bool = False
+    agg: str = "sum"
+    period: Optional[PerformancePeriod] = None
 
 
 @dataclass
@@ -608,8 +59,9 @@ class MetricDef:
     key: str
     label: str
     synonyms: list[str]
-    entity_levels: list[str]     # levels with a working resolver in sql_generator.py
-    primary_level: str           # level used when the query doesn't specify one
+    entity_levels: list[str]          # levels with a binding below
+    primary_level: str                # level used when the query doesn't specify one
+    bindings: dict[str, ColumnBinding] = field(default_factory=dict)
 
 
 METRICS: dict[str, MetricDef] = {
@@ -620,15 +72,22 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["target achievement", "achievement", "hit rate", "on target", "achieved target",
                    "target hit", "performance against target", "top performer", "performer", "performance"],
         entity_levels=["advisor", "team"],
-        primary_level="team",   # Target Achievement is genuine team-level source data
+        primary_level="team",
+        bindings={
+            "team": ColumnBinding(model=TeamTarget, expr=TeamTarget.achievement_pct, team_named=True),
+            "advisor": ColumnBinding(model=Performance, expr=Performance.pct, period=PerformancePeriod.MTD, agg="avg"),
+        },
     ),
 
     "mtd_cleared": MetricDef(
         key="mtd_cleared",
         label="MTD Revenue Cleared",
         synonyms=["revenue", "cleared", "sales", "closed revenue", "closed", "highest sales"],
-        entity_levels=["advisor"],
+        entity_levels=["advisor", "team", "company"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Performance, expr=Performance.cleared, period=PerformancePeriod.MTD),
+        },
     ),
 
     "ytd_cleared": MetricDef(
@@ -637,6 +96,9 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["ytd cleared", "ytd revenue", "year to date revenue", "year to date cleared", "annual cleared"],
         entity_levels=["advisor"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Performance, expr=Performance.cleared, period=PerformancePeriod.YTD),
+        },
     ),
 
     "three_month_cleared": MetricDef(
@@ -645,6 +107,9 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["3 month cleared", "three month cleared", "quarterly cleared", "3m cleared", "quarter revenue"],
         entity_levels=["advisor"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Performance, expr=Performance.cleared, period=PerformancePeriod.THREE_M),
+        },
     ),
 
     "mtd_target": MetricDef(
@@ -653,6 +118,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["mtd target", "monthly target", "this month's target", "month target", "target"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Performance, expr=Performance.target, period=PerformancePeriod.MTD),
+            "team": ColumnBinding(model=TeamTarget, expr=TeamTarget.target, team_named=True),
+        },
     ),
 
     "total_connects": MetricDef(
@@ -661,6 +130,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["connects", "connections", "connect", "total connects", "all connects", "most connects"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect),
+            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect),
+        },
     ),
 
     "new_connects": MetricDef(
@@ -669,6 +142,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["new connects", "new connect", "fresh connects", "first connects"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_connect),
+            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_connect),
+        },
     ),
 
     "followup_connects": MetricDef(
@@ -677,6 +154,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["follow-up connects", "followup connects", "follow up connects", "repeat connects"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_followup_connect),
+            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_followup_connect),
+        },
     ),
 
     "conversion": MetricDef(
@@ -685,6 +166,11 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["conversion", "conversions", "conversion rate"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_conversion),
+            # a rate metric averages, it doesn't sum, across a team
+            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_conversion, agg="avg"),
+        },
     ),
 
     "bookings": MetricDef(
@@ -693,6 +179,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["booking", "bookings", "booked units", "booking stored"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_booking_stored),
+            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_booking_stored),
+        },
     ),
 
     "pipeline_value": MetricDef(
@@ -701,6 +191,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["pipeline", "pipeline value", "open pipeline", "open deals"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Pipeline, expr=Pipeline.pipeline),
+            "team": ColumnBinding(model=Pipeline, expr=Pipeline.pipeline),
+        },
     ),
 
     "overdue": MetricDef(
@@ -709,6 +203,10 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["overdue", "past due"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Pipeline, expr=Pipeline.overdue),
+            "team": ColumnBinding(model=Pipeline, expr=Pipeline.overdue),
+        },
     ),
 
     "overdue_amount": MetricDef(
@@ -717,6 +215,12 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["overdue amount", "overdue value", "amount overdue"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            # Same underlying column as `overdue` — the schema has one overdue
+            # field, not separate count-vs-amount columns.
+            "advisor": ColumnBinding(model=Pipeline, expr=Pipeline.overdue),
+            "team": ColumnBinding(model=Pipeline, expr=Pipeline.overdue),
+        },
     ),
 
     "portfolio_value": MetricDef(
@@ -725,6 +229,9 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["portfolio", "portfolio value", "book size"],
         entity_levels=["advisor"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Portfolio, expr=Portfolio.value),
+        },
     ),
 
     "returned_value": MetricDef(
@@ -733,6 +240,9 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["returned", "returned value", "returns", "portfolio returned"],
         entity_levels=["advisor"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Portfolio, expr=Portfolio.returned),
+        },
     ),
 
     "answered_calls": MetricDef(
@@ -741,14 +251,22 @@ METRICS: dict[str, MetricDef] = {
         synonyms=["answered calls", "calls answered", "call answered"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Calls, expr=Calls.answered_calls_mtd),
+            "team": ColumnBinding(model=Calls, expr=Calls.answered_calls_mtd),
+        },
     ),
 
     "late_count": MetricDef(
         key="late_count",
         label="Late Attendance Count (MTD)",
-        synonyms=["late count", "how many late", "number of late", "late arrivals"],
+        synonyms=["late count", "how many late", "number of late", "late arrivals", "late"],
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Attendance, expr=Attendance.biometric_mtd_late),
+            "team": ColumnBinding(model=Attendance, expr=Attendance.biometric_mtd_late),
+        },
     ),
 }
 
@@ -770,3 +288,13 @@ def resolve_metric(text: str) -> str | None:
 
 def describe_available_metrics() -> str:
     return ", ".join(f"{m.label.lower()} ({'/'.join(m.entity_levels)})" for m in METRICS.values())
+
+
+def metric_catalog_for_prompt() -> str:
+    """Grounds the LLM semantic parser in exactly what's queryable — same
+    idea prompt_builder.py already used for teams/companies, extended to
+    metrics so the model can't invent a metric key that has no binding."""
+    lines = []
+    for m in METRICS.values():
+        lines.append(f"- {m.key}: {m.label} (levels: {', '.join(m.entity_levels)}; e.g. {', '.join(m.synonyms[:3])})")
+    return "\n".join(lines)

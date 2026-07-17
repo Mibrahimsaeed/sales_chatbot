@@ -15,13 +15,15 @@ export default function MessageBubble({ message }) {
     )
   }
 
+  const hasCard = ['advisor', 'team', 'company', 'leaderboard', 'attendance'].includes(kind)
+
   return (
     <div className="msg bot">
-      {text && <div className="bubble">{text}</div>}
+      {text && !hasCard && <div className="bubble">{text}</div>}
       {kind === 'advisor' && <AdvisorCard a={data} />}
       {kind === 'team' && <TeamCard t={data} />}
       {kind === 'company' && <CompanyCard c={data} />}
-      {kind === 'leaderboard' && <LeaderboardCard rows={data} metric={metric} />}
+      {kind === 'leaderboard' && <LeaderboardCard rows={data} metric={metric} title={text} />}
       {kind === 'attendance' && <AttendanceCard rows={data} />}
     </div>
   )
