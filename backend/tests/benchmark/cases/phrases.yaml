@@ -1,0 +1,75 @@
+# Business-language phrasings (P2): no literal metric name in the text.
+- id: phrase-001
+  tags: [phrases]
+  query: "who is the best performer"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 90}}
+
+- id: phrase-002
+  tags: [phrases]
+  query: "show me the underperforming advisors"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: advisor, sort_direction: asc}
+    sql: {first_row: {name: "Omar Farooq", value: 25}}
+
+- id: phrase-003
+  tags: [phrases]
+  query: "advisors who almost achieved their target"
+  expect:
+    ir: {metric: achievement_pct}
+    sql: {row_count: 2}
+
+- id: phrase-004
+  tags: [phrases]
+  query: "who is the highest closer"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 900}}
+
+- id: phrase-005
+  tags: [phrases]
+  query: "which advisors are doing well"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 90}}
+
+- id: phrase-006
+  tags: [phrases]
+  query: "who are the most punctual advisors"
+  expect:
+    ir: {metric: attendance_rate, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 90}}
+
+- id: phrase-007
+  tags: [phrases]
+  query: "star performers this month"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct}
+
+- id: phrase-008
+  tags: [phrases]
+  query: "who is always late"
+  expect:
+    ir: {metric: late_count}
+    sql: {first_row: {name: "Omar Farooq", value: 6}}
+
+- id: phrase-009
+  tags: [phrases, team]
+  query: "which team is performing best against target"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: team}
+    sql: {first_row: {name: "Blue Area", value: 80}}
+
+- id: phrase-010
+  tags: [phrases]
+  query: "biggest closers this month"
+  expect:
+    ir: {metric: mtd_cleared}
+    sql: {first_row: {name: "Waqar Haider", value: 900}}

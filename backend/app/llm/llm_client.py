@@ -5,7 +5,15 @@ from app.core.logger import get_logger
 
 log = get_logger("llm.client")
 
-_client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+# timeout + one SDK-level retry (connection errors / 429 / 5xx): with the
+# LLM now the primary parser, an unbounded hang here would stall every
+# analytical chat request — bound it and let semantic_parser's fail-soft
+# degrade path take over instead.
+_client = (
+    OpenAI(api_key=settings.openai_api_key, timeout=15.0, max_retries=1)
+    if settings.openai_api_key
+    else None
+)
 
 # Hand-written rather than derived from QueryIR.model_json_schema(): OpenAI's
 # strict structured-output mode requires every property "required" (optional

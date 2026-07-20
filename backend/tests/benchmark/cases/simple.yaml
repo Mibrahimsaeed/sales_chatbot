@@ -1,0 +1,159 @@
+# Single-metric leaderboard phrasings across the ontology.
+# expect.sql values derived by hand from fixture_data.py's docstring table.
+- id: simple-001
+  tags: [simple, leaderboard]
+  query: "top 5 advisors by revenue"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared, subject_level: advisor, limit: 5}
+    sql: {row_count: 5, first_row: {name: "Waqar Haider", value: 900}}
+
+- id: simple-002
+  tags: [simple, leaderboard]
+  query: "who has the highest sales"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 900}}
+
+- id: simple-003
+  tags: [simple, leaderboard]
+  query: "show me the top advisors by ytd revenue"
+  expect:
+    intent: leaderboard
+    ir: {metric: ytd_cleared, subject_level: advisor}
+    sql: {first_row: {name: "Ali Raza", value: 9000}}
+
+- id: simple-004
+  tags: [simple, leaderboard]
+  query: "which advisor has the most connects"
+  expect:
+    intent: leaderboard
+    ir: {metric: total_connects, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 30}}
+
+- id: simple-005
+  tags: [simple, leaderboard]
+  query: "top advisors by new connects"
+  expect:
+    intent: leaderboard
+    ir: {metric: new_connects, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 20}}
+
+- id: simple-006
+  tags: [simple, leaderboard]
+  query: "who held the most meetings this month"
+  expect:
+    intent: leaderboard
+    ir: {metric: total_meetings, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 12}}
+
+- id: simple-007
+  tags: [simple, leaderboard]
+  query: "who has the most overdue"
+  expect:
+    intent: leaderboard
+    ir: {metric: overdue, subject_level: advisor}
+    sql: {first_row: {name: "Omar Farooq", value: 600}}
+
+- id: simple-008
+  tags: [simple, leaderboard]
+  query: "top 3 advisors by achievement percentage"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: advisor, limit: 3}
+    sql: {row_count: 3, first_row: {name: "Waqar Haider", value: 90}}
+
+- id: simple-009
+  tags: [simple, leaderboard]
+  query: "which advisors have the best attendance rate"
+  expect:
+    intent: leaderboard
+    ir: {metric: attendance_rate, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 90}}
+
+- id: simple-010
+  tags: [simple, leaderboard]
+  query: "who was late the most this month"
+  expect:
+    ir: {metric: late_count, subject_level: advisor}
+    sql: {first_row: {name: "Omar Farooq", value: 6}}
+
+- id: simple-011
+  tags: [simple, leaderboard, team]
+  query: "which team has the highest revenue"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared, subject_level: team}
+    sql: {first_row: {name: "Blue Area", value: 1600}}
+
+- id: simple-012
+  tags: [simple, leaderboard, team]
+  query: "top teams by meetings"
+  expect:
+    intent: leaderboard
+    ir: {metric: total_meetings, subject_level: team}
+    sql: {first_row: {name: "Blue Area", value: 22}}
+
+- id: simple-013
+  tags: [simple, leaderboard, team]
+  query: "which teams have the best attendance rate"
+  expect:
+    intent: leaderboard
+    ir: {metric: attendance_rate, subject_level: team}
+    sql: {first_row: {name: "Blue Area", value: 85}}
+
+- id: simple-014
+  tags: [simple, leaderboard, team]
+  query: "worst teams by overdue"
+  expect:
+    intent: leaderboard
+    ir: {metric: overdue, subject_level: team}
+    sql: {first_row: {name: "DHA Phase 5", value: 1100}}
+
+- id: simple-015
+  tags: [simple, leaderboard, team]
+  query: "team target achievement ranking"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: team}
+    sql: {first_row: {name: "Blue Area", value: 80}}
+
+- id: simple-016
+  tags: [simple, leaderboard, company]
+  query: "which company cleared the most revenue"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared, subject_level: company}
+    sql: {first_row: {name: "Graana", value: 1900}}
+
+- id: simple-017
+  tags: [simple, leaderboard]
+  query: "bottom 2 advisors by revenue"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared, subject_level: advisor, limit: 2, sort_direction: asc}
+    sql: {row_count: 2, first_row: {name: "Omar Farooq", value: 100}}
+
+- id: simple-018
+  tags: [simple, leaderboard]
+  query: "lowest achievement advisors"
+  expect:
+    intent: leaderboard
+    ir: {metric: achievement_pct, subject_level: advisor, sort_direction: asc}
+    sql: {first_row: {name: "Omar Farooq", value: 25}}
+
+- id: simple-019
+  tags: [simple, leaderboard]
+  query: "rank advisors by follow-up connects"
+  expect:
+    intent: leaderboard
+    ir: {metric: followup_connects, subject_level: advisor}
+    sql: {first_row: {name: "Waqar Haider", value: 10}}
+
+- id: simple-020
+  tags: [simple, leaderboard]
+  query: "give me the top 4 by quarterly cleared"
+  expect:
+    intent: leaderboard
+    ir: {metric: three_month_cleared, limit: 4}

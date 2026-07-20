@@ -14,7 +14,20 @@ checks this regardless, but grounding it in the prompt cuts down on wasted
 round trips.
 """
 
+from app.llm.ir_examples import render_examples
 from app.llm.metric_ontology import metric_catalog_for_prompt
+
+# Business phrases that don't literally name a metric but have one
+# conventional meaning in this domain. Anything NOT on this list and not a
+# catalog synonym should produce intent="clarify", not a guess.
+BUSINESS_PHRASE_GLOSSARY = """How to read common business phrases:
+- "best performer" / "top performer" / "star" -> sort desc by achievement_pct
+- "underperforming" / "weak" / "bottom performers" -> sort asc by achievement_pct
+- "almost achieved target" / "close to target" -> two filters: achievement_pct >= 80 AND achievement_pct < 100
+- "highest closer" / "biggest closer" -> sort desc by mtd_cleared
+- "doing well" -> sort desc by achievement_pct
+- "punctual" / "shows up on time" -> attendance_rate high (sort desc or filter >)
+- "never on time" / "always late" -> late_count high or attendance_rate low"""
 
 IR_SCHEMA = """Return ONLY a JSON object, no other text, no markdown fences, matching this shape:
 {
@@ -51,15 +64,19 @@ def build_ir_prompt(
     grounded_entities: dict,
     prior_ir_json: str | None = None,
 ) -> str:
-    teams_sample = ", ".join(known_teams[:40])
+    # 200 is a generosity cap, not a truncation strategy — the real
+    # gazetteer is far smaller; the cap only guards against a pathological
+    # data load blowing up the prompt.
+    teams_sample = ", ".join(known_teams[:200])
     companies = ", ".join(known_companies)
     metric_catalog = metric_catalog_for_prompt()
 
     context_lines = [f"You are a query-understanding parser for a real-estate sales operations chatbot."]
-    context_lines.append(f"Known teams (not exhaustive): {teams_sample}")
+    context_lines.append(f"Known teams: {teams_sample}")
     context_lines.append(f"Known companies: {companies}")
     context_lines.append("Metric catalog (the ONLY valid metric keys):")
     context_lines.append(metric_catalog)
+    context_lines.append(BUSINESS_PHRASE_GLOSSARY)
 
     if grounded_entities:
         context_lines.append(f"Entities already found by rule-based grounding (use these, don't re-derive): {grounded_entities}")
@@ -70,6 +87,7 @@ def build_ir_prompt(
             f"'same for Downtown' — treat the new message as a patch on this): {prior_ir_json}"
         )
 
+    context_lines.append(render_examples())
     context_lines.append(f'User message: "{text}"')
     context_lines.append(IR_SCHEMA)
 

@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 
+from app.llm import narrative
 from app.llm.nlu_pipeline import resolve, Resolution
 from app.llm.query_compiler import compile_and_run
 from app.llm.response_formatter import (
@@ -105,7 +106,12 @@ def _dispatch_ir(db: Session, resolution: Resolution) -> dict:
             "data": None,
         }
 
-    return {"type": ir.intent, "reply": format_ir_reply(ir, rows), "data": rows}
+    reply = format_ir_reply(ir, rows)
+    if rows:
+        # narrative polish (P7): deterministic facts + LLM phrasing only,
+        # fail-soft back to the templated reply (see narrative.py)
+        reply = narrative.polish_reply(narrative.compute_facts(ir, rows), reply)
+    return {"type": ir.intent, "reply": reply, "data": rows}
 
 
 def _dispatch_shortcut(db: Session, intent: str, entities: dict) -> dict:
@@ -113,6 +119,13 @@ def _dispatch_shortcut(db: Session, intent: str, entities: dict) -> dict:
         return {
             "type": "text",
             "reply": "Hi — I can look up an advisor, a team, a company, or answer leaderboard and attendance questions. What would you like to know?",
+            "data": None,
+        }
+
+    if intent == "thanks":
+        return {
+            "type": "text",
+            "reply": "You're welcome! Anything else you'd like to look up?",
             "data": None,
         }
 

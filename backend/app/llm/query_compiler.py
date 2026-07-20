@@ -20,24 +20,12 @@ degrades to "I don't have a way to answer that yet" — the same fail-soft
 behavior sql_generator.py had, just derived from the ontology instead of a
 missing dict entry.
 
-KNOWN LIMITATION (found during the Phase 0-6 audit, not yet fixed): joins
-are deduplicated by MODEL CLASS only (`joined_models: set`), not by
-(model, period). If a query both sorts by one Performance-backed metric
+Joins are deduplicated by (model, period), not model class alone (see
+`_join_fact_table`): a query that sorts by one Performance-backed metric
 and filters by a DIFFERENT Performance-backed metric with a different
-period (e.g. "sort by MTD cleared, filter YTD cleared > X"), the second
-join is skipped as already-satisfied and the filter is silently applied
-against the FIRST join's period instead of its own — a wrong answer, not
-a degraded one. This only affects filter+sort pairs that share the same
-underlying model with different `period` values; it does not affect the
-"high sales but poor attendance" / "late but still hit target" style
-compound queries the redesign brief's examples focus on (those combine
-DIFFERENT models: Performance + Attendance, or Performance + TeamTarget).
-Fixing this properly needs SQLAlchemy `aliased()` per (model, period)
-pair in `_apply_metric_filters` / `_run_advisor_rooted` — left as follow-up
-work rather than done here, since it overlaps with Phase 4 (trend/period
-comparison), which needs the same distinct-period-join machinery and is
-already explicitly out of scope pending the historical-snapshot schema
-change.
+period (e.g. "sort by MTD cleared, filter YTD cleared > X") joins the
+second period via `aliased()` instead of reusing the first join, so the
+filter binds to its own period's row.
 """
 
 from __future__ import annotations
@@ -45,7 +33,7 @@ from __future__ import annotations
 import operator as op
 
 from sqlalchemy import asc, desc, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.database.models import Advisor, Attendance, PerformancePeriod
 from app.llm.metric_ontology import METRICS, ColumnBinding
@@ -163,66 +151,99 @@ def _apply_subject_filter(query, ir: QueryIR):
     return query
 
 
-def _apply_attendance_filter(query, ir: QueryIR, joined_models: set):
+def _join_fact_table(query, joined: dict, model: type, period):
+    """Joins `model` to the query, keyed by (model, period) rather than
+    model alone. If this exact model is already joined under a DIFFERENT
+    period, the new join uses aliased() instead of reusing the first
+    join — otherwise a filter on e.g. YTD cleared would silently bind to
+    an MTD join already present for the sort metric. Returns (query,
+    entity), where entity is the model class (first join) or its alias
+    (subsequent joins of the same model at a different period); all
+    column access for this join must go through entity, not the raw
+    model class.
+    """
+    key = (model, period)
+    if key in joined:
+        return query, joined[key]
+
+    already_joined_other_period = any(m is model for m, _p in joined)
+    entity = aliased(model) if already_joined_other_period else model
+    query = query.join(entity, entity.wid == Advisor.wid)
+    if period is not None:
+        query = query.filter(entity.period == period)
+    joined[key] = entity
+    return query, entity
+
+
+def _rebind_to_entity(expr, entity, model: type):
+    """binding.expr is written against the declared model class. If the
+    join for this binding used an alias (only happens when the SAME
+    model is joined twice in one query under different `period` values),
+    the expression must be rebound onto that alias. Every period-bearing
+    binding in metric_ontology.py is a single raw column, never a
+    computed expression, so a plain attribute lookup is sufficient — fail
+    loudly instead of silently compiling against the wrong table if that
+    invariant is ever broken by a future ontology entry.
+    """
+    if entity is model:
+        return expr
+    key = getattr(expr, "key", None)
+    if key is None:
+        raise NotImplementedError(
+            "A computed (non-column) metric expression needs an aliased "
+            "join — extend _rebind_to_entity to support this case."
+        )
+    return getattr(entity, key)
+
+
+def _apply_attendance_filter(query, ir: QueryIR, joined: dict):
     status_filters = [f for f in ir.filters if f.field == "attendance_status"]
     if not status_filters:
         return query
-    if Attendance not in joined_models:
-        query = query.join(Attendance, Attendance.wid == Advisor.wid)
-        joined_models.add(Attendance)
+    query, entity = _join_fact_table(query, joined, Attendance, None)
     for f in status_filters:
-        query = query.filter(Attendance.biometric_status == f.value)
+        query = query.filter(entity.biometric_status == f.value)
     return query
 
 
-def _apply_metric_filters(query, ir: QueryIR, level: str, joined_models: set):
+def _apply_metric_filters(query, ir: QueryIR, level: str, joined: dict):
     """Filters on a metric OTHER than the sort metric (Root Cause #1/#3 fix:
     "high sales but poor attendance" filters on late_count while sorting
-    by mtd_cleared). Each distinct fact table is joined once."""
+    by mtd_cleared). Each distinct (model, period) fact table is joined once."""
     for f in ir.filters:
         if f.field not in METRICS:
             continue
         f_binding = _binding_for(f.field, level)
         if not f_binding or f_binding.team_named:
             continue  # can't combine a team-named metric filter into an advisor-rooted query
-        if f_binding.model not in joined_models:
-            query = query.join(f_binding.model, f_binding.model.wid == Advisor.wid)
-            joined_models.add(f_binding.model)
-            if f_binding.period is not None:
-                query = query.filter(f_binding.model.period == f_binding.period)
-        query = query.filter(_apply_comparator(f_binding.expr, f.operator, f.value))
+        query, entity = _join_fact_table(query, joined, f_binding.model, f_binding.period)
+        expr = _rebind_to_entity(f_binding.expr, entity, f_binding.model)
+        query = query.filter(_apply_comparator(expr, f.operator, f.value))
     return query
 
 
 def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key: str) -> list[dict] | None:
     level = ir.subject_level
-    joined_models: set = {Advisor}
+    joined: dict = {}
     is_rollup = level in ("team", "company")
 
     value_expr = _value_expr(binding, agg_for_rollup=is_rollup, level=level)
 
     if level == "advisor":
-        query = db.query(
-            Advisor.wid, Advisor.name, Advisor.team, Advisor.company,
-            value_expr.label("value"),
-        ).join(binding.model, binding.model.wid == Advisor.wid)
-        joined_models.add(binding.model)
-        if binding.period is not None:
-            query = query.filter(binding.model.period == binding.period)
+        query = db.query(Advisor.wid, Advisor.name, Advisor.team, Advisor.company)
+        query, _sort_entity = _join_fact_table(query, joined, binding.model, binding.period)
+        query = query.add_columns(value_expr.label("value"))
     else:
         group_col = _LEVEL_GROUP_COLUMN[level]
-        query = db.query(group_col.label("name"), value_expr.label("value")).join(
-            binding.model, binding.model.wid == Advisor.wid
-        )
-        joined_models.add(binding.model)
-        if binding.period is not None:
-            query = query.filter(binding.model.period == binding.period)
+        query = db.query(group_col.label("name"))
+        query, _sort_entity = _join_fact_table(query, joined, binding.model, binding.period)
+        query = query.add_columns(value_expr.label("value"))
         query = query.filter(group_col.isnot(None))
 
     query = _apply_entity_filters(query, ir)
     query = _apply_subject_filter(query, ir)
-    query = _apply_attendance_filter(query, ir, joined_models)
-    query = _apply_metric_filters(query, ir, level, joined_models)
+    query = _apply_attendance_filter(query, ir, joined)
+    query = _apply_metric_filters(query, ir, level, joined)
 
     if level != "advisor":
         query = query.group_by(_LEVEL_GROUP_COLUMN[level])

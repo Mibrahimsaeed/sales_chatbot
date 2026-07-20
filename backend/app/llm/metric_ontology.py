@@ -22,6 +22,8 @@ No other pipeline change is required — the compiler reads this generically.
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from sqlalchemy import func
+
 from app.database.models import (
     Advisor, SalesFunnel, Pipeline, Performance, PerformancePeriod,
     TeamTarget, Portfolio, Calls, Attendance,
@@ -82,11 +84,13 @@ METRICS: dict[str, MetricDef] = {
     "mtd_cleared": MetricDef(
         key="mtd_cleared",
         label="MTD Revenue Cleared",
-        synonyms=["revenue", "cleared", "sales", "closed revenue", "closed", "highest sales"],
+        synonyms=["revenue", "cleared", "sales", "closed revenue", "closed", "highest sales", "highest closer", "top closer"],
         entity_levels=["advisor", "team", "company"],
         primary_level="advisor",
         bindings={
             "advisor": ColumnBinding(model=Performance, expr=Performance.cleared, period=PerformancePeriod.MTD),
+            "team": ColumnBinding(model=Performance, expr=Performance.cleared, period=PerformancePeriod.MTD),
+            "company": ColumnBinding(model=Performance, expr=Performance.cleared, period=PerformancePeriod.MTD),
         },
     ),
 
@@ -157,6 +161,18 @@ METRICS: dict[str, MetricDef] = {
         bindings={
             "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_followup_connect),
             "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_followup_connect),
+        },
+    ),
+
+    "total_meetings": MetricDef(
+        key="total_meetings",
+        label="Total MTD Meetings",
+        synonyms=["meetings", "meeting", "total meetings", "most meetings", "meetings held"],
+        entity_levels=["advisor", "team"],
+        primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_meeting + SalesFunnel.mtd_followup_meeting),
+            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_meeting + SalesFunnel.mtd_followup_meeting),
         },
     ),
 
@@ -268,6 +284,34 @@ METRICS: dict[str, MetricDef] = {
             "team": ColumnBinding(model=Attendance, expr=Attendance.biometric_mtd_late),
         },
     ),
+
+    "attendance_rate": MetricDef(
+        key="attendance_rate",
+        label="Attendance Rate % (MTD)",
+        synonyms=["attendance rate", "attendance percentage", "attendance %", "attendance",
+                  "on time rate", "on-time percentage", "punctuality"],
+        entity_levels=["advisor", "team"],
+        primary_level="advisor",
+        bindings={
+            # NULLIF guards the advisor with zero attendance rows of any kind
+            # (no on-time, no late, no not-marked) from dividing by zero —
+            # their rate compiles to NULL, not a crash.
+            "advisor": ColumnBinding(
+                model=Attendance,
+                expr=Attendance.biometric_mtd_ontime * 100.0 / func.nullif(
+                    Attendance.biometric_mtd_ontime + Attendance.biometric_mtd_late + Attendance.biometric_mtd_not_marked, 0
+                ),
+            ),
+            # a rate metric averages, it doesn't sum, across a team
+            "team": ColumnBinding(
+                model=Attendance,
+                expr=Attendance.biometric_mtd_ontime * 100.0 / func.nullif(
+                    Attendance.biometric_mtd_ontime + Attendance.biometric_mtd_late + Attendance.biometric_mtd_not_marked, 0
+                ),
+                agg="avg",
+            ),
+        },
+    ),
 }
 
 # Longest synonym first, so e.g. "ytd cleared" matches before the bare word
@@ -293,8 +337,11 @@ def describe_available_metrics() -> str:
 def metric_catalog_for_prompt() -> str:
     """Grounds the LLM semantic parser in exactly what's queryable — same
     idea prompt_builder.py already used for teams/companies, extended to
-    metrics so the model can't invent a metric key that has no binding."""
+    metrics so the model can't invent a metric key that has no binding.
+    Emits ALL synonyms per metric (the whole catalog is only a few hundred
+    tokens): with the LLM now the primary parser, the synonym list is the
+    model's main phrasing-to-key lookup table, not a truncated hint."""
     lines = []
     for m in METRICS.values():
-        lines.append(f"- {m.key}: {m.label} (levels: {', '.join(m.entity_levels)}; e.g. {', '.join(m.synonyms[:3])})")
+        lines.append(f"- {m.key}: {m.label} (levels: {', '.join(m.entity_levels)}; phrasings: {', '.join(m.synonyms)})")
     return "\n".join(lines)

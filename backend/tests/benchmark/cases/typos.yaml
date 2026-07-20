@@ -1,0 +1,62 @@
+# Misspelled entities and metrics (P3 fuzzy matching).
+- id: typo-001
+  tags: [typos]
+  query: "top advisors in blue aera"
+  expect:
+    intent: leaderboard
+    entities: {teams: ["Blue Area"]}
+    sql: {row_count: 2}
+
+- id: typo-002
+  tags: [typos]
+  query: "show grana advisors by revenue"
+  expect:
+    intent: leaderboard
+    entities: {companies: ["Graana"]}
+    ir: {metric: mtd_cleared}
+    sql: {row_count: 3, first_row: {name: "Waqar Haider", value: 900}}
+
+- id: typo-003
+  tags: [typos]
+  query: "top advisors by revnue"
+  expect:
+    intent: leaderboard
+    ir: {metric: mtd_cleared}
+    sql: {first_row: {name: "Waqar Haider", value: 900}}
+
+- id: typo-004
+  tags: [typos]
+  query: "atendance rate ranking for advisors"
+  expect:
+    ir: {metric: attendance_rate}
+    sql: {first_row: {name: "Waqar Haider", value: 90}}
+
+- id: typo-005
+  tags: [typos]
+  query: "tell me about Waqar Hader"
+  expect:
+    intent: lookup
+    entities: {advisor: "Waqar Haider"}
+
+- id: typo-006
+  tags: [typos]
+  query: "compare blue aera with downtwon on revenue"
+  expect:
+    intent: comparison
+    entities: {teams: ["Blue Area", "Downtown"]}
+    sql: {row_count: 2, first_row: {name: "Blue Area", value: 1600}}
+
+- id: typo-007
+  tags: [typos]
+  query: "top advisors from imarat by acheivement"
+  expect:
+    entities: {companies: ["IMARAT"]}
+    ir: {metric: achievement_pct}
+    sql: {row_count: 2, first_row: {name: "Bilal Ahmed", value: 62.5}}
+
+- id: typo-008
+  tags: [typos]
+  query: "most overdu advisors"
+  expect:
+    ir: {metric: overdue}
+    sql: {first_row: {name: "Omar Farooq", value: 600}}

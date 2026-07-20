@@ -31,19 +31,24 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from app.llm import semantic_parser
+import re
+
+from app.llm import conversation_memory, semantic_parser
+from app.llm.conversation_memory import MAX_CLARIFY_ATTEMPTS, PendingClarification
 from app.llm.entity_extractor import extract_entities
+from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.intent_detector import classify_intent as classify_shortcut
-from app.llm.ir_validator import build_targeted_clarification
+from app.llm.ir_patcher import try_patch
+from app.llm.ir_validator import build_targeted_clarification, validate_ir
 from app.llm.preprocessing import normalize
-from app.llm.query_ir import QueryIR
+from app.llm.query_ir import MetricRef, QueryIR, Subject
 from app.llm.query_planner import build_query_plan, QueryPlan
 from app.llm.metric_ontology import describe_available_metrics
 from app.core.logger import get_logger
 
 log = get_logger("llm.nlu_pipeline")
 
-SHORTCUT_INTENTS = ("greeting", "help", "attendance_check")
+SHORTCUT_INTENTS = ("greeting", "thanks", "help", "attendance_check")
 _RULE_BASED_ACTIONS = ("lookup", "summary", "attendance_filter")
 
 
@@ -58,6 +63,96 @@ class Resolution:
     clarify_message: str | None = None
 
 
+def _fill_pending_slot(
+    pending: PendingClarification, text: str, entities: dict
+) -> QueryIR | None:
+    """Merge a short answer ("revenue", "Blue Area") into the pending
+    partial IR's asked-about slots. Returns the filled copy if anything
+    was actually filled, else None (the message didn't answer the
+    question)."""
+    ir = pending.partial_ir.model_copy(deep=True)
+    filled = False
+
+    if any(m == "metric" or m.startswith("metric") for m in pending.missing):
+        metric = fuzzy_resolve_metric(text)
+        if metric:
+            ir.metric = MetricRef(key=metric, confidence=1.0)
+            ir.sort.metric = metric
+            filled = True
+
+    if any(m.startswith("subject") for m in pending.missing):
+        existing = {s.value for s in ir.subjects}
+        for team in entities.get("teams", []):
+            if team not in existing:
+                ir.subjects.append(Subject(type="team", value=team, match_confidence=1.0))
+                filled = True
+        for company in entities.get("companies", []):
+            if company not in existing:
+                ir.subjects.append(Subject(type="company", value=company, match_confidence=1.0))
+                filled = True
+
+    if not filled:
+        return None
+
+    # the gap that made the parser punt to "clarify" is now filled —
+    # promote to an executable intent so revalidation can pass
+    if ir.intent == "clarify":
+        ir.intent = "comparison" if len(ir.subjects) >= 2 else "leaderboard"
+    return ir
+
+
+_GIVE_UP_MESSAGE = (
+    "Let's start over — try a full question like 'top 5 advisors by revenue' "
+    "or 'compare Blue Area with Downtown on achievement %'."
+)
+
+
+def _handle_pending(
+    pending: PendingClarification,
+    cleaned: str,
+    entities: dict,
+    plan: QueryPlan,
+    db: Session,
+    session_id: str | None,
+) -> Resolution | None:
+    """Multi-turn clarification (P6): try to read this message as the
+    answer to the question we asked last turn. Returns a Resolution to
+    serve, or None to fall through to normal processing (the message is
+    its own new query, or we've given up on this clarification)."""
+    is_short = len(re.findall(r"\S+", cleaned)) <= 4
+    filled = _fill_pending_slot(pending, cleaned, entities) if is_short else None
+
+    if filled is not None:
+        result = validate_ir(filled, db)
+        if result.is_valid:
+            conversation_memory.set(session_id, result.ir)  # also closes the pending
+            return Resolution(kind="ir", ir=result.ir, entities=entities)
+        if pending.attempts >= MAX_CLARIFY_ATTEMPTS:
+            conversation_memory.clear_pending(session_id)
+            return Resolution(kind="clarify", entities=entities, clarify_message=_GIVE_UP_MESSAGE)
+        conversation_memory.set_pending(session_id, result.ir, result.missing)
+        return Resolution(
+            kind="clarify", ir=result.ir, entities=entities,
+            clarify_message=build_targeted_clarification(result.missing),
+        )
+
+    # nothing filled: a self-standing query means the user moved on —
+    # drop the pending and answer the new question instead
+    if plan.action != "unresolved" or semantic_parser.looks_compound(cleaned, entities):
+        conversation_memory.clear_pending(session_id)
+        return None
+
+    # short but unhelpful answer — re-ask once, then give up gracefully
+    if pending.attempts >= MAX_CLARIFY_ATTEMPTS:
+        conversation_memory.clear_pending(session_id)
+        return Resolution(kind="clarify", entities=entities, clarify_message=_GIVE_UP_MESSAGE)
+    conversation_memory.set_pending(session_id, pending.partial_ir, pending.missing)
+    return Resolution(
+        kind="clarify", ir=pending.partial_ir, entities=entities,
+        clarify_message=build_targeted_clarification(pending.missing),
+    )
+
+
 def resolve(text: str, db: Session, session_id: str | None = None) -> Resolution:
     cleaned = normalize(text)
 
@@ -68,7 +163,31 @@ def resolve(text: str, db: Session, session_id: str | None = None) -> Resolution
     entities = extract_entities(cleaned, db)
     plan = build_query_plan(cleaned, entities)
 
-    if plan.action in _RULE_BASED_ACTIONS:
+    # an in-flight clarification takes precedence: a bare "revenue" or
+    # "Blue Area" only means something as the answer to last turn's question
+    pending = conversation_memory.get_pending(session_id)
+    if pending is not None:
+        served = _handle_pending(pending, cleaned, entities, plan, db, session_id)
+        if served is not None:
+            return served
+
+    # short follow-up modifiers ("only Graana", "top 5", "sort ascending")
+    # patch the previous turn's IR deterministically — no LLM round trip.
+    # try_patch declines anything that stands alone as its own query.
+    prior_ir = conversation_memory.get(session_id)
+    if prior_ir is not None:
+        patched = try_patch(prior_ir, cleaned, entities, plan.action)
+        if patched is not None:
+            result = validate_ir(patched, db)
+            if result.is_valid:
+                conversation_memory.set(session_id, result.ir)
+                return Resolution(kind="ir", ir=result.ir, entities=entities)
+            # an invalid patch falls through to the normal parse path
+
+    # lookup/summary/attendance_filter stay on the simple rule-based path,
+    # but only when the query doesn't look compound — "summary for Graana
+    # AND Downtown" belongs to the semantic parser, not a single-entity plan.
+    if plan.action in _RULE_BASED_ACTIONS and not semantic_parser.looks_compound(cleaned, entities):
         return Resolution(kind="plan", plan=plan, entities=entities)
 
     outcome = semantic_parser.parse(cleaned, entities, db, session_id)
@@ -82,6 +201,9 @@ def resolve(text: str, db: Session, session_id: str | None = None) -> Resolution
         )
 
     if outcome.ir and outcome.missing:
+        # remember what we asked, so the next message can answer it
+        # (slot-filling, P6) instead of starting from scratch
+        conversation_memory.set_pending(session_id, outcome.ir, outcome.missing)
         return Resolution(
             kind="clarify",
             ir=outcome.ir,

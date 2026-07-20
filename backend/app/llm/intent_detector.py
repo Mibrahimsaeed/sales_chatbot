@@ -35,6 +35,7 @@ REQUIRED_SLOTS = {
     "leaderboard": ["metric"],
     "attendance_check": [],
     "greeting": [],
+    "thanks": [],
     "help": [],
     "unknown": [],
 }
@@ -51,6 +52,17 @@ def classify_intent(text: str, entities: dict) -> IntentResult:
     if re.search(r"^(hi|hello|hey|salam|assalam)\b", q):
         return IntentResult(
             intent="greeting",
+            confidence=1.0,
+            entities=entities
+        )
+
+
+    # ----------------------------
+    # Thanks
+    # ----------------------------
+    if re.search(r"^(thanks|thank you|thankyou|thx|shukriya)\b", q):
+        return IntentResult(
+            intent="thanks",
             confidence=1.0,
             entities=entities
         )

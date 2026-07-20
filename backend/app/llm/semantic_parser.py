@@ -1,19 +1,21 @@
 """
-Orchestrates steps 2-4 of the new pipeline (see nlu_pipeline.py's
-module docstring for the full order):
+Orchestrates the semantic-parse step of the pipeline (see nlu_pipeline.py's
+module docstring for the full order). Two modes, switched by
+settings.nlu_mode (NLU_MODE env var):
 
-  rule-based QueryPlan (cheap, exact) for simple queries
-      -> LLM Semantic Parser (QueryIR) only for compound/ambiguous ones
-      -> IR Validator/Grounder
-      -> fail-soft degrade to the rule-based plan if the LLM is
-         unavailable or returns something invalid
+  "llm_first" (default): the LLM parses EVERY analytical query reaching
+      this module into a QueryIR — the rule-based plan is computed only
+      as the fail-soft degrade target for LLM failure/invalid output.
+      This is the P1 inversion of the NLU rework: regex/rule parsing
+      systematically under-expressed real business queries, so rules are
+      now the safety net, not the front door.
 
-This keeps the property the original pipeline had ("no LLM involved for
-the large majority of real queries") while fixing the actual bottleneck
-the review identified: when a query genuinely needs a compound plan, the
-LLM is now asked to produce a QueryIR that CAN express it, instead of
-being constrained to the same flat single-metric schema the regex layer
-used.
+  "rules_first": the pre-inversion behavior, preserved verbatim as the
+      rollback path — rule-based fast path for simple leaderboards, fuzzy
+      metric widening, LLM only for compound-looking queries.
+
+Both modes end at the same place: IR Validator/Grounder, and never a
+dead end — LLM unavailability degrades to the rule-based plan.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import re
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.llm import conversation_memory
 from app.llm.entity_extractor import get_known_teams, get_known_companies
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
@@ -64,29 +67,9 @@ class ParseOutcome:
         self.used_llm = used_llm
 
 
-def parse(text: str, entities: dict, db: Session, session_id: str | None) -> ParseOutcome:
-    plan: QueryPlan = build_query_plan(text, entities)
-    compound = looks_compound(text, entities)
-
-    # ---- 1. rule-based fast path (skips the LLM for the common case) ----
-    if plan.action == "leaderboard" and not compound:
-        ir = plan_to_ir(plan, entities)
-        result = validate_ir(ir, db)
-        return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=False)
-
-    # ---- 2. widen via fuzzy metric match before reaching for the LLM ----
-    if plan.action == "unresolved" and not compound:
-        widened = fuzzy_resolve_metric(text)
-        if widened:
-            entities = {**entities, "metric": widened}
-            widened_plan = build_query_plan(text, entities)
-            if widened_plan.action == "leaderboard":
-                log.info(f"Fallback reasoning resolved '{text}' via widened metric match: {widened}")
-                ir = plan_to_ir(widened_plan, entities)
-                result = validate_ir(ir, db)
-                return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=False)
-
-    # ---- 3. LLM semantic parser — compound query, or nothing else worked ----
+def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | None) -> QueryIR | None:
+    """One LLM round trip -> QueryIR, or None on any failure (no key,
+    provider error, schema-invalid output)."""
     prior_ir = conversation_memory.get(session_id)
     prompt = build_ir_prompt(
         text,
@@ -96,23 +79,73 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None) -> Par
         prior_ir_json=prior_ir.model_dump_json() if prior_ir else None,
     )
     raw = call_llm_structured(prompt, QUERY_IR_JSON_SCHEMA, schema_name="query_ir")
+    if not raw:
+        return None
+    try:
+        return QueryIR.model_validate(raw)
+    except ValidationError as e:
+        log.warning(f"LLM returned a QueryIR that failed validation: {e}")
+        return None
 
-    ir: QueryIR | None = None
-    if raw:
-        try:
-            ir = QueryIR.model_validate(raw)
-        except ValidationError as e:
-            log.warning(f"LLM returned a QueryIR that failed validation: {e}")
-            ir = None
 
-    # ---- 4. fail-soft degrade ----
-    if ir is None:
-        if plan.action == "leaderboard":
-            ir = plan_to_ir(plan, entities)
-        else:
-            return ParseOutcome(ir=None, missing=["intent"], used_llm=False)
+def _rule_based_ir(text: str, entities: dict, plan: QueryPlan) -> QueryIR | None:
+    """The deterministic degrade target: the rule plan if it resolved to a
+    leaderboard, else one fuzzy-metric widening attempt. None if neither
+    produces something answerable."""
+    if plan.action == "leaderboard":
+        return plan_to_ir(plan, entities)
+    if plan.action == "unresolved":
+        widened = fuzzy_resolve_metric(text)
+        if widened:
+            widened_entities = {**entities, "metric": widened}
+            widened_plan = build_query_plan(text, widened_entities)
+            if widened_plan.action == "leaderboard":
+                log.info(f"Fallback reasoning resolved '{text}' via widened metric match: {widened}")
+                return plan_to_ir(widened_plan, widened_entities)
+    return None
 
+
+def _finish(ir: QueryIR, db: Session, session_id: str | None, used_llm: bool) -> ParseOutcome:
     result = validate_ir(ir, db)
+    result.ir.nlu_mode = settings.nlu_mode
     if result.is_valid:
         conversation_memory.set(session_id, result.ir)
-    return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=True)
+    return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=used_llm)
+
+
+def parse(text: str, entities: dict, db: Session, session_id: str | None) -> ParseOutcome:
+    plan: QueryPlan = build_query_plan(text, entities)
+
+    # ---- llm_first (P1 inversion): LLM parses everything reaching here ----
+    if settings.nlu_mode == "llm_first":
+        ir = _call_llm_for_ir(text, entities, db, session_id)
+        if ir is not None:
+            return _finish(ir, db, session_id, used_llm=True)
+        degraded = _rule_based_ir(text, entities, plan)
+        if degraded is not None:
+            return _finish(degraded, db, session_id, used_llm=False)
+        return ParseOutcome(ir=None, missing=["intent"], used_llm=False)
+
+    # ---- rules_first: pre-inversion behavior, kept as the rollback path ----
+    compound = looks_compound(text, entities)
+
+    # 1. rule-based fast path (skips the LLM for the common case)
+    if plan.action == "leaderboard" and not compound:
+        return _finish(plan_to_ir(plan, entities), db, session_id, used_llm=False)
+
+    # 2. widen via fuzzy metric match before reaching for the LLM
+    if plan.action == "unresolved" and not compound:
+        degraded = _rule_based_ir(text, entities, plan)
+        if degraded is not None:
+            return _finish(degraded, db, session_id, used_llm=False)
+
+    # 3. LLM semantic parser — compound query, or nothing else worked
+    ir = _call_llm_for_ir(text, entities, db, session_id)
+
+    # 4. fail-soft degrade
+    if ir is None:
+        if plan.action != "leaderboard":
+            return ParseOutcome(ir=None, missing=["intent"], used_llm=False)
+        ir = plan_to_ir(plan, entities)
+
+    return _finish(ir, db, session_id, used_llm=True)

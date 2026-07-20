@@ -1,0 +1,109 @@
+# Multi-filter / multi-metric / threshold queries (P4).
+- id: compound-001
+  tags: [compound]
+  query: "Show Graana advisors with attendance at least 90 and achievement above 80, sorted by meetings"
+  expect:
+    entities: {companies: ["Graana"]}
+    ir:
+      metric: total_meetings
+      subject_level: advisor
+      filters:
+        - {field: company, value: "Graana"}
+        - {field: attendance_rate, operator: ">="}
+        - {field: achievement_pct, operator: ">"}
+    sql: {row_count: 1, first_row: {name: "Waqar Haider", value: 12}}
+
+- id: compound-002
+  tags: [compound]
+  query: "advisors with revenue above 400 sorted by attendance rate"
+  expect:
+    ir:
+      metric: attendance_rate
+      filters:
+        - {field: mtd_cleared, operator: ">"}
+    sql: {row_count: 3, first_row: {name: "Waqar Haider", value: 90}}
+
+- id: compound-003
+  tags: [compound]
+  query: "which IMARAT advisors cleared more than 300"
+  expect:
+    entities: {companies: ["IMARAT"]}
+    ir:
+      filters:
+        - {field: company, value: "IMARAT"}
+        - {field: mtd_cleared, operator: ">"}
+    sql: {row_count: 1, first_row: {name: "Bilal Ahmed", value: 500}}
+
+- id: compound-004
+  tags: [compound]
+  query: "top advisors by connects who were late more than 3 times"
+  expect:
+    ir:
+      metric: total_connects
+      filters:
+        - {field: late_count, operator: ">"}
+    sql: {row_count: 3, first_row: {name: "Bilal Ahmed", value: 15}}
+
+- id: compound-005
+  tags: [compound]
+  query: "advisors with achievement below 60 sorted by overdue"
+  expect:
+    ir:
+      metric: overdue
+      filters:
+        - {field: achievement_pct, operator: "<"}
+    sql: {row_count: 2, first_row: {name: "Omar Farooq", value: 600}}
+
+- id: compound-006
+  tags: [compound]
+  query: "Downtown advisors with attendance rate above 60"
+  expect:
+    entities: {teams: ["Downtown"]}
+    ir:
+      filters:
+        - {field: team, value: "Downtown"}
+        - {field: attendance_rate, operator: ">"}
+    sql: {row_count: 1}
+
+- id: compound-007
+  tags: [compound]
+  query: "advisors with more than 15 connects and revenue over 400 sorted by revenue"
+  expect:
+    ir:
+      metric: mtd_cleared
+      filters:
+        - {field: total_connects, operator: ">"}
+        - {field: mtd_cleared, operator: ">"}
+    sql: {row_count: 2, first_row: {name: "Waqar Haider", value: 900}}
+
+- id: compound-008
+  tags: [compound]
+  query: "sort advisors by ytd revenue but only those with mtd revenue under 400"
+  expect:
+    ir:
+      metric: ytd_cleared
+      filters:
+        - {field: mtd_cleared, operator: "<"}
+    sql: {row_count: 3, first_row: {name: "Sana Khan", value: 6000}}
+
+- id: compound-009
+  tags: [compound]
+  query: "top 2 Graana advisors by meetings"
+  expect:
+    entities: {companies: ["Graana"]}
+    ir:
+      metric: total_meetings
+      limit: 2
+      filters:
+        - {field: company, value: "Graana"}
+    sql: {row_count: 2, first_row: {name: "Waqar Haider", value: 12}}
+
+- id: compound-010
+  tags: [compound]
+  query: "advisors who hit at least 75 percent of target but had attendance below 75"
+  expect:
+    ir:
+      filters:
+        - {field: achievement_pct, operator: ">="}
+        - {field: attendance_rate, operator: "<"}
+    sql: {row_count: 1, first_row: {name: "Sana Khan"}}

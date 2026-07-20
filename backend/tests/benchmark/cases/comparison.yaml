@@ -1,0 +1,58 @@
+# Comparisons between named subjects.
+- id: compare-001
+  tags: [comparison, team]
+  query: "compare Blue Area with Downtown on revenue"
+  expect:
+    intent: comparison
+    entities: {teams: ["Blue Area", "Downtown"]}
+    ir: {metric: mtd_cleared, subject_level: team}
+    sql: {row_count: 2, first_row: {name: "Blue Area", value: 1600}}
+
+- id: compare-002
+  tags: [comparison, team]
+  query: "Blue Area vs DHA Phase 5 attendance rate"
+  expect:
+    intent: comparison
+    entities: {teams: ["Blue Area", "DHA Phase 5"]}
+    ir: {metric: attendance_rate, subject_level: team}
+    sql: {row_count: 2, first_row: {name: "Blue Area", value: 85}}
+
+- id: compare-003
+  tags: [comparison, advisor]
+  query: "compare Waqar Haider with Ali Raza on connects"
+  expect:
+    intent: comparison
+    ir: {metric: total_connects, subject_level: advisor}
+    sql: {row_count: 2, first_row: {name: "Waqar Haider", value: 30}}
+
+- id: compare-004
+  tags: [comparison, company]
+  query: "compare Graana and IMARAT revenue"
+  expect:
+    intent: comparison
+    entities: {companies: ["Graana", "IMARAT"]}
+    ir: {metric: mtd_cleared, subject_level: company}
+    sql: {row_count: 2, first_row: {name: "Graana", value: 1900}}
+
+- id: compare-005
+  tags: [comparison, team]
+  query: "which is doing better on overdue, Downtown or Blue Area"
+  expect:
+    intent: comparison
+    entities: {teams: ["Blue Area", "Downtown"]}
+    ir: {metric: overdue, subject_level: team}
+    sql: {row_count: 2}
+
+- id: compare-006
+  tags: [comparison, advisor]
+  query: "Sana Khan versus Bilal Ahmed achievement"
+  expect:
+    intent: comparison
+    ir: {metric: achievement_pct, subject_level: advisor}
+    sql: {row_count: 2, first_row: {name: "Sana Khan", value: 75}}
+
+- id: compare-007
+  tags: [comparison, team]
+  query: "compare all three teams on meetings"
+  expect:
+    ir: {metric: total_meetings, subject_level: team}

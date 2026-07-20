@@ -1,0 +1,100 @@
+# Multi-turn incremental context (P5): each case's `turns` run in one
+# session; expectations apply to the FINAL turn's resolution.
+- id: follow-001
+  tags: [followup]
+  turns:
+    - "show top advisors by revenue"
+    - "only Graana"
+  expect:
+    intent: leaderboard
+    ir:
+      metric: mtd_cleared
+      filters:
+        - {field: company, value: "Graana"}
+    sql: {row_count: 3, first_row: {name: "Waqar Haider", value: 900}}
+
+- id: follow-002
+  tags: [followup]
+  turns:
+    - "show top advisors by revenue"
+    - "top 2"
+  expect:
+    ir: {metric: mtd_cleared, limit: 2}
+    sql: {row_count: 2, first_row: {name: "Waqar Haider", value: 900}}
+
+- id: follow-003
+  tags: [followup]
+  turns:
+    - "show top advisors by revenue"
+    - "sort ascending"
+  expect:
+    ir: {metric: mtd_cleared, sort_direction: asc}
+    sql: {first_row: {name: "Omar Farooq", value: 100}}
+
+- id: follow-004
+  tags: [followup]
+  turns:
+    - "show top advisors by revenue"
+    - "ytd"
+  expect:
+    ir: {metric: ytd_cleared}
+    sql: {first_row: {name: "Ali Raza", value: 9000}}
+
+- id: follow-005
+  tags: [followup]
+  turns:
+    - "show top advisors by revenue"
+    - "only Graana"
+    - "top 2"
+    - "sort ascending"
+  expect:
+    ir:
+      metric: mtd_cleared
+      limit: 2
+      sort_direction: asc
+      filters:
+        - {field: company, value: "Graana"}
+    sql: {row_count: 2, first_row: {name: "Sana Khan", value: 300}}
+
+- id: follow-006
+  tags: [followup]
+  turns:
+    - "top advisors by meetings"
+    - "attendance above 65"
+  expect:
+    ir:
+      metric: total_meetings
+      filters:
+        - {field: attendance_rate, operator: ">"}
+    sql: {row_count: 3, first_row: {name: "Waqar Haider", value: 12}}
+
+- id: follow-007
+  tags: [followup]
+  turns:
+    - "top advisors by revenue"
+    - "only Downtown"
+  expect:
+    ir:
+      filters:
+        - {field: team, value: "Downtown"}
+    sql: {row_count: 2, first_row: {name: "Bilal Ahmed", value: 500}}
+
+- id: follow-008
+  tags: [followup]
+  turns:
+    - "show top advisors by revenue"
+    - "only Graana"
+    - "all companies"
+  expect:
+    ir: {metric: mtd_cleared}
+    sql: {row_count: 6, first_row: {name: "Waqar Haider", value: 900}}
+
+- id: follow-009
+  tags: [followup, newquery]
+  turns:
+    - "show top advisors by revenue"
+    - "which teams have the best attendance rate"
+  expect:
+    intent: leaderboard
+    ir: {metric: attendance_rate, subject_level: team}
+    sql: {first_row: {name: "Blue Area", value: 85}}

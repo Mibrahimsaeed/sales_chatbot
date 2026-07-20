@@ -20,10 +20,10 @@ ask about just the unresolved piece.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 
 from sqlalchemy.orm import Session
 
+from app.llm.fuzzy_match import best_match
 from app.llm.metric_ontology import METRICS
 from app.llm.entity_extractor import get_known_teams, get_known_companies
 from app.llm.query_ir import QueryIR, Subject
@@ -59,24 +59,11 @@ class ValidationResult:
         return not self.missing
 
 
-def _best_match(value: str, candidates: list[str]) -> tuple[str, float] | None:
-    best_name, best_score = None, 0.0
-    for c in candidates:
-        score = SequenceMatcher(None, value.lower(), c.lower()).ratio()
-        if c.lower() == value.lower():
-            return c, 1.0
-        if score > best_score:
-            best_name, best_score = c, score
-    if best_name and best_score >= _MATCH_FLOOR:
-        return best_name, best_score
-    return None
-
-
 def _ground_subject(subject: Subject, db: Session) -> tuple[Subject, str | None]:
     if subject.type == "team":
-        match = _best_match(subject.value, get_known_teams(db))
+        match = best_match(subject.value, get_known_teams(db), kind="team", floor=_MATCH_FLOOR)
     elif subject.type == "company":
-        match = _best_match(subject.value, get_known_companies(db))
+        match = best_match(subject.value, get_known_companies(db), kind="company", floor=_MATCH_FLOOR)
     else:
         # advisor names are matched at lookup time against the DB view —
         # grounding here only affects filter confidence, not existence.
@@ -147,42 +134,64 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
     if ir.intent == "comparison" and len(ir.subjects) < 2:
         missing.append("subjects")
 
+    # intent="clarify" is the parser explicitly saying "ask the user" — it
+    # must NEVER validate clean and get executed. If nothing more specific
+    # was flagged above, ask about the metric (the most common gap).
+    if ir.intent == "clarify" and not missing:
+        missing.append("metric" if ir.metric is None else f"metric_low_confidence:{ir.metric.key}")
+
     ir.missing = missing
     return ValidationResult(ir=ir, missing=missing)
 
 
+# One slot per turn (P6): asking for three things at once gets zero of
+# them answered. Highest-priority unresolved slot wins; the rest get
+# asked on subsequent turns once this one is filled.
+_CLARIFY_PRIORITY = ("unsupported_intent:", "metric", "subject", "filter")
+
+
+def _ask_for(item: str) -> str:
+    if item == "metric":
+        return "which metric you'd like (revenue, connects, achievement %, overdue, etc.)"
+    if item.startswith("metric:"):
+        return f"'{item.split(':', 1)[1]}' isn't a metric I track — which metric did you mean"
+    if item.startswith("metric_low_confidence:"):
+        return f"you meant '{item.split(':', 1)[1]}' as the metric — I wasn't confident enough to assume that"
+    if item.startswith("filter:"):
+        return f"what you mean by '{item.split(':', 1)[1]}'"
+    if item.startswith("filter_low_confidence:"):
+        return f"the '{item.split(':', 1)[1]}' condition — I wasn't confident I understood it correctly"
+    if item.startswith("subject_low_confidence:"):
+        _, s_type, s_value = item.split(":", 2)
+        return f"which {s_type} you meant by '{s_value}' — I wasn't confident enough to assume that"
+    if item.startswith("subject:team:"):
+        return f"which team you meant by '{item.split(':', 2)[2]}'"
+    if item.startswith("subject:company:"):
+        return f"which company you meant by '{item.split(':', 2)[2]}'"
+    if item == "subjects":
+        return "which two (or more) things you'd like to compare"
+    if item.startswith("unsupported_intent:"):
+        _, intent, reason = item.split(":", 2)
+        return f"I can't answer a '{intent}'-style question yet ({reason})"
+    return item
+
+
+def pick_clarification_slot(missing: list[str]) -> str | None:
+    """The single highest-priority missing item to ask about this turn."""
+    if not missing:
+        return None
+    for prefix in _CLARIFY_PRIORITY:
+        for item in missing:
+            if item == prefix or item.startswith(prefix):
+                return item
+    return missing[0]
+
+
 def build_targeted_clarification(missing: list[str]) -> str:
     """Per-field clarification instead of one generic 'I didn't understand'
-    (Root Cause #9 / Part 5.6). Falls back to a single combined question
-    when several fields are unresolved."""
-    if not missing:
+    (Root Cause #9 / Part 5.6). Asks about ONE slot — the highest-priority
+    unresolved one — per turn."""
+    item = pick_clarification_slot(missing)
+    if item is None:
         return "I need a bit more detail to answer that."
-
-    asks = []
-    for item in missing:
-        if item == "metric":
-            asks.append("which metric you'd like (revenue, connects, achievement %, overdue, etc.)")
-        elif item.startswith("metric:"):
-            asks.append(f"'{item.split(':', 1)[1]}' isn't a metric I track")
-        elif item.startswith("metric_low_confidence:"):
-            asks.append(f"you meant '{item.split(':', 1)[1]}' as the metric — I wasn't confident enough to assume that")
-        elif item.startswith("filter:"):
-            asks.append(f"what you mean by '{item.split(':', 1)[1]}'")
-        elif item.startswith("filter_low_confidence:"):
-            asks.append(f"the '{item.split(':', 1)[1]}' condition — I wasn't confident I understood it correctly")
-        elif item.startswith("subject_low_confidence:"):
-            _, s_type, s_value = item.split(":", 2)
-            asks.append(f"which {s_type} you meant by '{s_value}' — I wasn't confident enough to assume that")
-        elif item.startswith("subject:team:"):
-            asks.append(f"which team you meant by '{item.split(':', 2)[2]}'")
-        elif item.startswith("subject:company:"):
-            asks.append(f"which company you meant by '{item.split(':', 2)[2]}'")
-        elif item == "subjects":
-            asks.append("which two (or more) things you'd like to compare")
-        elif item.startswith("unsupported_intent:"):
-            _, intent, reason = item.split(":", 2)
-            asks.append(f"I can't answer a '{intent}'-style question yet ({reason})")
-        else:
-            asks.append(item)
-
-    return "I need a bit more detail — " + "; and ".join(asks) + "?"
+    return "I need a bit more detail — " + _ask_for(item) + "?"

@@ -5,6 +5,7 @@ from app.core.logger import get_logger
 from etl.extract import extract_all
 from etl.transform import transform
 from etl.load import load_all
+from etl.history_snapshot import write_snapshot_safe
 
 log = get_logger("etl.sync")
 
@@ -23,6 +24,9 @@ def run_sync():
         data = transform(raw)
         counts = load_all(data)
         total = counts.get("advisors", 0)
+
+        history_rows = write_snapshot_safe(data)
+        log.info(f"AdvisorHistory snapshot: {history_rows} rows")
 
         db = SessionLocal()
         row = db.get(SyncLog, entry_id)

@@ -1,0 +1,57 @@
+# Ambiguity -> targeted clarification (P6), plus rule-based shortcuts
+# that must NOT reach the LLM.
+- id: clarify-001
+  tags: [clarify]
+  query: "who is struggling"
+  expect:
+    intent: clarify
+
+- id: clarify-002
+  tags: [clarify]
+  query: "show me the numbers"
+  expect:
+    intent: clarify
+
+- id: clarify-003
+  tags: [clarify, multiturn]
+  turns:
+    - "who is struggling"
+    - "achievement"
+  expect:
+    ir: {metric: achievement_pct}
+
+- id: shortcut-001
+  tags: [shortcut]
+  query: "hello"
+  expect:
+    intent: greeting
+
+- id: shortcut-002
+  tags: [shortcut]
+  query: "thanks a lot"
+  expect:
+    intent: thanks
+
+- id: shortcut-003
+  tags: [shortcut]
+  query: "help"
+  expect:
+    intent: help
+
+- id: shortcut-004
+  tags: [shortcut, plan]
+  query: "tell me about Waqar Haider"
+  expect:
+    intent: lookup
+
+- id: shortcut-005
+  tags: [shortcut, plan]
+  query: "how is the Blue Area team doing"
+  expect:
+    intent: summary
+
+- id: shortcut-006
+  tags: [shortcut]
+  query: "who was late today"
+  expect:
+    intent: attendance_check

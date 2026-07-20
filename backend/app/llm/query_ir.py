@@ -73,6 +73,9 @@ class QueryIR(BaseModel):
     group_by: Optional[Level] = None
     overall_confidence: float = 1.0
     missing: list[str] = Field(default_factory=list)
+    # observability only (persisted in ChatLog.resolved_ir): which NLU mode
+    # served this IR — not part of the LLM output schema, never validated
+    nlu_mode: Optional[str] = None
 
 
 def plan_to_ir(plan, entities: dict) -> QueryIR:

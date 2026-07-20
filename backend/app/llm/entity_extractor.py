@@ -28,10 +28,10 @@ and used directly by the rule-based fast path when unambiguous.
 
 import re
 import time
-from difflib import SequenceMatcher
 from sqlalchemy.orm import Session
 from sqlalchemy import distinct
 from app.database.models import Advisor
+from app.llm.fuzzy_match import best_match, find_in_text, STRONG_FLOOR
 
 _CACHE_TTL_SECONDS = 300
 _cache = {"teams": [], "companies": [], "advisor_names": [], "loaded_at": 0}
@@ -87,17 +87,6 @@ def get_known_companies(db: Session) -> list[str]:
     return _cache["companies"]
 
 
-def _best_name_match(text: str, candidates: list[str], cutoff: float = 0.55) -> tuple[str, float] | None:
-    best_name, best_score = None, 0.0
-    for name in candidates:
-        score = SequenceMatcher(None, text.lower(), name.lower()).ratio()
-        if score > best_score:
-            best_name, best_score = name, score
-    if best_name and best_score >= cutoff:
-        return best_name, best_score
-    return None
-
-
 def _extract_thresholds(q: str) -> list[dict]:
     thresholds = []
     for pattern, operator in _THRESHOLD_PATTERNS:
@@ -127,35 +116,55 @@ def extract_entities(text: str, db: Session) -> dict:
 
     entities["thresholds"] = _extract_thresholds(q)
 
-    # companies — collect ALL matches, not just the first (Root Cause #2)
-    companies_found = [c for c in _cache["companies"] if c and c.lower() in q]
-    if companies_found:
-        entities["companies"] = companies_found
-        entities["company"] = companies_found[0]     # backward-compat singular
+    # companies — substring first (exact, confidence 1.0), then a fuzzy
+    # scan for typos ("grana" -> Graana), which only auto-accepts at the
+    # STRONG floor since a false-positive company filter silently narrows
+    # results. ALL matches collected, not just the first (Root Cause #2).
+    company_matches = [
+        {"value": c, "score": 1.0} for c in _cache["companies"] if c and c.lower() in q
+    ]
+    if not company_matches:
+        company_matches = [
+            {"value": c, "score": s}
+            for c, s in find_in_text(q, _cache["companies"], kind="company", floor=STRONG_FLOOR)
+        ]
+    if company_matches:
+        entities["company_matches"] = company_matches
+        entities["companies"] = [m["value"] for m in company_matches]
+        entities["company"] = company_matches[0]["value"]     # backward-compat singular
 
-    # teams — longest match first so "Blue Area" doesn't get shadowed by a
-    # shorter partial hit, and collect ALL matches (comparisons need both)
-    teams_found = [
-        t for t in sorted((t for t in _cache["teams"] if t), key=len, reverse=True)
+    # teams — longest substring match first so "Blue Area" doesn't get
+    # shadowed by a shorter partial hit, then the same fuzzy fallback
+    team_matches = [
+        {"value": t, "score": 1.0}
+        for t in sorted((t for t in _cache["teams"] if t), key=len, reverse=True)
         if t.lower() in q
     ]
-    if teams_found:
-        entities["teams"] = teams_found
-        entities["team"] = teams_found[0]             # backward-compat singular
+    if not team_matches:
+        team_matches = [
+            {"value": t, "score": s}
+            for t, s in find_in_text(q, _cache["teams"], kind="team", floor=STRONG_FLOOR)
+        ]
+    if team_matches:
+        entities["team_matches"] = team_matches
+        entities["teams"] = [m["value"] for m in team_matches]
+        entities["team"] = team_matches[0]["value"]           # backward-compat singular
 
     # advisor name(s) — substring first (cheap, exact), fuzzy fallback
     advisor_names_found = [n for n in _cache["advisor_names"] if n and n.lower() in q]
     matched_name = advisor_names_found[0] if advisor_names_found else None
     if advisor_names_found:
         entities["advisor_names"] = advisor_names_found
+        entities["advisor_matches"] = [{"value": n, "score": 1.0} for n in advisor_names_found]
     if not matched_name:
         # strip common filler so fuzzy matching isn't thrown off by "tell me about"
         cleaned = re.sub(r"tell me about|how is|show me|what about|performance of", "", text, flags=re.I).strip()
         if len(cleaned) > 2:
-            result = _best_name_match(cleaned, _cache["advisor_names"])
+            result = best_match(cleaned, _cache["advisor_names"], kind="advisor")
             if result:
                 matched_name, score = result
                 entities["advisor_match_score"] = round(score, 2)
+                entities["advisor_matches"] = [{"value": matched_name, "score": round(score, 2)}]
     if matched_name:
         entities["advisor_name"] = matched_name
 
