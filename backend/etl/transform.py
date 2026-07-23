@@ -323,19 +323,28 @@ def transform(src: dict) -> dict:
         wid = _wid(wid_raw)
         if wid is None:
             return None
-        a = advisors.setdefault(wid, {"wid": wid})
+        # in_master_sheet defaults False here — only the MasterSheet loop
+        # below ever sets it True. Every other source sheet can introduce
+        # a WID that was never onboarded (raw activity data, terminated
+        # employees, etc.); those rows must not silently look identical
+        # to a real advisor in every leaderboard/summary/lookup.
+        a = advisors.setdefault(wid, {"wid": wid, "in_master_sheet": False})
         _assign(a, "name", name)
         return wid, a
 
     # ---- 1. MasterSheet FIRST — documented authoritative source for org
     #         hierarchy (Company / Regional / Teams / Portfolio Lead /
     #         Management Lead). Runs before CCMC DATA MTD so a blank cell
-    #         downstream can never shadow a good value set here. ----
+    #         downstream can never shadow a good value set here. Also the
+    #         ONLY loop that sets in_master_sheet — a real (not empty)
+    #         assignment, not run through _assign()'s don't-overwrite
+    #         semantics, since every WID here genuinely IS on the sheet. ----
     for row in src["master_sheet"]:
         res = ensure_advisor(row.get("User ID"), row.get("Advisor Name"))
         if not res:
             continue
         _, a = res
+        a["in_master_sheet"] = True
         _assign(a, "company", row.get("Company"))
         _assign(a, "region", row.get("Regional"))
         _assign(a, "team", row.get("Teams"))

@@ -1,5 +1,5 @@
 from app.llm import narrative
-from app.llm.narrative import compute_facts, polish_reply, _numbers_in
+from app.llm.narrative import compute_facts, compute_insights, polish_reply, _numbers_in
 from app.llm.query_ir import Filter, MetricRef, QueryIR, Sort
 
 
@@ -90,3 +90,44 @@ def test_polish_disabled_by_flag(monkeypatch):
 
 def test_number_normalization_treats_90_and_90_point_0_as_equal():
     assert _numbers_in({"v": 90.0}) == _numbers_in("attendance is 90")
+
+
+# ---- compute_insights (Part 8) ----
+
+def test_no_insights_when_values_are_reasonably_uniform():
+    assert compute_insights(_ir(), ROWS) == []
+
+
+def test_flags_outlier_far_above_group_average():
+    skewed_rows = [
+        {"wid": 1, "name": "A", "value": 10.0},
+        {"wid": 2, "name": "B", "value": 10.0},
+        {"wid": 3, "name": "C", "value": 10.0},
+        {"wid": 4, "name": "D", "value": 100.0},
+    ]
+    insights = compute_insights(_ir(), skewed_rows)
+    assert len(insights) == 1
+    assert "D" in insights[0]
+    assert "above" in insights[0]
+
+
+def test_requires_at_least_three_values():
+    assert compute_insights(_ir(), ROWS[:2]) == []
+
+
+def test_zero_spread_produces_no_insights():
+    flat_rows = [{"wid": i, "name": str(i), "value": 50.0} for i in range(4)]
+    assert compute_insights(_ir(), flat_rows) == []
+
+
+def test_insight_quotes_the_actual_row_values():
+    skewed_rows = [
+        {"wid": 1, "name": "A", "value": 10.0},
+        {"wid": 2, "name": "B", "value": 10.0},
+        {"wid": 3, "name": "C", "value": 10.0},
+        {"wid": 4, "name": "D", "value": 100.0},
+    ]
+    insights = compute_insights(_ir(), skewed_rows)
+    used = _numbers_in(insights)
+    # the outlier's own quoted value must be traceable back to real row data
+    assert "100" in used

@@ -195,3 +195,59 @@ def build_targeted_clarification(missing: list[str]) -> str:
     if item is None:
         return "I need a bit more detail to answer that."
     return "I need a bit more detail — " + _ask_for(item) + "?"
+
+
+def clarification_options(item: str | None, db: Session) -> list[str]:
+    """Suggested answers for the slot build_targeted_clarification() just
+    asked about (Part 8) — e.g. the actual metric labels when the gap is
+    'which metric', or the real team/company gazetteer when the gap is
+    which team/company was meant. Empty list when the slot has no
+    enumerable option set (e.g. 'subjects', an unsupported intent) — the
+    plain question text alone is still a complete answer in that case."""
+    if not item:
+        return []
+    if item == "metric" or item.startswith("metric:") or item.startswith("metric_low_confidence:"):
+        return sorted({m.label for m in METRICS.values()})
+    parts = item.split(":")
+    if len(parts) >= 2 and parts[-2] == "team":
+        return get_known_teams(db)
+    if len(parts) >= 2 and parts[-2] == "company":
+        return get_known_companies(db)
+    return []
+
+
+# ---------------------------------------------------------------------
+# Confidence breakdown (Part 8) — per-field confidence already exists on
+# QueryIR (metric.confidence, filters[].confidence, subjects[].match_
+# confidence, overall_confidence); this derives a single {intent, entities,
+# metric, time, filters} view from it instead of asking the LLM for new
+# output fields (which can't be iteratively verified while the API key is
+# quota-exhausted).
+# ---------------------------------------------------------------------
+
+def confidence_breakdown(ir: QueryIR) -> dict:
+    intent_confidence = 0.0 if ir.intent == "clarify" else ir.overall_confidence
+
+    metric_confidence = ir.metric.confidence if ir.metric else 0.0
+    if any(m.startswith("metric") for m in ir.missing):
+        metric_confidence = 0.0
+
+    subject_scores = [s.match_confidence for s in ir.subjects]
+    entities_confidence = sum(subject_scores) / len(subject_scores) if subject_scores else 1.0
+
+    filter_scores = [f.confidence for f in ir.filters]
+    filters_confidence = sum(filter_scores) / len(filter_scores) if filter_scores else 1.0
+
+    # TimeRange has no native confidence field — this is the one honest
+    # approximation here: an explicitly non-default period implies the
+    # parser had a real signal to act on; the default (MTD) is ambiguous
+    # between "the user asked for this month" and "nothing else matched".
+    time_confidence = 0.9 if ir.time_range.period != "MTD" else 0.6
+
+    return {
+        "intent": round(intent_confidence, 2),
+        "entities": round(entities_confidence, 2),
+        "metric": round(metric_confidence, 2),
+        "time": round(time_confidence, 2),
+        "filters": round(filters_confidence, 2),
+    }

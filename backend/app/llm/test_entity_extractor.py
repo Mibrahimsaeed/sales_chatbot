@@ -54,3 +54,21 @@ def test_advisor_fuzzy_match_populates_matches_list(gazetteer_db):
     assert entities["advisor_name"] == "Waqar Haider"
     assert entities["advisor_matches"][0]["value"] == "Waqar Haider"
     assert 0 < entities["advisor_matches"][0]["score"] <= 1.0
+
+
+def test_non_master_sheet_advisor_and_team_are_excluded_from_gazetteer(gazetteer_db):
+    # a raw-data-only WID (never on the MasterSheet) must not ground a
+    # query, or get fuzzy-matched against, as if it were real org data
+    gazetteer_db.add(Advisor(
+        wid=99, name="Raw Data Ghost", team="Ghost Team", company="Ghost Co",
+        in_master_sheet=False,
+    ))
+    gazetteer_db.commit()
+    entity_extractor._cache["loaded_at"] = 0
+
+    entities = extract_entities("show ghost team advisors from ghost co", gazetteer_db)
+    assert "team" not in entities
+    assert "company" not in entities
+
+    entities = extract_entities("tell me about Raw Data Ghost", gazetteer_db)
+    assert entities.get("advisor_name") != "Raw Data Ghost"

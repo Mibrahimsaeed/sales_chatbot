@@ -10,6 +10,19 @@ from app.core.dependencies import get_db
 import app.database.models  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _no_live_semantic_retrieval(monkeypatch):
+    """Part 8: semantic_retrieval.py is a real network call site
+    (embeddings), but only test_semantic_retrieval.py should ever exercise
+    it (with a mocked embed_texts) — every other test's "unresolved" plan
+    path must stay fully offline like it always has. test_semantic_
+    retrieval.py's own fixture re-enables this per test, which runs after
+    this conftest-level fixture for the same (function) scope."""
+    from app.llm import semantic_retrieval
+
+    monkeypatch.setattr(semantic_retrieval.settings, "semantic_retrieval_enabled", False)
+
+
 @pytest.fixture()
 def db_session():
     engine = create_engine(

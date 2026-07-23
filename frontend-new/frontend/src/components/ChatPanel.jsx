@@ -6,7 +6,7 @@ import MessageBubble from './MessageBubble'
 import { useChat } from '../hooks/useChat'
 
 export default function ChatPanel() {
-  const { messages, isLoading, send } = useChat()
+  const { messages, isLoading, send, loadMore, loadingMoreId } = useChat()
   const threadRef = useRef(null)
 
   useEffect(() => {
@@ -21,7 +21,12 @@ export default function ChatPanel() {
       <SuggestionChips onPick={send} />
       <div className="thread" ref={threadRef}>
         {messages.map((m) => (
-          <MessageBubble key={m.id} message={m} />
+          <MessageBubble
+            key={m.id}
+            message={m}
+            onShowMore={loadMore}
+            isLoadingMore={loadingMoreId === m.id}
+          />
         ))}
         {isLoading && (
           <div className="msg bot">

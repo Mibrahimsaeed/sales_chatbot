@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from "react";
-import { sendChatMessage } from "../api/client";
+import { sendChatMessage, fetchMoreResults } from "../api/client";
 
 export function useChat() {
   const [messages, setMessages] = useState([
@@ -12,6 +12,7 @@ export function useChat() {
   ]);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingMoreId, setLoadingMoreId] = useState(null);
 
   const sessionId = useRef(`web-${Date.now()}`);
   const nextId = useRef(1);
@@ -46,6 +47,8 @@ export function useChat() {
             text: response.reply,
             data: response.data,
             metric: response.metric,
+            totalCount: response.total_count,
+            hasMore: response.has_more,
           },
         ]);
       } catch (err) {
@@ -67,9 +70,43 @@ export function useChat() {
     [isLoading]
   );
 
+  // Part 8 (pagination): fetches the next page for a message that has
+  // more results, and appends it to that SAME message's data — no new
+  // chat bubble, "preserving the existing results" as the spec asks.
+  const loadMore = useCallback(
+    async (messageId) => {
+      if (loadingMoreId) return;
+      setLoadingMoreId(messageId);
+
+      try {
+        const response = await fetchMoreResults(sessionId.current);
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId
+              ? {
+                  ...m,
+                  data: [...(m.data || []), ...(response.data || [])],
+                  totalCount: response.total_count,
+                  hasMore: response.has_more,
+                }
+              : m
+          )
+        );
+      } catch (err) {
+        console.error("Show more failed:", err);
+      } finally {
+        setLoadingMoreId(null);
+      }
+    },
+    [loadingMoreId]
+  );
+
   return {
     messages,
     isLoading,
     send,
+    loadMore,
+    loadingMoreId,
   };
 }

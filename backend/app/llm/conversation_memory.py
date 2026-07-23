@@ -36,10 +36,24 @@ class PendingClarification:
 
 
 @dataclass
+class PaginationState:
+    """Part 8: the cursor for a "Show More" continuation — the IR that
+    produced the current result set, how many rows have been shown so
+    far (the next page's OFFSET), and the true total capped by the IR's
+    own limit (if the user asked for an explicit "top N", the cursor
+    stops at N even if more rows technically match)."""
+    ir: QueryIR
+    offset: int
+    capped_total: int
+    saved_at: float = field(default_factory=time.time)
+
+
+@dataclass
 class SessionState:
     saved_at: float = field(default_factory=time.time)
     last_ir: QueryIR | None = None
     pending: PendingClarification | None = None
+    pagination: PaginationState | None = None
 
 
 _store: dict[str, SessionState] = {}
@@ -97,3 +111,40 @@ def clear_pending(session_id: str | None) -> None:
     state = _state(session_id)
     if state:
         state.pending = None
+
+
+def get_pagination(session_id: str | None) -> PaginationState | None:
+    state = _state(session_id)
+    if not state or not state.pagination:
+        return None
+    if time.time() - state.pagination.saved_at > _PENDING_TTL_SECONDS:
+        state.pagination = None
+        return None
+    return state.pagination
+
+
+def set_pagination(session_id: str | None, ir: QueryIR, offset: int, capped_total: int) -> None:
+    """Records a fresh "Show More" cursor for the query that just
+    resolved. Called by chat_service._dispatch_ir right after `set()`
+    stores the new last_ir — set() already wiped any previous pagination
+    state (it replaces the whole SessionState), so this is establishing
+    the cursor for the CURRENT query, not overwriting a stale one."""
+    if not session_id:
+        return
+    state = _state(session_id) or SessionState()
+    state.pagination = PaginationState(ir=ir, offset=offset, capped_total=capped_total)
+    state.saved_at = time.time()
+    _store[session_id] = state
+
+
+def advance_pagination(session_id: str | None, new_offset: int) -> None:
+    state = _state(session_id)
+    if state and state.pagination:
+        state.pagination.offset = new_offset
+        state.pagination.saved_at = time.time()
+
+
+def clear_pagination(session_id: str | None) -> None:
+    state = _state(session_id)
+    if state:
+        state.pagination = None

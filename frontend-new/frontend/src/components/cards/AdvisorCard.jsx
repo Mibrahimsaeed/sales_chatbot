@@ -6,6 +6,7 @@ export default function AdvisorCard({ a }) {
   const connects = (a.mtd_new_connect || 0) + (a.mtd_followup_connect || 0)
   const meetings = (a.mtd_new_meeting || 0) + (a.mtd_followup_meeting || 0)
   const pctClass = a.mtd_pct >= 1 ? 'good' : a.mtd_pct >= 0.6 ? 'warn' : 'bad'
+  const ytdPctClass = a.ytd_pct >= 1 ? 'good' : a.ytd_pct >= 0.6 ? 'warn' : 'bad'
   const bioClass =
     a.biometric_status === 'On Time' ? 'good' : a.biometric_status === 'Late' ? 'warn' : 'bad'
   const loginClass = a.login_status?.includes('Before') ? 'good' : 'bad'
@@ -52,6 +53,16 @@ export default function AdvisorCard({ a }) {
           <span className="r">
             {fmtPKR(a.mtd_target)} / {fmtPKR(a.mtd_cleared)}{' '}
             <span className={`pill ${pctClass}`}>{fmtPct(a.mtd_pct)}</span>
+          </span>
+        </div>
+      )}
+
+      {a.ytd_target != null && (
+        <div className="row">
+          <span className="l">YTD Target / Cleared</span>
+          <span className="r">
+            {fmtPKR(a.ytd_target)} / {fmtPKR(a.ytd_cleared)}{' '}
+            <span className={`pill ${ytdPctClass}`}>{fmtPct(a.ytd_pct)}</span>
           </span>
         </div>
       )}

@@ -3,8 +3,8 @@ Performance-backed metric while filtering by a DIFFERENT Performance-backed
 metric with a different `period` used to silently apply the filter against
 the sort metric's period instead of its own."""
 
-from app.database.models import Advisor, Attendance, Performance, PerformancePeriod, SalesFunnel
-from app.llm.query_compiler import compile_and_run
+from app.database.models import Advisor, Attendance, Performance, PerformancePeriod, SalesFunnel, TeamTarget
+from app.llm.query_compiler import compile_and_run, count_ir
 from app.llm.query_ir import Filter, MetricRef, QueryIR, Sort
 
 
@@ -177,3 +177,122 @@ def test_team_level_rollup_still_sums_correctly(db_session):
     rows = compile_and_run(db_session, ir)
 
     assert rows == [{"wid": None, "name": "Alpha", "team": "Alpha", "company": None, "value": 300}]
+
+
+def test_non_master_sheet_advisor_excluded_from_advisor_level_leaderboard(db_session):
+    """A WID that only ever appeared in a raw activity sheet (never the
+    MasterSheet) must not show up in leaderboards alongside real advisors
+    — this used to mix "who has most connects" results with junk data."""
+    db_session.add(Advisor(wid=1, name="Real Advisor", team="Alpha", company="IMARAT", in_master_sheet=True))
+    db_session.add(SalesFunnel(wid=1, mtd_new_connect=100, mtd_followup_connect=0))
+    db_session.add(Advisor(wid=2, name="Raw Data Ghost", team="Alpha", company="IMARAT", in_master_sheet=False))
+    db_session.add(SalesFunnel(wid=2, mtd_new_connect=900, mtd_followup_connect=0))
+    db_session.commit()
+
+    ir = QueryIR(
+        intent="leaderboard",
+        subject_level="advisor",
+        metric=MetricRef(key="total_connects"),
+        sort=Sort(metric="total_connects", direction="desc"),
+        limit=10,
+    )
+
+    rows = compile_and_run(db_session, ir)
+
+    assert [r["name"] for r in rows] == ["Real Advisor"]
+
+
+def test_non_master_sheet_advisor_excluded_from_team_rollup(db_session):
+    db_session.add(Advisor(wid=1, name="A", team="Alpha", company="IMARAT", in_master_sheet=True))
+    db_session.add(SalesFunnel(wid=1, mtd_new_connect=100, mtd_followup_connect=0))
+    db_session.add(Advisor(wid=2, name="Ghost", team="Alpha", company="IMARAT", in_master_sheet=False))
+    db_session.add(SalesFunnel(wid=2, mtd_new_connect=900, mtd_followup_connect=0))
+    db_session.commit()
+
+    ir = QueryIR(
+        intent="leaderboard",
+        subject_level="team",
+        metric=MetricRef(key="total_connects"),
+        sort=Sort(metric="total_connects", direction="desc"),
+        limit=10,
+    )
+
+    rows = compile_and_run(db_session, ir)
+
+    # only the real advisor's 100 connects should count, not the ghost's 900
+    assert rows == [{"wid": None, "name": "Alpha", "team": "Alpha", "company": None, "value": 100}]
+
+
+# ---- Part 8: pagination — count_ir + compile_and_run(offset=) ----
+
+def _seed_n_advisors(db, n, team="Alpha", company="IMARAT", start_wid=1):
+    for i in range(n):
+        wid = start_wid + i
+        db.add(Advisor(wid=wid, name=f"Advisor {i + 1}", team=team, company=company))
+        db.add(SalesFunnel(wid=wid, mtd_new_connect=100 - i, mtd_followup_connect=0))
+
+
+def _ir(**overrides):
+    base = dict(
+        intent="leaderboard",
+        subject_level="advisor",
+        metric=MetricRef(key="total_connects"),
+        sort=Sort(metric="total_connects", direction="desc"),
+        limit=10,
+    )
+    base.update(overrides)
+    return QueryIR(**base)
+
+
+def test_count_ir_matches_total_rows_at_advisor_level(db_session):
+    _seed_n_advisors(db_session, 20)
+    db_session.commit()
+
+    assert count_ir(db_session, _ir(limit=None)) == 20
+
+
+def test_count_ir_ignores_limit_returns_true_total(db_session):
+    """count_ir reports the TRUE total regardless of ir.limit — capping
+    against ir.limit is the caller's (chat_service's) job, not the
+    compiler's, so the same count_ir call works whether or not the
+    query has an explicit top-N."""
+    _seed_n_advisors(db_session, 20)
+    db_session.commit()
+
+    assert count_ir(db_session, _ir(limit=5)) == 20
+
+
+def test_count_ir_counts_groups_not_rows_for_team_rollup(db_session):
+    _seed_n_advisors(db_session, 5, team="Alpha", start_wid=1)
+    _seed_n_advisors(db_session, 3, team="Beta", start_wid=101)
+    db_session.commit()
+
+    total = count_ir(db_session, _ir(subject_level="team", limit=None))
+    assert total == 2  # two teams, not eight advisor rows
+
+
+def test_compile_and_run_offset_returns_next_slice(db_session):
+    _seed_n_advisors(db_session, 20)
+    db_session.commit()
+
+    page1 = compile_and_run(db_session, _ir(limit=10), offset=0)
+    page2 = compile_and_run(db_session, _ir(limit=10), offset=10)
+
+    assert [r["name"] for r in page1] == [f"Advisor {i}" for i in range(1, 11)]
+    assert [r["name"] for r in page2] == [f"Advisor {i}" for i in range(11, 21)]
+    assert not set(r["wid"] for r in page1) & set(r["wid"] for r in page2)
+
+
+def test_count_ir_for_team_named_metric(db_session):
+    db_session.add(TeamTarget(team="Alpha", target=1000, achieved=500, achievement_pct=50))
+    db_session.add(TeamTarget(team="Beta", target=2000, achieved=1000, achievement_pct=50))
+    db_session.commit()
+
+    ir = QueryIR(
+        intent="leaderboard",
+        subject_level="team",
+        metric=MetricRef(key="achievement_pct"),
+        sort=Sort(metric="achievement_pct", direction="desc"),
+        limit=None,
+    )
+    assert count_ir(db_session, ir) == 2

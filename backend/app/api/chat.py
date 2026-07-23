@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from app.core.dependencies import get_db, get_current_user
-from app.services.chat_service import handle_chat_message
+from app.services.chat_service import handle_chat_message, handle_show_more
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -20,6 +20,15 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class ShowMoreRequest(BaseModel):
+    """Part 8: the button-click path for pagination — bypasses NLU
+    entirely (no text to parse), fetching the next page straight off the
+    session's pagination cursor. See nlu_pipeline.py's typed "show more"
+    recognition for the other trigger path, which reuses the same
+    chat_service.handle_show_more()."""
+    session_id: str
+
+
 @router.post("")
 def chat(
     payload: ChatRequest,
@@ -27,3 +36,12 @@ def chat(
     user=Depends(get_current_user),
 ):
     return handle_chat_message(db, payload.message, session_id=payload.session_id)
+
+
+@router.post("/more")
+def chat_more(
+    payload: ShowMoreRequest,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return handle_show_more(db, payload.session_id)

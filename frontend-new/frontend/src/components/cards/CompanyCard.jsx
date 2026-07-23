@@ -5,6 +5,8 @@ export default function CompanyCard({ c }) {
 
   const pct = c.mtd_target ? c.mtd_cleared / c.mtd_target : 0
   const pctClass = pct >= 1 ? 'good' : pct >= 0.6 ? 'warn' : 'bad'
+  const ytdPct = c.ytd_target ? c.ytd_cleared / c.ytd_target : 0
+  const ytdPctClass = ytdPct >= 1 ? 'good' : ytdPct >= 0.6 ? 'warn' : 'bad'
 
   return (
     <div className="card">
@@ -37,6 +39,21 @@ export default function CompanyCard({ c }) {
           {fmtPKR(c.mtd_cleared)} <span className={`pill ${pctClass}`}>{fmtPct(pct)}</span>
         </span>
       </div>
+
+      {c.ytd_target != null && (
+        <>
+          <div className="row">
+            <span className="l">YTD Target</span>
+            <span className="r">{fmtPKR(c.ytd_target)}</span>
+          </div>
+          <div className="row">
+            <span className="l">YTD Cleared</span>
+            <span className="r">
+              {fmtPKR(c.ytd_cleared)} <span className={`pill ${ytdPctClass}`}>{fmtPct(ytdPct)}</span>
+            </span>
+          </div>
+        </>
+      )}
     </div>
   )
 }

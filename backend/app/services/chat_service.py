@@ -1,8 +1,11 @@
 from sqlalchemy.orm import Session
 
-from app.llm import narrative
+from app.llm import conversation_memory, narrative
+from app.llm.ir_validator import confidence_breakdown
 from app.llm.nlu_pipeline import resolve, Resolution
-from app.llm.query_compiler import compile_and_run
+from app.llm.query_compiler import compile_and_run, count_ir
+from app.llm.query_ir import QueryIR
+from app.llm.response_planner import plan_response
 from app.llm.response_formatter import (
     format_advisor_reply,
     format_team_reply,
@@ -22,6 +25,28 @@ from app.database.models import ChatLog
 
 log = get_logger("services.chat_service")
 
+# Part 8: pagination. A result set bigger than this shows only the first
+# page plus a "Show More" control instead of dumping everything into one
+# reply — see nlu_pipeline.py's typed "show more" recognition and the new
+# POST /chat/more endpoint (app/api/chat.py) for the two ways a
+# continuation gets triggered; both end up calling handle_show_more() below.
+PAGE_SIZE = 15
+
+
+def _capped_total(ir: QueryIR, true_total: int) -> int:
+    """The total pagination should count toward: the true DB match count,
+    unless the user explicitly asked for a bounded "top N" (ir.limit),
+    in which case N is the ceiling even if more rows technically match."""
+    return min(true_total, ir.limit) if ir.limit is not None else true_total
+
+
+def _page_ir(ir: QueryIR, offset: int, capped_total: int) -> QueryIR:
+    """A COPY of ir with limit shrunk to exactly this page's size — never
+    mutates the stored ir, since later pages (and "Show More") still need
+    its original limit/filters/sort untouched."""
+    take = min(PAGE_SIZE, max(capped_total - offset, 0))
+    return ir.model_copy(update={"limit": take})
+
 
 def handle_chat_message(
     db: Session,
@@ -31,24 +56,76 @@ def handle_chat_message(
     resolution = resolve(message, db, session_id=session_id)
     log.debug(f"resolved '{message}' -> kind={resolution.kind}")
 
-    response = _dispatch(db, resolution)
+    response = _dispatch(db, resolution, session_id)
     _log_interaction(db, session_id, message, resolution, response)
     return response
 
 
-def _dispatch(db: Session, resolution: Resolution) -> dict:
+def handle_show_more(db: Session, session_id: str | None) -> dict:
+    """Part 8: the single implementation behind both "Show More" triggers
+    — the dedicated POST /chat/more endpoint (button click, no re-parse)
+    and nlu_pipeline recognizing typed "show more" (kind="paginate").
+    Fetches the NEXT page only; the caller (frontend) appends it to what
+    it already has, per the pagination cursor in conversation_memory."""
+    state = conversation_memory.get_pagination(session_id)
+    if state is None:
+        return {
+            "type": "text",
+            "reply": "There's nothing more to show right now — try asking a new question.",
+            "data": None,
+        }
+
+    # capture these BEFORE advance_pagination/clear_pagination — state is a
+    # mutable reference into the stored PaginationState (get_pagination
+    # doesn't copy it), so mutating it in place would silently change
+    # what state.offset means out from under the rest of this function
+    page_offset = state.offset
+    ir = state.ir
+    capped_total = state.capped_total
+
+    page_ir = _page_ir(ir, page_offset, capped_total)
+    rows = compile_and_run(db, page_ir, offset=page_offset)
+    new_shown = page_offset + len(rows)
+    has_more = capped_total > new_shown
+
+    if has_more:
+        conversation_memory.advance_pagination(session_id, new_shown)
+    else:
+        conversation_memory.clear_pagination(session_id)
+
+    reply = format_ir_reply(
+        ir, rows, total_count=capped_total, start_index=page_offset + 1, paginated=True
+    )
+    return {
+        "type": ir.intent,
+        "reply": reply,
+        "data": rows,
+        "total_count": capped_total,
+        "shown_count": new_shown,
+        "has_more": has_more,
+    }
+
+
+def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
     if resolution.kind == "shortcut":
         return _dispatch_shortcut(db, resolution.shortcut_intent, resolution.entities)
+
+    if resolution.kind == "multi":
+        return _dispatch_multi(db, resolution, session_id)
+
+    if resolution.kind == "paginate":
+        return handle_show_more(db, session_id)
 
     if resolution.kind == "clarify":
         return {
             "type": "clarification",
             "reply": resolution.clarify_message,
             "data": None,
+            "options": resolution.clarify_options or [],
         }
 
     if resolution.kind == "ir":
-        return _dispatch_ir(db, resolution)
+        return _dispatch_ir(db, resolution, session_id)
 
     # kind == "plan" — lookup / summary / attendance_filter, unchanged from
     # the previous design (see nlu_pipeline.py's docstring for why these
@@ -90,15 +167,15 @@ def _dispatch(db: Session, resolution: Resolution) -> dict:
     return {"type": "unknown", "reply": "I'm not sure how to answer that yet.", "data": None}
 
 
-def _dispatch_ir(db: Session, resolution: Resolution) -> dict:
+def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
     """New path (Part 4/5.5): any query the generic compiler can answer —
     leaderboards, comparisons, and filtered/thresholded/boolean-combined
     queries — regardless of whether the QueryIR came from the rule-based
     fast path or the LLM Semantic Parser."""
     ir = resolution.ir
-    rows = compile_and_run(db, ir)
+    true_total = count_ir(db, ir)
 
-    if rows is None:
+    if true_total is None:
         metric_label = ir.sort.metric or (ir.metric.key if ir.metric else "that metric")
         return {
             "type": "unknown",
@@ -106,12 +183,68 @@ def _dispatch_ir(db: Session, resolution: Resolution) -> dict:
             "data": None,
         }
 
-    reply = format_ir_reply(ir, rows)
+    # Part 8: cap the first page at PAGE_SIZE regardless of how many rows
+    # actually match — a "Show More" cursor picks up the rest instead of
+    # dumping hundreds of rows into one reply.
+    capped_total = _capped_total(ir, true_total)
+    rows = compile_and_run(db, _page_ir(ir, 0, capped_total), offset=0)
+    has_more = capped_total > len(rows)
+
+    if has_more:
+        conversation_memory.set_pagination(session_id, ir, offset=len(rows), capped_total=capped_total)
+    else:
+        conversation_memory.clear_pagination(session_id)
+
+    reply = format_ir_reply(ir, rows, total_count=capped_total, paginated=has_more)
+    insights: list[str] = []
     if rows:
         # narrative polish (P7): deterministic facts + LLM phrasing only,
-        # fail-soft back to the templated reply (see narrative.py)
-        reply = narrative.polish_reply(narrative.compute_facts(ir, rows), reply)
-    return {"type": ir.intent, "reply": reply, "data": rows}
+        # fail-soft back to the templated reply (see narrative.py). Facts/
+        # insights are computed over the DISPLAYED page only, same as
+        # before pagination existed — not the full (possibly 500+ row)
+        # match set.
+        facts = narrative.compute_facts(ir, rows)
+        reply = narrative.polish_reply(facts, reply)
+        # Part 8: only attach outlier insights when the response planner
+        # judges the result set large enough for "outlier" to mean
+        # anything (2-row comparisons don't have a meaningful peer group)
+        if plan_response(ir, rows).show_insights:
+            insights = narrative.compute_insights(ir, rows)
+    return {
+        "type": ir.intent,
+        "reply": reply,
+        "data": rows,
+        "insights": insights,
+        "confidence": confidence_breakdown(ir),
+        "total_count": capped_total,
+        "shown_count": len(rows),
+        "has_more": has_more,
+    }
+
+
+def _dispatch_multi(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
+    """Part 8, light multi-intent: each section of a compound utterance
+    was already resolved independently by nlu_pipeline.split_subqueries()
+    — dispatch each through the normal single-query path and stitch the
+    replies into labeled sections. No new response type per section;
+    reuses whatever _dispatch() already does for that section's kind.
+    Pagination note: each section still runs through _dispatch_ir's own
+    15-per-page cap, but since set_pagination() is called once per
+    section, only the LAST section's "Show More" cursor survives — the
+    same documented limitation multi-intent already has for
+    conversation_memory in general."""
+    sections = resolution.sections or []
+    parts = []
+    all_data = []
+    for i, (_text, sub_resolution) in enumerate(sections, start=1):
+        sub_response = _dispatch(db, sub_resolution, session_id)
+        parts.append(f"{i}. {sub_response['reply']}")
+        all_data.append(sub_response.get("data"))
+    return {
+        "type": "multi",
+        "reply": "\n\n".join(parts),
+        "data": all_data,
+    }
 
 
 def _dispatch_shortcut(db: Session, intent: str, entities: dict) -> dict:
@@ -161,6 +294,12 @@ def _log_interaction(
         elif resolution.kind == "ir":
             detected_intent = resolution.ir.intent
             confidence = resolution.ir.overall_confidence
+        elif resolution.kind == "multi":
+            detected_intent = "multi"
+            sub_confidences = [
+                r.ir.overall_confidence for _t, r in (resolution.sections or []) if r.ir is not None
+            ]
+            confidence = sum(sub_confidences) / len(sub_confidences) if sub_confidences else 0.5
         else:
             detected_intent = "clarify"
             confidence = 0.0

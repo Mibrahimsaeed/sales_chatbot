@@ -32,15 +32,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import distinct
 from app.database.models import Advisor
 from app.llm.fuzzy_match import best_match, find_in_text, STRONG_FLOOR
+from app.llm.temporal_parser import parse_period
 
 _CACHE_TTL_SECONDS = 300
 _cache = {"teams": [], "companies": [], "advisor_names": [], "loaded_at": 0}
-
-PERIOD_KEYWORDS = {
-    "mtd": "MTD", "this month": "MTD", "month": "MTD",
-    "ytd": "YTD", "this year": "YTD", "year": "YTD",
-    "3m": "3M", "quarter": "3M", "three month": "3M",
-}
 ATTENDANCE_STATUS_KEYWORDS = {
     "not marked": "Not Marked",
     "late": "Late",
@@ -71,9 +66,13 @@ def _refresh_cache(db: Session):
     now = time.time()
     if _cache["loaded_at"] and now - _cache["loaded_at"] < _CACHE_TTL_SECONDS:
         return
-    _cache["teams"] = [t for (t,) in db.query(distinct(Advisor.team)).filter(Advisor.team.isnot(None)).all()]
-    _cache["companies"] = [c for (c,) in db.query(distinct(Advisor.company)).filter(Advisor.company.isnot(None)).all()]
-    _cache["advisor_names"] = [n for (n,) in db.query(Advisor.name).all()]
+    # in_master_sheet=True only — a team/company/advisor name that only
+    # exists because of a raw-data-only WID shouldn't ground a query or
+    # get fuzzy-matched against (see models.py's in_master_sheet docstring).
+    master_only = Advisor.in_master_sheet.is_(True)
+    _cache["teams"] = [t for (t,) in db.query(distinct(Advisor.team)).filter(Advisor.team.isnot(None), master_only).all()]
+    _cache["companies"] = [c for (c,) in db.query(distinct(Advisor.company)).filter(Advisor.company.isnot(None), master_only).all()]
+    _cache["advisor_names"] = [n for (n,) in db.query(Advisor.name).filter(master_only).all()]
     _cache["loaded_at"] = now
 
 
@@ -105,10 +104,18 @@ def extract_entities(text: str, db: Session) -> dict:
             entities["attendance_status"] = status
             break
 
-    for kw, period in PERIOD_KEYWORDS.items():
-        if kw in q:
-            entities["period"] = period
-            break
+    # Part 8: parse_period() replaces the old bare "month"/"year" keyword
+    # map, which used to silently turn "last month" into MTD. Genuinely
+    # unsupported windows (last month, yesterday, this week, past N days,
+    # custom ranges) are surfaced as period_unsupported instead of a
+    # silently wrong period — never set alongside "period".
+    temporal = parse_period(q)
+    if temporal is not None:
+        if temporal.kind == "equivalent":
+            entities["period"] = temporal.period
+            entities["period_confidence"] = temporal.confidence
+        else:
+            entities["period_unsupported"] = temporal.reason
 
     limit_match = re.search(r"top\s+(\d+)", q)
     if limit_match:

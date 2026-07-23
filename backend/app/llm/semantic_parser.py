@@ -26,7 +26,7 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.llm import conversation_memory
+from app.llm import conversation_memory, semantic_retrieval
 from app.llm.entity_extractor import get_known_teams, get_known_companies
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.ir_validator import validate_ir
@@ -90,12 +90,15 @@ def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | N
 
 def _rule_based_ir(text: str, entities: dict, plan: QueryPlan) -> QueryIR | None:
     """The deterministic degrade target: the rule plan if it resolved to a
-    leaderboard, else one fuzzy-metric widening attempt. None if neither
-    produces something answerable."""
+    leaderboard, else a widening attempt — fuzzy synonym match first
+    (typos, "revnue"), then embedding-based semantic retrieval (Part 8)
+    for genuine paraphrases with no lexical overlap ("who's crushing it"
+    for achievement_pct). None if nothing produces something answerable.
+    """
     if plan.action == "leaderboard":
         return plan_to_ir(plan, entities)
     if plan.action == "unresolved":
-        widened = fuzzy_resolve_metric(text)
+        widened = fuzzy_resolve_metric(text) or semantic_retrieval.retrieve_metric(text)
         if widened:
             widened_entities = {**entities, "metric": widened}
             widened_plan = build_query_plan(text, widened_entities)

@@ -33,6 +33,7 @@ def get_attendance_issues(db: Session, team: str | None = None, limit: int | Non
         .join(Attendance, Attendance.wid == Advisor.wid)
         .filter(Attendance.biometric_status.isnot(None))
         .filter(Attendance.biometric_status != "On Time")
+        .filter(Advisor.in_master_sheet.is_(True))
     )
 
     if team:
@@ -88,6 +89,7 @@ def get_attendance_by_status(
         .filter(
             Attendance.biometric_status == status
         )
+        .filter(Advisor.in_master_sheet.is_(True))
     )
 
     if team:

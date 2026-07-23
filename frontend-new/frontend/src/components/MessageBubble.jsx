@@ -4,8 +4,8 @@ import CompanyCard from './cards/CompanyCard'
 import LeaderboardCard from './cards/LeaderboardCard'
 import AttendanceCard from './cards/AttendanceCard'
 
-export default function MessageBubble({ message }) {
-  const { role, text, kind, data, metric } = message
+export default function MessageBubble({ message, onShowMore, isLoadingMore }) {
+  const { role, text, kind, data, metric, hasMore, totalCount } = message
 
   if (role === 'user') {
     return (
@@ -17,13 +17,41 @@ export default function MessageBubble({ message }) {
 
   const hasCard = ['advisor', 'team', 'company', 'leaderboard', 'attendance'].includes(kind)
 
+  // Part 8 (pagination): comparison/filtered_list responses have no
+  // dedicated card — the "Showing X of Y" wording is already baked into
+  // `text` by the backend, this just adds the button itself.
+  const showMoreButton = hasMore && (
+    <button
+      className="chip show-more-btn"
+      onClick={() => onShowMore(message.id)}
+      disabled={isLoadingMore}
+    >
+      {isLoadingMore ? 'Loading…' : 'Show More'}
+    </button>
+  )
+
   return (
     <div className="msg bot">
-      {text && !hasCard && <div className="bubble">{text}</div>}
+      {text && !hasCard && (
+        <div className="bubble">
+          {text}
+          {showMoreButton}
+        </div>
+      )}
       {kind === 'advisor' && <AdvisorCard a={data} />}
       {kind === 'team' && <TeamCard t={data} />}
       {kind === 'company' && <CompanyCard c={data} />}
-      {kind === 'leaderboard' && <LeaderboardCard rows={data} metric={metric} title={text} />}
+      {kind === 'leaderboard' && (
+        <LeaderboardCard
+          rows={data}
+          metric={metric}
+          title={text}
+          totalCount={totalCount}
+          hasMore={hasMore}
+          onShowMore={() => onShowMore(message.id)}
+          isLoadingMore={isLoadingMore}
+        />
+      )}
       {kind === 'attendance' && <AttendanceCard rows={data} />}
     </div>
   )

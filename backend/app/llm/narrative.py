@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -68,6 +69,50 @@ def compute_facts(ir: QueryIR, rows: list[dict]) -> dict:
                 facts["lead_pct"] = _round(lead * 100.0 / abs(values[-1]))
 
     return facts
+
+
+_OUTLIER_Z = 1.5
+
+
+def compute_insights(ir: QueryIR, rows: list[dict]) -> list[str]:
+    """Part 8: within-result anomaly/outlier detection, pure Python (no
+    LLM — zero hallucination risk, no quota dependency). Flags entries far
+    from their peers' mean in the CURRENT result set. This is deliberately
+    NOT period-over-period trend detection (that needs historical
+    snapshots — AdvisorHistory, out of scope for now); it answers "which
+    of these results stands out and why", not "what changed since last
+    time". Every number quoted is read straight from `rows`, so it's
+    automatically consistent with compute_facts() — no separate evidence
+    guard needed, unlike polish_reply()'s LLM-output check."""
+    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    label = METRICS[metric_key].label if metric_key in METRICS else (metric_key or "value")
+
+    values = [r["value"] for r in rows if r.get("value") is not None]
+    if len(values) < 3:
+        return []
+
+    mean = statistics.fmean(values)
+    stdev = statistics.pstdev(values)
+    if not stdev:
+        return []
+
+    insights: list[str] = []
+    for r in rows:
+        value = r.get("value")
+        if value is None:
+            continue
+        z = (value - mean) / stdev
+        if abs(z) < _OUTLIER_Z:
+            continue
+        direction = "above" if z > 0 else "below"
+        pct = abs(value - mean) / abs(mean) * 100 if mean else 0
+        insights.append(
+            f"{r['name']}'s {label} ({value:,.0f}) is {pct:.0f}% {direction} the group average ({mean:,.0f})."
+        )
+        if len(insights) == 3:
+            break
+
+    return insights
 
 
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")

@@ -1,28 +1,34 @@
 import json
-from openai import OpenAI
+
+import ollama
+
 from app.core.config import settings
 from app.core.logger import get_logger
 
 log = get_logger("llm.client")
 
-# timeout + one SDK-level retry (connection errors / 429 / 5xx): with the
-# LLM now the primary parser, an unbounded hang here would stall every
-# analytical chat request — bound it and let semantic_parser's fail-soft
-# degrade path take over instead.
-_client = (
-    OpenAI(api_key=settings.openai_api_key, timeout=15.0, max_retries=1)
-    if settings.openai_api_key
-    else None
-)
+# Local Ollama server — no API key, so there's no "key missing" precondition
+# to gate on like the old OpenAI client had. Client construction is cheap
+# and doesn't connect eagerly; "unavailable" (daemon down, model not
+# pulled, timeout) surfaces as an exception at call time, caught by each
+# function below exactly like every other failure mode already was.
+_client = ollama.Client(host=settings.ollama_host, timeout=15.0)
 
-# Hand-written rather than derived from QueryIR.model_json_schema(): OpenAI's
-# strict structured-output mode requires every property "required" (optional
-# fields are expressed as a type union with "null", not by omission) and
-# additionalProperties: false at every object level. Pydantic v2's generated
-# schema doesn't emit that shape out of the box, and reshaping it generically
-# on every call is more moving parts than hand-maintaining one schema that
-# mirrors query_ir.QueryIR field-for-field (see prompt_builder.IR_SCHEMA,
-# which documents the same shape for the model to read).
+# Ollama unloads a model from memory after its keep_alive window of
+# inactivity (default 5m) — the next request then pays a ~15-30s reload
+# cost. Chat traffic is bursty, not constant, so a generous window here
+# (instead of Ollama's default) keeps qwen3 resident through normal gaps
+# between messages; app startup (main.py) also warms it once at boot so
+# the FIRST real request isn't the one that pays the cold-start cost.
+_KEEP_ALIVE = "30m"
+
+# Hand-written rather than derived from QueryIR.model_json_schema(): keeping
+# one schema that mirrors query_ir.QueryIR field-for-field (see
+# prompt_builder.IR_SCHEMA, which documents the same shape for the model to
+# read) is simpler than reshaping pydantic's generated schema on every call.
+# Passed to Ollama's `format` param as-is — Ollama's grammar-constrained
+# decoding reads standard JSON Schema (type/properties/required/enum/anyOf),
+# no OpenAI-specific wrapper needed.
 QUERY_IR_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -95,36 +101,30 @@ QUERY_IR_JSON_SCHEMA = {
 
 
 def call_llm_structured(prompt: str, schema: dict, schema_name: str) -> dict | None:
-    """API-enforced structured output (Part 5.3): the model is constrained
-    to the given JSON schema server-side, so a malformed shape becomes a
-    provider-level error this function catches — not a `json.JSONDecodeError`
-    or a QueryIR that silently fails pydantic validation downstream. This
-    is what actually removes the "same narrow schema as the regex layer"
-    bottleneck the architecture review flagged: the model is grounded in a
-    schema that CAN express compound queries, and can't drift from it.
+    """Schema-constrained structured output (Part 5.3): Ollama's `format`
+    param grammar-constrains decoding to the given JSON schema, so a
+    malformed shape becomes a provider-level error this function catches —
+    not a `json.JSONDecodeError` or a QueryIR that silently fails pydantic
+    validation downstream. `think=False` — this is a single-turn extraction
+    task, not one that benefits from qwen3's visible reasoning, and skipping
+    it cuts latency noticeably.
 
-    Fails soft exactly like call_llm_json() — any error returns None so
-    semantic_parser.py degrades to the rule-based plan_to_ir() path.
+    Fails soft exactly like call_llm_json(): any error (daemon down, model
+    not pulled, timeout, malformed output) returns None so semantic_parser.py
+    degrades to the rule-based plan_to_ir() path. `schema_name` is unused —
+    kept for call-site compatibility (it named the schema for OpenAI's
+    strict-mode wrapper, which Ollama's format param doesn't need).
     """
-    if not _client:
-        log.warning("openai_api_key not set — LLM parsing unavailable, staying rule-based only")
-        return None
-
     try:
-        response = _client.responses.create(
-            model="gpt-5.5",
-            input=prompt,
-            max_output_tokens=800,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": schema_name,
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
+        response = _client.chat(
+            model=settings.ollama_model,
+            messages=[{"role": "user", "content": prompt}],
+            format=schema,
+            think=False,
+            options={"num_predict": 800},
+            keep_alive=_KEEP_ALIVE,
         )
-        return json.loads(response.output_text.strip())
+        return json.loads(response.message.content.strip())
 
     except json.JSONDecodeError:
         log.warning("LLM returned unparseable JSON despite schema constraint")
@@ -136,30 +136,25 @@ def call_llm_structured(prompt: str, schema: dict, schema_name: str) -> dict | N
 
 
 def call_llm_json(prompt: str) -> dict | None:
-    """Schema-agnostic fallback for any caller without a strict JSON
-    schema to enforce (e.g. the legacy INTENT_SCHEMA-style prompt some
-    older code paths may still build). New code parsing a QueryIR should
-    call call_llm_structured() with QUERY_IR_JSON_SCHEMA instead — see
-    semantic_parser.py.
+    """Schema-agnostic fallback for any caller without a strict JSON schema
+    to enforce (e.g. narrative.py's phrasing-only polish). New code parsing
+    a QueryIR should call call_llm_structured() with QUERY_IR_JSON_SCHEMA
+    instead — see semantic_parser.py.
 
-    Fails soft — returns None on any error (missing API key, malformed
-    JSON, provider error/timeout/rate-limit) so the pipeline can degrade to
-    the rule-based fallback rather than crash the chat endpoint or block on
-    a retry loop.
+    Fails soft — returns None on any error (daemon down, model not pulled,
+    malformed JSON, timeout) so the pipeline can degrade to the rule-based
+    fallback rather than crash the chat endpoint or block on a retry loop.
     """
-    if not _client:
-        log.warning("openai_api_key not set — LLM parsing unavailable, staying rule-based only")
-        return None
-
     try:
-        response = _client.responses.create(
-            model="gpt-5.5",
-            input=prompt,
-            max_output_tokens=600,
+        response = _client.chat(
+            model=settings.ollama_model,
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            think=False,
+            options={"num_predict": 600},
+            keep_alive=_KEEP_ALIVE,
         )
-
-        text = response.output_text.strip()
-        return json.loads(text)
+        return json.loads(response.message.content.strip())
 
     except json.JSONDecodeError:
         log.warning("LLM returned unparseable JSON")
@@ -173,3 +168,20 @@ def call_llm_json(prompt: str) -> dict | None:
 def classify_with_llm(prompt: str) -> dict | None:
     """Backward-compat alias — see call_llm_json()."""
     return call_llm_json(prompt)
+
+
+def embed_texts(texts: list[str]) -> list[list[float]] | None:
+    """Part 8: fail-soft embeddings primitive for semantic_retrieval.py,
+    same contract as call_llm_structured() — any failure (daemon down,
+    embedding model not pulled, timeout) returns None so the caller
+    degrades to its next-best option instead of raising."""
+    if not texts:
+        return []
+
+    try:
+        response = _client.embed(model=settings.ollama_embedding_model, input=texts, keep_alive=_KEEP_ALIVE)
+        return list(response.embeddings)
+
+    except Exception:
+        log.exception("Embedding call failed")
+        return None

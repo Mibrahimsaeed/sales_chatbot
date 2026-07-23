@@ -51,7 +51,28 @@
     intent: summary
 
 - id: shortcut-006
-  tags: [shortcut]
+  tags: [shortcut, plan]
+  # bug fix: a specific status word ("late") must route through
+  # query_planner's attendance_filter action (status-exact query), not
+  # the generic attendance_check shortcut — that shortcut returns EVERY
+  # non-"On Time" status mixed together, so this used to also return
+  # "Not Marked"/"Absent" advisors alongside the late ones.
   query: "who was late today"
   expect:
+    intent: attendance_filter
+
+- id: shortcut-007
+  tags: [shortcut]
+  # truly generic — no specific status named — still hits the broad
+  # "any attendance issue" shortcut, on purpose
+  query: "show attendance issues today"
+  expect:
     intent: attendance_check
+
+- id: shortcut-008
+  tags: [shortcut, plan]
+  # the exact reported bug: "not marked" must never come back with late
+  # arrivals mixed in
+  query: "who was not marked today"
+  expect:
+    intent: attendance_filter

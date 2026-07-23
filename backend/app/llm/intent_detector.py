@@ -13,10 +13,31 @@ Important:
   Example:
       "show not marked people in Blue Area"
       "who was late in Downtown"
+
+Part 8 (intent ranking): every rule below used to be a sequential
+if/return chain — first match wins, so two candidate intents never get
+compared. Rules are now independent scoring functions evaluated in full;
+the highest-confidence candidate wins (earliest-defined rule breaks a tie,
+which reproduces the old first-match behavior exactly for every existing
+test case). This also means a rule's `entities.setdefault(...)` side
+effect only applies when that rule actually wins, instead of leaking into
+the entities dict just because it was checked first.
+
+Caveat worth stating plainly: nlu_pipeline.resolve() calls
+classify_intent(cleaned, {}) and only ever inspects `.intent` against
+SHORTCUT_INTENTS = ("greeting", "thanks", "help", "attendance_check") —
+the leaderboard/*_summary/advisor_lookup branches below are not consulted
+for live routing (query_planner.py and semantic_parser.py own that).
+Ranking them is still worth doing — this module is independently unit
+tested, and removes a first-match footgun for whoever extends the
+shortcut set later — but it does not change production routing today.
 """
 
 import re
 from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+from app.llm.entity_extractor import ATTENDANCE_STATUS_KEYWORDS
 
 
 @dataclass
@@ -41,238 +62,142 @@ REQUIRED_SLOTS = {
 }
 
 
-def classify_intent(text: str, entities: dict) -> IntentResult:
+@dataclass
+class _Candidate:
+    intent: str
+    confidence: float
+    entity_patch: dict = field(default_factory=dict)
 
-    q = text.lower().strip()
 
-
-    # ----------------------------
-    # Greeting
-    # ----------------------------
+def _rule_greeting(q: str, entities: dict) -> Optional[_Candidate]:
     if re.search(r"^(hi|hello|hey|salam|assalam)\b", q):
-        return IntentResult(
-            intent="greeting",
-            confidence=1.0,
-            entities=entities
-        )
+        return _Candidate("greeting", 1.0)
+    return None
 
 
-    # ----------------------------
-    # Thanks
-    # ----------------------------
+def _rule_thanks(q: str, entities: dict) -> Optional[_Candidate]:
     if re.search(r"^(thanks|thank you|thankyou|thx|shukriya)\b", q):
-        return IntentResult(
-            intent="thanks",
-            confidence=1.0,
-            entities=entities
-        )
+        return _Candidate("thanks", 1.0)
+    return None
 
 
-    # ----------------------------
-    # Help
-    # ----------------------------
+def _rule_help(q: str, entities: dict) -> Optional[_Candidate]:
     if re.search(r"\b(help|what can you do|commands)\b", q):
-        return IntentResult(
-            intent="help",
-            confidence=1.0,
-            entities=entities
-        )
+        return _Candidate("help", 1.0)
+    return None
 
 
-    # ----------------------------
-    # Attendance Queries
-    #
-    # IMPORTANT:
-    # Do NOT capture specific filters here.
-    #
-    # These should go through query_planner:
-    #
-    # "show not marked people in Blue Area"
-    # "who was late in AMD"
-    # "give absent advisors from Downtown"
-    #
-    # Only generic attendance questions become shortcuts:
-    #
-    # "who was late today"
-    # "show attendance issues"
-    # ----------------------------
-
+def _rule_attendance(q: str, entities: dict) -> Optional[_Candidate]:
+    # IMPORTANT: do NOT capture specific filters here — those go through
+    # query_planner ("show not marked people in Blue Area", "who was late
+    # in AMD", and — just as importantly — "who was not marked today"
+    # with no team at all: query_planner.build_query_plan() routes to
+    # attendance_filter off attendance_status ALONE, team is optional).
+    # Only a truly generic attendance question with no specific status
+    # named ("show attendance issues", "any attendance problems today")
+    # becomes this shortcut. A specific status word (late/not marked/
+    # absent/present) must always fall through to the filtered path —
+    # otherwise "who was not marked today" incorrectly returns everyone
+    # with ANY issue (late arrivals included), since this shortcut's
+    # get_attendance_issues() ignores which status was actually asked
+    # about, it only excludes "On Time".
     attendance_match = re.search(
-        r"(late|not marked|absent|missing|missed|biometric|login|attendance)",
-        q
+        r"(late|not marked|absent|missing|missed|biometric|login|attendance)", q
     )
-
-    # detect if query contains a specific location/team context
+    has_specific_status = any(keyword in q for keyword in ATTENDANCE_STATUS_KEYWORDS)
     has_context = (
         entities.get("team")
-        or re.search(
-            r"\b(in|from|at|team|zone|region)\b",
-            q
-        )
+        or re.search(r"\b(in|from|at|team|zone|region)\b", q)
+        or has_specific_status
     )
-
     if attendance_match and not has_context:
-
-        return IntentResult(
-            intent="attendance_check",
-            confidence=0.9,
-            entities=entities
-        )
+        return _Candidate("attendance_check", 0.9)
+    return None
 
 
-    # ----------------------------
-    # Leaderboard - Sales / Revenue
-    #
-    # Examples:
-    # who has highest sales
-    # top advisors by revenue
-    # best performer
-    # ----------------------------
+def _rule_leaderboard_sales(q: str, entities: dict) -> Optional[_Candidate]:
     if re.search(
         r"(top|highest|best|maximum|most|who.*(highest|most|best)|rank|ranking)"
         r".*(sales|sale|revenue|cleared|closed|performance)",
-        q
+        q,
     ):
-
-        entities.setdefault(
-            "metric",
-            "mtd_cleared"
-        )
-
-        return IntentResult(
-            intent="leaderboard",
-            confidence=0.9,
-            entities=entities
-        )
+        return _Candidate("leaderboard", 0.9, {"metric": entities.get("metric", "mtd_cleared")})
+    return None
 
 
-    # ----------------------------
-    # Leaderboard - Connects
-    # ----------------------------
+def _rule_leaderboard_connects(q: str, entities: dict) -> Optional[_Candidate]:
     if re.search(
         r"(top|highest|best|most|who.*(highest|most|best))"
         r".*(connect|connections|new connect)",
-        q
+        q,
     ):
-
-        entities.setdefault(
-            "metric",
-            "mtd_new_connect"
-        )
-
-        return IntentResult(
-            intent="leaderboard",
-            confidence=0.9,
-            entities=entities
-        )
+        return _Candidate("leaderboard", 0.9, {"metric": entities.get("metric", "mtd_new_connect")})
+    return None
 
 
-    # ----------------------------
-    # Leaderboard - Overdue
-    # ----------------------------
-    if re.search(
-        r"(worst|highest|most|maximum|top)"
-        r".*(overdue|overdues)",
-        q
-    ):
-
-        entities.setdefault(
-            "metric",
-            "overdue"
-        )
-
-        return IntentResult(
-            intent="leaderboard",
-            confidence=0.9,
-            entities=entities
-        )
+def _rule_leaderboard_overdue(q: str, entities: dict) -> Optional[_Candidate]:
+    if re.search(r"(worst|highest|most|maximum|top).*(overdue|overdues)", q):
+        return _Candidate("leaderboard", 0.9, {"metric": entities.get("metric", "overdue")})
+    return None
 
 
-    # ----------------------------
-    # Company Summary
-    # ----------------------------
-    if (
-        entities.get("company")
-        and re.search(
-            r"\b(company|doing|performing|performance|how is)\b",
-            q
-        )
-    ):
-
-        return IntentResult(
-            intent="company_summary",
-            confidence=0.75,
-            entities=entities
-        )
+def _rule_company_summary(q: str, entities: dict) -> Optional[_Candidate]:
+    if entities.get("company") and re.search(r"\b(company|doing|performing|performance|how is)\b", q):
+        return _Candidate("company_summary", 0.75)
+    return None
 
 
-    # ----------------------------
-    # Team Summary
-    # ----------------------------
-    if (
-        entities.get("team")
-        and re.search(
-            r"\b(team|group|department)\b",
-            q
-        )
-    ):
-
-        return IntentResult(
-            intent="team_summary",
-            confidence=0.75,
-            entities=entities
-        )
+def _rule_team_summary(q: str, entities: dict) -> Optional[_Candidate]:
+    if entities.get("team") and re.search(r"\b(team|group|department)\b", q):
+        return _Candidate("team_summary", 0.75)
+    return None
 
 
-    # ----------------------------
-    # Advisor Lookup
-    # ----------------------------
-    if (
-        entities.get("advisor_name")
-        and entities.get("advisor_match_score", 1.0) >= 0.65
-    ):
-
-        return IntentResult(
-            intent="advisor_lookup",
-            confidence=0.7,
-            entities=entities
-        )
+def _rule_advisor_strong(q: str, entities: dict) -> Optional[_Candidate]:
+    if entities.get("advisor_name") and entities.get("advisor_match_score", 1.0) >= 0.65:
+        return _Candidate("advisor_lookup", 0.7)
+    return None
 
 
-    # Weak advisor match
+def _rule_advisor_weak(q: str, entities: dict) -> Optional[_Candidate]:
     if entities.get("advisor_name"):
-
-        return IntentResult(
-            intent="advisor_lookup",
-            confidence=0.4,
-            entities=entities
-        )
+        return _Candidate("advisor_lookup", 0.4)
+    return None
 
 
-    # ----------------------------
-    # Unknown
-    # ----------------------------
-    return IntentResult(
-        intent="unknown",
-        confidence=0.0,
-        entities=entities
-    )
+# Same order as the original if/elif chain — preserved as the tie-break
+# order (earliest-defined rule wins a confidence tie), so any input that
+# used to match exactly one rule produces a byte-identical result.
+_RULES: list[Callable[[str, dict], Optional[_Candidate]]] = [
+    _rule_greeting,
+    _rule_thanks,
+    _rule_help,
+    _rule_attendance,
+    _rule_leaderboard_sales,
+    _rule_leaderboard_connects,
+    _rule_leaderboard_overdue,
+    _rule_company_summary,
+    _rule_team_summary,
+    _rule_advisor_strong,
+    _rule_advisor_weak,
+]
 
+
+def classify_intent(text: str, entities: dict) -> IntentResult:
+    q = text.lower().strip()
+
+    hits = [(i, c) for i, rule in enumerate(_RULES) if (c := rule(q, entities)) is not None]
+    if not hits:
+        return IntentResult(intent="unknown", confidence=0.0, entities=entities)
+
+    _, winner = max(hits, key=lambda pair: (pair[1].confidence, -pair[0]))
+    result_entities = {**entities, **winner.entity_patch}
+    return IntentResult(intent=winner.intent, confidence=winner.confidence, entities=result_entities)
 
 
 def find_missing_slots(result: IntentResult) -> list[str]:
-
-    required = REQUIRED_SLOTS.get(
-        result.intent,
-        []
-    )
-
-    return [
-        slot
-        for slot in required
-        if not result.entities.get(slot)
-    ]
-
+    required = REQUIRED_SLOTS.get(result.intent, [])
+    return [slot for slot in required if not result.entities.get(slot)]
 
 
 # ----------------------------
@@ -280,14 +205,7 @@ def find_missing_slots(result: IntentResult) -> list[str]:
 # ----------------------------
 
 def test_highest_sales_query():
-
-    result = classify_intent(
-        "who has highest sales",
-        {}
-    )
-
+    result = classify_intent("who has highest sales", {})
     assert result.intent == "leaderboard"
     assert result.entities["metric"] == "mtd_cleared"
     assert result.confidence >= 0.85
-
-

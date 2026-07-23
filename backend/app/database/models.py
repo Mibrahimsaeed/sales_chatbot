@@ -32,6 +32,15 @@ class Advisor(Base):
     bm = Column(String)
     zm = Column(String)
     rm = Column(String)
+    # True only for a WID actually present in the MasterSheet tab — every
+    # other sheet (CCMC DATA MTD, biometric, login report, etc.) can
+    # introduce a WID that was never onboarded, and those rows used to
+    # leak into every leaderboard/summary/lookup right alongside real
+    # advisors. Defaults True so ORM-constructed rows that don't set this
+    # explicitly (tests, fixtures) stay queryable; etl/transform.py always
+    # sets it explicitly (True for MasterSheet rows, False otherwise) for
+    # real synced data, so the default only matters off the ETL path.
+    in_master_sheet = Column(Boolean, nullable=False, default=True, server_default="true")
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     sales_funnel = relationship("SalesFunnel", back_populates="advisor", uselist=False, cascade="all, delete-orphan")

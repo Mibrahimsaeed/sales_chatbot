@@ -38,11 +38,33 @@
 # app.include_router(api_router, prefix="/api")
 
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 
-app = FastAPI(title="CCMC Sales Chatbot API")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Best-effort: loads the chat model into Ollama's memory at boot so
+    the first real chat request isn't the one that pays the ~15-30s cold
+    model-load cost (see llm_client.py's _KEEP_ALIVE comment). A failure
+    here (Ollama not running yet, model not pulled) must never block
+    startup — the whole LLM layer is already fail-soft, this is purely an
+    optimization, and call_llm_json() itself never raises regardless."""
+    from app.core.logger import get_logger
+    from app.llm.llm_client import call_llm_json
+
+    log = get_logger("main")
+    if call_llm_json('Return ONLY JSON: {"ok": true}') is not None:
+        log.info("Ollama model warmed up")
+    else:
+        log.warning("Ollama warm-up failed — will load lazily on first chat request instead")
+    yield
+
+
+app = FastAPI(title="CCMC Sales Chatbot API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,

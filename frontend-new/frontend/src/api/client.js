@@ -69,3 +69,33 @@ export async function sendChatMessage(message, sessionId) {
 
   return await res.json();
 }
+
+/**
+ * Part 8 (pagination): fetches the next page of a result set that's
+ * already been shown, using the session's server-side pagination cursor
+ * — no message text, no re-query/re-filter. Same response shape as
+ * sendChatMessage, but `data` here is only the NEW batch; the caller
+ * appends it to what it already has.
+ */
+export async function fetchMoreResults(sessionId) {
+  const token = await getCurrentToken();
+
+  const res = await fetch(`${API_URL}/chat/more`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      session_id: sessionId,
+    }),
+  });
+
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => "");
+    console.error("Show-more request failed:", bodyText);
+    throw new Error(`Show-more request failed: ${res.status}`);
+  }
+
+  return await res.json();
+}

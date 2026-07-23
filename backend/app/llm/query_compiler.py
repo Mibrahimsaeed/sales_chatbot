@@ -76,10 +76,13 @@ def _value_expr(binding: ColumnBinding, agg_for_rollup: bool, level: str):
     return func.avg(binding.expr) if binding.agg == "avg" else func.sum(binding.expr)
 
 
-def compile_and_run(db: Session, ir: QueryIR) -> list[dict] | None:
+def compile_and_run(db: Session, ir: QueryIR, offset: int = 0) -> list[dict] | None:
     """Returns a list of {wid, name, team, company, value, ...} rows, or
     None if the IR (after validation) still can't be answered — e.g. the
-    sort metric has no binding at the requested level."""
+    sort metric has no binding at the requested level. `offset` (Part 8's
+    pagination) skips this many rows past the start of the ordered
+    result — default 0 preserves the exact prior behavior for every
+    existing caller."""
     level = ir.subject_level
     sort_metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
     if not sort_metric_key:
@@ -90,15 +93,37 @@ def compile_and_run(db: Session, ir: QueryIR) -> list[dict] | None:
         return None
 
     if binding.team_named:
-        return _run_team_named(db, ir, binding)
-    return _run_advisor_rooted(db, ir, binding, sort_metric_key)
+        return _run_team_named(db, ir, binding, offset)
+    return _run_advisor_rooted(db, ir, binding, sort_metric_key, offset)
 
 
-def _run_team_named(db, ir: QueryIR, binding: ColumnBinding) -> list[dict] | None:
-    """TeamTarget-style metrics: the row already IS the team, no Advisor
-    join, no roll-up. Filters here are limited to team-name membership
-    (e.g. comparisons) since there's no per-advisor row to join other
-    metrics' fact tables against."""
+def count_ir(db: Session, ir: QueryIR) -> int | None:
+    """Total rows the IR's filters would match, ignoring limit/offset —
+    same unanswerable conditions (None) as compile_and_run, since this is
+    meant to be called as the answerability gate before it (Part 8:
+    pagination needs the true total to decide whether/how many pages
+    exist, decoupled from however many rows get displayed)."""
+    level = ir.subject_level
+    sort_metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    if not sort_metric_key:
+        return None
+
+    binding = _binding_for(sort_metric_key, level)
+    if not binding:
+        return None
+
+    if binding.team_named:
+        query, _value_col = _build_team_named_query(db, ir, binding)
+    else:
+        query, _value_expr = _build_advisor_rooted_query(db, ir, binding)
+
+    return db.query(func.count()).select_from(query.subquery()).scalar()
+
+
+def _build_team_named_query(db, ir: QueryIR, binding: ColumnBinding):
+    """Filtered-but-unordered/unlimited query for TeamTarget-style metrics
+    — shared by _run_team_named (adds order_by/limit/offset) and
+    count_ir (wraps in a count) so the filter logic lives in one place."""
     model = binding.model
     value_col = binding.expr
 
@@ -112,9 +137,21 @@ def _run_team_named(db, ir: QueryIR, binding: ColumnBinding) -> list[dict] | Non
     if subject_names:
         query = query.filter(model.team.in_(subject_names))
 
+    return query, value_col
+
+
+def _run_team_named(db, ir: QueryIR, binding: ColumnBinding, offset: int = 0) -> list[dict] | None:
+    """TeamTarget-style metrics: the row already IS the team, no Advisor
+    join, no roll-up. Filters here are limited to team-name membership
+    (e.g. comparisons) since there's no per-advisor row to join other
+    metrics' fact tables against."""
+    query, value_col = _build_team_named_query(db, ir, binding)
+
     query = query.order_by(_order(value_col, ir.sort.direction))
     if ir.limit:
         query = query.limit(ir.limit)
+    if offset:
+        query = query.offset(offset)
 
     rows = query.all()
     return [{"wid": None, "name": r.name, "team": r.name, "company": None, "value": r.value} for r in rows]
@@ -222,7 +259,13 @@ def _apply_metric_filters(query, ir: QueryIR, level: str, joined: dict):
     return query
 
 
-def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key: str) -> list[dict] | None:
+def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
+    """Filtered/joined/grouped-but-unordered/unlimited query, rooted at
+    Advisor — shared by _run_advisor_rooted (adds order_by/limit/offset)
+    and count_ir (wraps in a count) so the join/filter logic lives in one
+    place. Returns (query, value_expr) — value_expr is needed by the
+    caller to order by (the raw per-advisor column, or the sum()/avg()
+    rollup at team/company level)."""
     level = ir.subject_level
     joined: dict = {}
     is_rollup = level in ("team", "company")
@@ -240,6 +283,12 @@ def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key
         query = query.add_columns(value_expr.label("value"))
         query = query.filter(group_col.isnot(None))
 
+    # every advisor-rooted query (advisor level, or a team/company rollup
+    # over Advisor) excludes WIDs that only appear in a raw source sheet
+    # and were never actually on the MasterSheet — see models.py's
+    # in_master_sheet column docstring.
+    query = query.filter(Advisor.in_master_sheet.is_(True))
+
     query = _apply_entity_filters(query, ir)
     query = _apply_subject_filter(query, ir)
     query = _apply_attendance_filter(query, ir, joined)
@@ -248,12 +297,21 @@ def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key
     if level != "advisor":
         query = query.group_by(_LEVEL_GROUP_COLUMN[level])
 
+    return query, value_expr
+
+
+def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key: str, offset: int = 0) -> list[dict] | None:
+    level = ir.subject_level
+    query, value_expr = _build_advisor_rooted_query(db, ir, binding)
+
     # value_expr is already the right expression to order by: the raw
     # per-advisor column at advisor level, or the sum()/avg()-wrapped
     # rollup at team/company level (from _value_expr above).
     query = query.order_by(_order(value_expr, ir.sort.direction))
     if ir.limit:
         query = query.limit(ir.limit)
+    if offset:
+        query = query.offset(offset)
 
     rows = query.all()
 

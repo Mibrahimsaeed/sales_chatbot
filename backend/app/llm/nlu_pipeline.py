@@ -33,13 +33,18 @@ from sqlalchemy.orm import Session
 
 import re
 
-from app.llm import conversation_memory, semantic_parser
+from app.llm import conversation_memory, multi_intent, semantic_parser
 from app.llm.conversation_memory import MAX_CLARIFY_ATTEMPTS, PendingClarification
 from app.llm.entity_extractor import extract_entities
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.intent_detector import classify_intent as classify_shortcut
 from app.llm.ir_patcher import try_patch
-from app.llm.ir_validator import build_targeted_clarification, validate_ir
+from app.llm.ir_validator import (
+    build_targeted_clarification,
+    clarification_options,
+    pick_clarification_slot,
+    validate_ir,
+)
 from app.llm.preprocessing import normalize
 from app.llm.query_ir import MetricRef, QueryIR, Subject
 from app.llm.query_planner import build_query_plan, QueryPlan
@@ -51,6 +56,14 @@ log = get_logger("llm.nlu_pipeline")
 SHORTCUT_INTENTS = ("greeting", "thanks", "help", "attendance_check")
 _RULE_BASED_ACTIONS = ("lookup", "summary", "attendance_filter")
 
+# Part 8: typed "show more" — the alternative to clicking the button
+# (POST /chat/more, see app/api/chat.py). Only recognized when there's an
+# active pagination cursor for this session (conversation_memory); with
+# no cursor, "more" et al. fall through to the normal pipeline unchanged
+# (verified against intent_detector's rules — none of them match these
+# phrases, so this can't misfire and steal a real query).
+_SHOW_MORE_RE = re.compile(r"^(show more|more|next|next page|load more)$", re.I)
+
 
 @dataclass
 class Resolution:
@@ -61,6 +74,8 @@ class Resolution:
     entities: dict | None = None
     used_llm_fallback: bool = False
     clarify_message: str | None = None
+    clarify_options: list[str] | None = None
+    sections: list[tuple[str, "Resolution"]] | None = None  # kind == "multi" only
 
 
 def _fill_pending_slot(
@@ -101,6 +116,14 @@ def _fill_pending_slot(
     return ir
 
 
+def _clarify(missing: list[str], db: Session) -> tuple[str, list[str]]:
+    """Part 8: the targeted question plus suggested options for it (real
+    metric labels / real team or company names), computed from the same
+    highest-priority slot build_targeted_clarification() already picks."""
+    slot = pick_clarification_slot(missing)
+    return build_targeted_clarification(missing), clarification_options(slot, db)
+
+
 _GIVE_UP_MESSAGE = (
     "Let's start over — try a full question like 'top 5 advisors by revenue' "
     "or 'compare Blue Area with Downtown on achievement %'."
@@ -131,9 +154,10 @@ def _handle_pending(
             conversation_memory.clear_pending(session_id)
             return Resolution(kind="clarify", entities=entities, clarify_message=_GIVE_UP_MESSAGE)
         conversation_memory.set_pending(session_id, result.ir, result.missing)
+        message, options = _clarify(result.missing, db)
         return Resolution(
             kind="clarify", ir=result.ir, entities=entities,
-            clarify_message=build_targeted_clarification(result.missing),
+            clarify_message=message, clarify_options=options,
         )
 
     # nothing filled: a self-standing query means the user moved on —
@@ -147,20 +171,53 @@ def _handle_pending(
         conversation_memory.clear_pending(session_id)
         return Resolution(kind="clarify", entities=entities, clarify_message=_GIVE_UP_MESSAGE)
     conversation_memory.set_pending(session_id, pending.partial_ir, pending.missing)
+    message, options = _clarify(pending.missing, db)
     return Resolution(
         kind="clarify", ir=pending.partial_ir, entities=entities,
-        clarify_message=build_targeted_clarification(pending.missing),
+        clarify_message=message, clarify_options=options,
     )
 
 
-def resolve(text: str, db: Session, session_id: str | None = None) -> Resolution:
+def resolve(text: str, db: Session, session_id: str | None = None, _depth: int = 0) -> Resolution:
     cleaned = normalize(text)
+
+    if _SHOW_MORE_RE.match(cleaned.strip()) and conversation_memory.get_pagination(session_id) is not None:
+        return Resolution(kind="paginate", entities={})
+
+    # Part 8 (light multi-intent): checked BEFORE shortcut classification
+    # on purpose — classify_intent scores the whole string, so a compound
+    # message ("top advisors by revenue; who was late today") can contain
+    # a shortcut-triggering word (here "late") that would otherwise hijack
+    # the ENTIRE message into a single shortcut instead of ever reaching
+    # the splitter. A genuinely compound utterance is split into
+    # independent sub-queries, each resolved through this same pipeline
+    # (including its own shortcut check), and stitched into labeled
+    # sections by chat_service. Depth-capped at 1 — a split segment is
+    # never re-split, and only the LAST segment's IR ends up persisted to
+    # conversation_memory (each resolve() call below writes it in turn) —
+    # a known, documented limitation of the light version.
+    if _depth == 0:
+        segments = multi_intent.split_subqueries(cleaned)
+        if segments is not None:
+            sections = [(seg, resolve(seg, db, session_id, _depth=1)) for seg in segments]
+            return Resolution(kind="multi", entities={}, sections=sections)
 
     shortcut = classify_shortcut(cleaned, {})
     if shortcut.intent in SHORTCUT_INTENTS:
         return Resolution(kind="shortcut", shortcut_intent=shortcut.intent, entities={})
 
     entities = extract_entities(cleaned, db)
+
+    # Part 8: a genuinely unsupported time window (last month, yesterday,
+    # this week, past N days, a custom date range) must never silently
+    # fall back to MTD — say so plainly instead of guessing wrong.
+    if entities.get("period_unsupported"):
+        return Resolution(
+            kind="clarify",
+            entities=entities,
+            clarify_message=entities["period_unsupported"] + ". Try 'this month', 'year to date', or 'last 3 months' instead.",
+        )
+
     plan = build_query_plan(cleaned, entities)
 
     # an in-flight clarification takes precedence: a bare "revenue" or
@@ -204,12 +261,14 @@ def resolve(text: str, db: Session, session_id: str | None = None) -> Resolution
         # remember what we asked, so the next message can answer it
         # (slot-filling, P6) instead of starting from scratch
         conversation_memory.set_pending(session_id, outcome.ir, outcome.missing)
+        message, options = _clarify(outcome.missing, db)
         return Resolution(
             kind="clarify",
             ir=outcome.ir,
             entities=entities,
             used_llm_fallback=outcome.used_llm,
-            clarify_message=build_targeted_clarification(outcome.missing),
+            clarify_message=message,
+            clarify_options=options,
         )
 
     return Resolution(
