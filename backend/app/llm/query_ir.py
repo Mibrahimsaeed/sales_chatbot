@@ -18,6 +18,23 @@ field per query shape:
 Nothing here talks to the database. Grounding real gazetteer/ontology
 values into `resolved_id` / validity happens in ir_validator.py; turning a
 valid IR into SQL happens in query_compiler.py.
+
+Part 10 (confidence-aware generation) added three fields beyond the
+per-field confidences that already existed (metric.confidence,
+filters[].confidence, subjects[].match_confidence, time_range.confidence):
+  - intent_confidence     — how sure the parser is about intent/shape
+                            itself, independent of any one field's value
+  - ambiguity_reasons     — human-readable reasons, POPULATED BY
+                            ir_validator.py during grounding, not by the
+                            LLM — same "validator is the safety layer,
+                            not the parser" split `missing[]` already uses
+  - confidence_level      — "high" | "medium" | "low", also populated by
+                            ir_validator.py; see its module docstring for
+                            what each tier means for execution
+All three default to values that make an IR built the OLD way (rule-based
+plan_to_ir, ir_patcher, or any hand-built QueryIR that never sets them)
+behave exactly as it did before this field existed — this is additive,
+not a breaking change to the model.
 """
 
 from __future__ import annotations
@@ -29,6 +46,7 @@ from pydantic import BaseModel, Field
 Level = Literal["advisor", "team", "company"]
 Operator = Literal["=", "!=", ">", ">=", "<", "<=", "in"]
 Intent = Literal["leaderboard", "comparison", "lookup", "trend", "filtered_list", "clarify"]
+ConfidenceLevel = Literal["high", "medium", "low"]
 
 
 class Subject(BaseModel):
@@ -54,6 +72,7 @@ class TimeRange(BaseModel):
     mode: Literal["snapshot", "compare"] = "snapshot"
     period: Literal["MTD", "YTD", "3M"] = "MTD"
     compare_to: Optional[str] = None             # e.g. previous period key — Phase 4, not compiled yet
+    confidence: float = 1.0                      # how sure the parser is this is the intended period
 
 
 class Sort(BaseModel):
@@ -72,7 +91,13 @@ class QueryIR(BaseModel):
     limit: Optional[int] = 10
     group_by: Optional[Level] = None
     overall_confidence: float = 1.0
+    intent_confidence: float = 1.0
     missing: list[str] = Field(default_factory=list)
+    # both populated by ir_validator.validate_ir(), not by the LLM —
+    # human-readable version of `missing[]`, and the three-tier execution
+    # gate derived from it plus overall_confidence (Part 10)
+    ambiguity_reasons: list[str] = Field(default_factory=list)
+    confidence_level: Optional[ConfidenceLevel] = None
     # observability only (persisted in ChatLog.resolved_ir): which NLU mode
     # served this IR — not part of the LLM output schema, never validated
     nlu_mode: Optional[str] = None
@@ -101,5 +126,9 @@ def plan_to_ir(plan, entities: dict) -> QueryIR:
         filters=filters,
         sort=Sort(metric=plan.metric, direction="asc" if plan.ascending else "desc"),
         limit=plan.limit or 10,
-        overall_confidence=0.75,
+        # a deterministic rule-based match is genuinely high-confidence —
+        # not 1.0 (an LLM-confirmed shape can still be more certain, e.g.
+        # matching an explicit business-phrase gloss), but well clear of
+        # the confidence_high_threshold gate in ir_validator.py (Part 10)
+        overall_confidence=0.9,
     )

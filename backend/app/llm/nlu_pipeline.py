@@ -113,6 +113,15 @@ def _fill_pending_slot(
     # promote to an executable intent so revalidation can pass
     if ir.intent == "clarify":
         ir.intent = "comparison" if len(ir.subjects) >= 2 else "leaderboard"
+
+    # Part 10: overall_confidence/intent_confidence reflected doubt about
+    # WHAT the user wanted before they answered directly — a slot the user
+    # just answered in response to our own question is as trustworthy as a
+    # rule-based match, so a stale low holistic score from the original
+    # ambiguous parse must not keep tripping the "low confidence" gate in
+    # ir_validator.classify_confidence() after the ambiguity is resolved.
+    ir.overall_confidence = max(ir.overall_confidence, 0.9)
+    ir.intent_confidence = max(ir.intent_confidence, 0.9)
     return ir
 
 
@@ -150,7 +159,7 @@ def _handle_pending(
         if result.is_valid:
             conversation_memory.set(session_id, result.ir)  # also closes the pending
             return Resolution(kind="ir", ir=result.ir, entities=entities)
-        if pending.attempts >= MAX_CLARIFY_ATTEMPTS:
+        if pending.attempts >= MAX_CLARIFY_ATTEMPTS or result.confidence_level == "low":
             conversation_memory.clear_pending(session_id)
             return Resolution(kind="clarify", entities=entities, clarify_message=_GIVE_UP_MESSAGE)
         conversation_memory.set_pending(session_id, result.ir, result.missing)
@@ -258,8 +267,21 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         )
 
     if outcome.ir and outcome.missing:
-        # remember what we asked, so the next message can answer it
-        # (slot-filling, P6) instead of starting from scratch
+        # Part 10: "low" confidence means the parse itself is too shaky to
+        # trust `missing` enough to ask about one specific slot — reject
+        # outright and ask the user to rephrase, instead of setting a
+        # pending clarification that's likely to keep missing the mark.
+        # Never executed (this never returns kind="ir").
+        if outcome.ir.confidence_level == "low":
+            return Resolution(
+                kind="clarify",
+                ir=outcome.ir,
+                entities=entities,
+                used_llm_fallback=outcome.used_llm,
+                clarify_message=_GIVE_UP_MESSAGE,
+            )
+        # "medium": remember what we asked, so the next message can answer
+        # it (slot-filling, P6) instead of starting from scratch
         conversation_memory.set_pending(session_id, outcome.ir, outcome.missing)
         message, options = _clarify(outcome.missing, db)
         return Resolution(

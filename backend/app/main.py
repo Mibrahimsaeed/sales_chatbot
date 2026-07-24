@@ -55,12 +55,29 @@ async def _lifespan(app: FastAPI):
     optimization, and call_llm_json() itself never raises regardless."""
     from app.core.logger import get_logger
     from app.llm.llm_client import call_llm_json
+    from app.llm import entity_extractor  # noqa: F401 — import registers entity types with entity_linker
+    from app.llm import entity_linker
+    from app.database.session import SessionLocal
 
     log = get_logger("main")
     if call_llm_json('Return ONLY JSON: {"ok": true}') is not None:
         log.info("Ollama model warmed up")
     else:
         log.warning("Ollama warm-up failed — will load lazily on first chat request instead")
+
+    # Best-effort, same fail-soft spirit as the warm-up above: an embedding
+    # index gets built lazily on first use anyway (entity_linker.py), so a
+    # failure here (Ollama down, embedding model not pulled, DB not ready)
+    # must never block startup.
+    db = SessionLocal()
+    try:
+        entity_linker.build_index(db, force=True)
+        log.info(f"Entity linking index built for: {entity_linker.registered_types()}")
+    except Exception:
+        log.warning("Entity linking index build failed — will build lazily on first query instead")
+    finally:
+        db.close()
+
     yield
 
 

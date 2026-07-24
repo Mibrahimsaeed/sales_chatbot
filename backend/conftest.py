@@ -23,6 +23,19 @@ def _no_live_semantic_retrieval(monkeypatch):
     monkeypatch.setattr(semantic_retrieval.settings, "semantic_retrieval_enabled", False)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_entity_linking(monkeypatch):
+    """Same reasoning as _no_live_semantic_retrieval above, for the
+    embedding-based entity linker (Part 9) — entity_extractor.py and
+    ir_validator.py both call entity_linker.semantic_candidates() as a
+    fallback, a real network call site. Only test_entity_linker.py should
+    exercise it for real (with a mocked embed_texts); every other test's
+    fuzzy-floor-miss path must stay fully offline."""
+    from app.llm import entity_linker
+
+    monkeypatch.setattr(entity_linker.settings, "entity_linking_enabled", False)
+
+
 @pytest.fixture()
 def db_session():
     engine = create_engine(

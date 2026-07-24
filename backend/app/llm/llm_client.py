@@ -32,7 +32,7 @@ _KEEP_ALIVE = "30m"
 QUERY_IR_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["intent", "subject_level", "subjects", "metric", "filters", "time_range", "sort", "limit", "group_by", "overall_confidence"],
+    "required": ["intent", "subject_level", "subjects", "metric", "filters", "time_range", "sort", "limit", "group_by", "overall_confidence", "intent_confidence"],
     "properties": {
         "intent": {"type": "string", "enum": ["leaderboard", "comparison", "lookup", "trend", "filtered_list", "clarify"]},
         "subject_level": {"type": "string", "enum": ["advisor", "team", "company"]},
@@ -77,11 +77,12 @@ QUERY_IR_JSON_SCHEMA = {
         "time_range": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["mode", "period", "compare_to"],
+            "required": ["mode", "period", "compare_to", "confidence"],
             "properties": {
                 "mode": {"type": "string", "enum": ["snapshot", "compare"]},
                 "period": {"type": "string", "enum": ["MTD", "YTD", "3M"]},
                 "compare_to": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "confidence": {"type": "number"},
             },
         },
         "sort": {
@@ -96,6 +97,7 @@ QUERY_IR_JSON_SCHEMA = {
         "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
         "group_by": {"anyOf": [{"type": "string", "enum": ["advisor", "team", "company"]}, {"type": "null"}]},
         "overall_confidence": {"type": "number"},
+        "intent_confidence": {"type": "number"},
     },
 }
 

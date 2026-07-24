@@ -238,7 +238,15 @@ class ChatLog(Base):
     what makes a production query failure debuggable after the fact —
     Part 6 of the redesign brief — instead of only having the final
     intent label and a confidence float with no way to see which filters,
-    subjects, or metric the parser actually produced."""
+    subjects, or metric the parser actually produced.
+
+    `confidence_metadata` (Part 10) stores the JSON-serialized per-field
+    confidence breakdown (intent/metric/entities/filters/time) plus
+    confidence_level and ambiguity_reasons for that same IR — its own
+    column, not just nested inside resolved_ir, so "how often do we
+    reject for low confidence" / "which dimension is the weak one most
+    often" are queryable without parsing resolved_ir's JSON on every row.
+    Null for shortcut/plan-kind resolutions, same as resolved_ir."""
     __tablename__ = "chat_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -249,6 +257,7 @@ class ChatLog(Base):
     used_llm_fallback = Column(Boolean, default=False)
     response_type = Column(String)
     resolved_ir = Column(String)          # QueryIR.model_dump_json(), null for shortcut/plan-kind resolutions
+    confidence_metadata = Column(String)  # JSON: {intent, metric, entities, filters, time, level, ambiguity_reasons}
     created_at = Column(DateTime, server_default=func.now())
 
 

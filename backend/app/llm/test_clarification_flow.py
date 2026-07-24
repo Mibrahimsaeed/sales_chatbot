@@ -21,6 +21,21 @@ CLARIFY_IR = {
     "overall_confidence": 0.4,
 }
 
+VERY_LOW_CONFIDENCE_IR = {
+    # genuinely unclear — Part 10's "low" tier: reject and ask to rephrase
+    # instead of setting a pending clarification for a specific slot
+    "intent": "clarify",
+    "subject_level": "advisor",
+    "subjects": [],
+    "metric": None,
+    "filters": [],
+    "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+    "sort": {"metric": None, "direction": "desc"},
+    "limit": 10,
+    "group_by": None,
+    "overall_confidence": 0.2,
+}
+
 LEADERBOARD_IR = {
     "intent": "leaderboard",
     "subject_level": "advisor",
@@ -110,6 +125,20 @@ def test_unhelpful_answers_reask_then_give_up(clarify_db, monkeypatch):
     r3 = nlu_pipeline.resolve("whatever man", clarify_db, session_id=session)
     assert r3.kind == "clarify"
     assert "start over" in r3.clarify_message
+    assert conversation_memory.get_pending(session) is None
+
+
+def test_low_confidence_ir_is_rejected_not_asked_about(clarify_db, monkeypatch):
+    _mock_llm(monkeypatch, VERY_LOW_CONFIDENCE_IR)
+    session = "cl-5"
+
+    r1 = nlu_pipeline.resolve("uhh something about numbers i guess", clarify_db, session_id=session)
+    assert r1.kind == "clarify"
+    assert r1.ir.confidence_level == "low"
+    # the rephrase message, not a targeted "which metric" question
+    assert "start over" in r1.clarify_message
+    # never set a pending slot for a query this unclear — a follow-up
+    # answer would likely just compound the confusion
     assert conversation_memory.get_pending(session) is None
 
 

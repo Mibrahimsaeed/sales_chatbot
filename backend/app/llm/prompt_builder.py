@@ -36,11 +36,12 @@ IR_SCHEMA = """Return ONLY a JSON object, no other text, no markdown fences, mat
   "subjects": [ { "type": "advisor"|"team"|"company", "value": string, "match_confidence": number } ],
   "metric": { "key": string, "confidence": number } | null,
   "filters": [ { "field": string, "operator": "="|"!="|">"|">="|"<"|"<="|"in", "value": string|number, "confidence": number } ],
-  "time_range": { "mode": "snapshot"|"compare", "period": "MTD"|"YTD"|"3M", "compare_to": string|null },
+  "time_range": { "mode": "snapshot"|"compare", "period": "MTD"|"YTD"|"3M", "compare_to": string|null, "confidence": number },
   "sort": { "metric": string|null, "direction": "asc"|"desc" },
   "limit": number|null,
   "group_by": "advisor"|"team"|"company"|null,
-  "overall_confidence": number
+  "overall_confidence": number,
+  "intent_confidence": number
 }
 
 Rules:
@@ -54,7 +55,17 @@ Rules:
 - If the user's business language is ambiguous ("struggling", "consistently performs well") and
   isn't clearly one of the metrics below, set intent to "clarify" and explain your best guess as
   a filter with a lower confidence rather than inventing a new field.
-- Only use metric keys from the catalog below — never invent one."""
+- Only use metric keys from the catalog below — never invent one.
+- Every confidence number (including the two below) is 0-1 and scores ONLY its own dimension —
+  don't let one shaky field drag another field's score down.
+- "intent_confidence" scores whether you picked the right QUERY SHAPE (leaderboard vs comparison
+  vs filtered_list vs clarify), independent of whether any one metric/filter/subject value is
+  itself uncertain. A query can have a very confident shape (0.9+) even if the metric guess is
+  shaky, or vice versa.
+- "time_range.confidence" scores how sure you are about the period. The user not mentioning a
+  time period at all and you defaulting to MTD is a LOW-confidence guess (~0.5-0.6) even though
+  it's a common default — reserve high confidence (0.9+) for when the user's words actually imply
+  or state the period ("this month", "ytd", "year to date", "last 3 months")."""
 
 
 def build_ir_prompt(

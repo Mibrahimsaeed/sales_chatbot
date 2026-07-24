@@ -37,6 +37,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from app.llm import entity_linker
 from app.llm.entity_extractor import ATTENDANCE_STATUS_KEYWORDS
 
 
@@ -183,16 +184,54 @@ _RULES: list[Callable[[str, dict], Optional[_Candidate]]] = [
 ]
 
 
+
+# Part 12 (semantic retrieval expansion): a small, curated set of
+# paraphrases for the ONLY intents nlu_pipeline.py actually routes on
+# (SHORTCUT_INTENTS) — deliberately excludes leaderboard/*_summary/
+# advisor_lookup, which the caveat above already says aren't consulted
+# for live routing; adding semantic paraphrase coverage for those would
+# just duplicate what the LLM semantic parser already owns.
+_INTENT_EXEMPLARS: list[tuple[str, str]] = [
+    ("hi", "greeting"), ("hello there", "greeting"), ("hey", "greeting"), ("good morning", "greeting"),
+    ("good afternoon", "greeting"), ("yo", "greeting"), ("what's up", "greeting"), ("salam", "greeting"),
+    ("thanks", "thanks"), ("thank you so much", "thanks"), ("appreciate it", "thanks"), ("cheers", "thanks"),
+    ("thanks a lot", "thanks"), ("shukriya", "thanks"),
+    ("help", "help"), ("what can you do", "help"), ("how does this work", "help"),
+    ("give me a hand", "help"), ("show me the commands", "help"), ("what are my options", "help"),
+    ("who missed attendance today", "attendance_check"), ("any attendance problems", "attendance_check"),
+    ("who didn't show up today", "attendance_check"), ("attendance issues today", "attendance_check"),
+    ("is everyone accounted for today", "attendance_check"),
+]
+
+entity_linker.register_exemplar_type("intent", lambda: _INTENT_EXEMPLARS)
+
+# Shortcuts are short utterances by nature — this is a cheap pre-filter so
+# the common case (a long analytical query that will never be a greeting)
+# never pays for an embedding call; only a short message that ALSO failed
+# every rule above reaches semantic_classify().
+_MAX_SEMANTIC_INTENT_WORDS = 8
+_SEMANTIC_INTENT_FLOOR = 0.75
+
+
 def classify_intent(text: str, entities: dict) -> IntentResult:
     q = text.lower().strip()
 
     hits = [(i, c) for i, rule in enumerate(_RULES) if (c := rule(q, entities)) is not None]
-    if not hits:
-        return IntentResult(intent="unknown", confidence=0.0, entities=entities)
+    if hits:
+        _, winner = max(hits, key=lambda pair: (pair[1].confidence, -pair[0]))
+        result_entities = {**entities, **winner.entity_patch}
+        return IntentResult(intent=winner.intent, confidence=winner.confidence, entities=result_entities)
 
-    _, winner = max(hits, key=lambda pair: (pair[1].confidence, -pair[0]))
-    result_entities = {**entities, **winner.entity_patch}
-    return IntentResult(intent=winner.intent, confidence=winner.confidence, entities=result_entities)
+    # Part 12: every rule missed — try semantic retrieval against the
+    # shortcut-intent exemplars before giving up. Only ever reached when
+    # nothing deterministic matched, so it can never override a
+    # confident rule-based hit.
+    if len(q.split()) <= _MAX_SEMANTIC_INTENT_WORDS:
+        semantic = entity_linker.semantic_classify(q, "intent", top_k=1, floor=_SEMANTIC_INTENT_FLOOR)
+        if semantic:
+            return IntentResult(intent=semantic[0]["value"], confidence=semantic[0]["score"], entities=entities)
+
+    return IntentResult(intent="unknown", confidence=0.0, entities=entities)
 
 
 def find_missing_slots(result: IntentResult) -> list[str]:

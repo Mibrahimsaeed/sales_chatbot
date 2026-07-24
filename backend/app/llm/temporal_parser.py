@@ -15,6 +15,18 @@ Two outcomes only:
 
 Scope boundary: only the Performance-table period enum (MTD/YTD/3M).
 Attendance's "today" is a separate table/concept and untouched here.
+
+Part 12 (semantic retrieval expansion) added a semantic widening step,
+tried only after BOTH pattern lists above find nothing at all — so it can
+never override an "unsupported" verdict (checked first, returned
+immediately) or an "equivalent" one. The exemplar corpus is deliberately
+narrow and steers clear of anything resembling a DISCRETE prior period
+("last quarter", "previous month") — those are exactly the unsupported
+cases above, and embeddings alone can't reliably tell "the past 3 months"
+(a rolling window, genuinely equivalent to 3M) apart from "last quarter"
+(a specific prior calendar quarter, genuinely unsupported) since they're
+semantically close. Getting a period wrong is a silently-wrong-answer bug,
+not a missing-answer one, so this uses a higher floor than entity linking.
 """
 
 from __future__ import annotations
@@ -22,6 +34,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Literal
+
+from app.llm import entity_linker
 
 Period = Literal["MTD", "YTD", "3M"]
 
@@ -65,6 +79,28 @@ _UNSUPPORTED_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
+# Deliberately narrow and unambiguous — see the module docstring for why
+# "last quarter"-shaped phrasings must never appear here.
+_TEMPORAL_EXEMPLARS: list[tuple[str, str]] = [
+    ("since the start of the month", "MTD"), ("from the beginning of the month", "MTD"),
+    ("so far this month", "MTD"), ("current month so far", "MTD"), ("month so far", "MTD"),
+    ("so far this year", "YTD"), ("since january", "YTD"), ("year so far", "YTD"),
+    ("annual to date", "YTD"), ("this year so far", "YTD"),
+    ("past three months", "3M"), ("past 3 months", "3M"), ("last 3 months", "3M"),
+    ("rolling three months", "3M"), ("trailing three months", "3M"), ("last three months", "3M"),
+]
+
+entity_linker.register_exemplar_type("temporal", lambda: _TEMPORAL_EXEMPLARS)
+
+# Cheap pre-filter: only pay for an embedding call when the text has SOME
+# time-adjacent vocabulary at all — the vast majority of messages ("top 5
+# by revenue") have none, and must never pay this cost.
+_TEMPORAL_HINT_RE = re.compile(
+    r"\b(month|year|quarter|week|day|since|so far|to date|period|recent|annual|ytd|mtd)\b", re.I
+)
+_SEMANTIC_TEMPORAL_FLOOR = 0.85
+
+
 def parse_period(text: str) -> TemporalMatch | None:
     """Returns a TemporalMatch if the text names a time window at all,
     else None (no temporal expression found — caller's existing behavior
@@ -80,5 +116,14 @@ def parse_period(text: str) -> TemporalMatch | None:
     for pattern, period in _EQUIVALENT_PATTERNS:
         if re.search(pattern, q):
             return TemporalMatch(kind="equivalent", period=period, confidence=1.0)
+
+    # Part 12: nothing matched deterministically — try semantic retrieval
+    # against the narrow exemplar corpus above before giving up. Only
+    # reached when neither pattern list matched anything, so it can never
+    # override either verdict.
+    if _TEMPORAL_HINT_RE.search(q):
+        semantic = entity_linker.semantic_classify(q, "temporal", top_k=1, floor=_SEMANTIC_TEMPORAL_FLOOR)
+        if semantic:
+            return TemporalMatch(kind="equivalent", period=semantic[0]["value"], confidence=semantic[0]["score"])
 
     return None

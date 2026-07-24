@@ -33,11 +33,13 @@ EXAMPLES: list[dict] = [
                 {"field": "attendance_rate", "operator": ">", "value": 90, "confidence": 0.9},
                 {"field": "achievement_pct", "operator": ">", "value": 80, "confidence": 0.9},
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            # no period mentioned — MTD is a default guess, not a stated fact
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "total_meetings", "direction": "desc"},
             "limit": None,
             "group_by": None,
             "overall_confidence": 0.9,
+            "intent_confidence": 0.95,
         },
     },
     {
@@ -53,11 +55,12 @@ EXAMPLES: list[dict] = [
             ],
             "metric": {"key": "mtd_cleared", "confidence": 0.95},
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "mtd_cleared", "direction": "desc"},
             "limit": None,
             "group_by": None,
             "overall_confidence": 0.9,
+            "intent_confidence": 0.95,
         },
     },
     {
@@ -70,11 +73,12 @@ EXAMPLES: list[dict] = [
             "subjects": [],
             "metric": {"key": "achievement_pct", "confidence": 0.85},
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "achievement_pct", "direction": "desc"},
             "limit": 1,
             "group_by": None,
             "overall_confidence": 0.85,
+            "intent_confidence": 0.9,
         },
     },
     {
@@ -88,11 +92,12 @@ EXAMPLES: list[dict] = [
             "subjects": [],
             "metric": {"key": "achievement_pct", "confidence": 0.8},
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "achievement_pct", "direction": "asc"},
             "limit": 10,
             "group_by": None,
             "overall_confidence": 0.8,
+            "intent_confidence": 0.9,
         },
     },
     {
@@ -109,11 +114,12 @@ EXAMPLES: list[dict] = [
                 {"field": "achievement_pct", "operator": ">=", "value": 80, "confidence": 0.75},
                 {"field": "achievement_pct", "operator": "<", "value": 100, "confidence": 0.75},
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "achievement_pct", "direction": "desc"},
             "limit": None,
             "group_by": None,
             "overall_confidence": 0.8,
+            "intent_confidence": 0.85,
         },
     },
     {
@@ -130,11 +136,12 @@ EXAMPLES: list[dict] = [
             "filters": [
                 {"field": "team", "operator": "=", "value": "Blue Area", "confidence": 0.85},
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "mtd_cleared", "direction": "desc"},
             "limit": 10,
             "group_by": None,
             "overall_confidence": 0.85,
+            "intent_confidence": 0.95,
         },
     },
     {
@@ -147,11 +154,14 @@ EXAMPLES: list[dict] = [
             "subjects": [],
             "metric": {"key": "ytd_cleared", "confidence": 0.95},
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "YTD", "compare_to": None},
+            # "ytd" is stated explicitly — high time confidence, unlike the
+            # defaulted-MTD examples above
+            "time_range": {"mode": "snapshot", "period": "YTD", "compare_to": None, "confidence": 0.95},
             "sort": {"metric": "ytd_cleared", "direction": "desc"},
             "limit": 5,
             "group_by": None,
             "overall_confidence": 0.95,
+            "intent_confidence": 0.95,
         },
     },
     {
@@ -164,11 +174,12 @@ EXAMPLES: list[dict] = [
             "subjects": [],
             "metric": {"key": "attendance_rate", "confidence": 0.95},
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "attendance_rate", "direction": "desc"},
             "limit": 10,
             "group_by": None,
             "overall_confidence": 0.95,
+            "intent_confidence": 0.95,
         },
     },
     {
@@ -180,11 +191,12 @@ EXAMPLES: list[dict] = [
             "subjects": [],
             "metric": {"key": "mtd_cleared", "confidence": 0.95},
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "mtd_cleared", "direction": "desc"},
             "limit": 10,
             "group_by": None,
             "overall_confidence": 0.95,
+            "intent_confidence": 0.95,
         },
         "expect_valid": True,
         "ir": {
@@ -195,11 +207,12 @@ EXAMPLES: list[dict] = [
             "filters": [
                 {"field": "company", "operator": "=", "value": "Graana", "confidence": 0.95},
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
             "sort": {"metric": "mtd_cleared", "direction": "desc"},
             "limit": 10,
             "group_by": None,
             "overall_confidence": 0.9,
+            "intent_confidence": 0.95,
         },
     },
     {
@@ -217,11 +230,16 @@ EXAMPLES: list[dict] = [
             "filters": [
                 {"field": "achievement_pct", "operator": "<", "value": 50, "confidence": 0.4},
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+            # "this month" IS explicit — the ambiguity here is entirely
+            # about the metric/intent, not the period, which is why
+            # time_range.confidence stays high even though overall_confidence
+            # (and intent_confidence, tracking it) are both low
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.9},
             "sort": {"metric": None, "direction": "desc"},
             "limit": 10,
             "group_by": None,
             "overall_confidence": 0.4,
+            "intent_confidence": 0.4,
         },
     },
 ]

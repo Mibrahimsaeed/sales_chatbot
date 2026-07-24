@@ -40,6 +40,21 @@ class Settings(BaseSettings):
     # misbehaves once quota is restored (unverified against the live API
     # as of this change).
     semantic_retrieval_enabled: bool = Field(default=True, alias="SEMANTIC_RETRIEVAL_ENABLED")
+    # Embedding-based entity linking (Part 9) — the same widening idea as
+    # semantic_retrieval_enabled, applied to advisor/team/company/office/
+    # portfolio_lead/management_lead names instead of metrics. A separate
+    # flag so either can be killed independently via env var.
+    entity_linking_enabled: bool = Field(default=True, alias="ENTITY_LINKING_ENABLED")
+
+    # Confidence-aware QueryIR execution gate (Part 10) — see
+    # ir_validator.classify_confidence(). An IR with nothing unresolved
+    # (`missing` empty) is "high" only if overall_confidence also clears
+    # confidence_high_threshold; short of that it's "medium" (ask about the
+    # specific uncertain slot) down to confidence_low_threshold, below which
+    # it's "low" (never executed — the user is asked to rephrase instead of
+    # being asked about one slot when the whole parse is shaky).
+    confidence_high_threshold: float = Field(default=0.8, alias="CONFIDENCE_HIGH_THRESHOLD")
+    confidence_low_threshold: float = Field(default=0.4, alias="CONFIDENCE_LOW_THRESHOLD")
 
     model_config = SettingsConfigDict(
         env_file=".env",

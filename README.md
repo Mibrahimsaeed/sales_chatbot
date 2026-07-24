@@ -156,4 +156,7 @@ answered calls, meetings, CR, pipeline, target ach
 
 
 
- 
+ percentage sign
+ hr bndy ka alag sy info jb kch specific manga jaye
+ aur rel/teams nh bny huy
+ air jo tha bana hua woh kr de 

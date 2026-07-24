@@ -6,6 +6,7 @@ extraction and the LLM fallback need integration tests against a real
 (or fixture) DB and are not covered here.
 """
 
+from app.llm import intent_detector
 from app.llm.intent_detector import classify_intent, find_missing_slots
 
 
@@ -90,6 +91,54 @@ def test_confidence_tie_breaks_to_earlier_rule():
     )
     assert result.intent == "company_summary"
     assert result.confidence == 0.75
+
+
+# ---- Part 12: semantic retrieval fallback (only when every rule misses) ----
+
+def test_semantic_fallback_disabled_by_default_in_tests():
+    # conftest's autouse fixture forces entity_linking_enabled=False, so a
+    # paraphrase that no rule catches must still come back "unknown" —
+    # this locks in that the semantic step never runs unmocked/unguarded
+    result = classify_intent("yo whats good", {})
+    assert result.intent == "unknown"
+
+
+def test_semantic_fallback_classifies_a_greeting_paraphrase(monkeypatch):
+    monkeypatch.setattr(intent_detector.entity_linker.settings, "entity_linking_enabled", True)
+    monkeypatch.setattr(
+        intent_detector.entity_linker, "semantic_classify",
+        lambda text, exemplar_type, **kw: [{"value": "greeting", "score": 0.8}] if exemplar_type == "intent" else [],
+    )
+    result = classify_intent("yo whats good", {})
+    assert result.intent == "greeting"
+    assert result.confidence == 0.8
+
+
+def test_semantic_fallback_never_overrides_a_rule_match(monkeypatch):
+    monkeypatch.setattr(intent_detector.entity_linker.settings, "entity_linking_enabled", True)
+    monkeypatch.setattr(
+        intent_detector.entity_linker, "semantic_classify",
+        lambda text, exemplar_type, **kw: [{"value": "greeting", "score": 0.99}],
+    )
+    # "hello" already hits the rule-based greeting rule at confidence 1.0 —
+    # the mocked semantic step (which would also say "greeting" here,
+    # harmlessly) must never even be consulted
+    result = classify_intent("hello", {})
+    assert result.intent == "greeting"
+    assert result.confidence == 1.0
+
+
+def test_semantic_fallback_skipped_for_long_queries(monkeypatch):
+    monkeypatch.setattr(intent_detector.entity_linker.settings, "entity_linking_enabled", True)
+    calls = []
+    monkeypatch.setattr(
+        intent_detector.entity_linker, "semantic_classify",
+        lambda text, exemplar_type, **kw: calls.append(text) or [],
+    )
+    # a long analytical query is never a greeting/thanks/help paraphrase —
+    # the word-count gate must skip the embedding call entirely
+    classify_intent("show me every advisor who cleared more than fifty thousand this month please", {})
+    assert calls == []
 
 
     

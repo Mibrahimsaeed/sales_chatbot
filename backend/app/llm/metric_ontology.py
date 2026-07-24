@@ -330,6 +330,24 @@ def resolve_metric(text: str) -> str | None:
     return None
 
 
+def metric_label(metric_key: str | None) -> str:
+    """Shared by response_formatter.py and narrative.py so 'what do we call
+    this metric in a reply' has one answer, not two independently
+    maintained copies."""
+    if not metric_key:
+        return "value"
+    return METRICS[metric_key].label if metric_key in METRICS else metric_key
+
+
+def is_percentage_metric(metric_key: str | None) -> bool:
+    """A metric is percentage-shaped if its own label says so ("%" in the
+    label, e.g. achievement_pct's 'Target Achievement %') — a data-driven
+    signal already curated in METRICS, not a second hand-maintained list
+    that could drift out of sync. Adding "%" to a future metric's label is
+    the only step needed to make narrative.py explain it as a percentage."""
+    return bool(metric_key) and metric_key in METRICS and "%" in METRICS[metric_key].label
+
+
 def describe_available_metrics() -> str:
     return ", ".join(f"{m.label.lower()} ({'/'.join(m.entity_levels)})" for m in METRICS.values())
 

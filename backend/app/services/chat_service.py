@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy.orm import Session
 
 from app.llm import conversation_memory, narrative
@@ -198,18 +200,28 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
     reply = format_ir_reply(ir, rows, total_count=capped_total, paginated=has_more)
     insights: list[str] = []
     if rows:
-        # narrative polish (P7): deterministic facts + LLM phrasing only,
-        # fail-soft back to the templated reply (see narrative.py). Facts/
-        # insights are computed over the DISPLAYED page only, same as
-        # before pagination existed — not the full (possibly 500+ row)
-        # match set.
+        # Part 11: evidence-aware explanation — 100% deterministic (every
+        # number traced to `rows`), prepended ahead of the raw templated
+        # list so the reply says WHY the answer is correct (ranking
+        # justification, percentage interpretation, comparison
+        # explanation) instead of just restating a value. polish_
+        # explanation() may lightly smooth its phrasing but can't
+        # originate or change a number — fails soft back to the
+        # deterministic sentence unchanged. Facts/explanation/insights are
+        # computed over the DISPLAYED page only, same as before pagination
+        # existed — not the full (possibly 500+ row) match set.
         facts = narrative.compute_facts(ir, rows)
-        reply = narrative.polish_reply(facts, reply)
-        # Part 8: only attach outlier insights when the response planner
-        # judges the result set large enough for "outlier" to mean
-        # anything (2-row comparisons don't have a meaningful peer group)
+        explanation = narrative.build_explanation(ir, rows, total_count=capped_total)
+        explanation = narrative.polish_explanation(explanation, facts)
+        if explanation:
+            reply = f"{explanation}\n\n{reply}"
+        # Part 8/11: only attach insights when the response planner judges
+        # the result set large enough for "outlier"/"trend" to mean
+        # anything (2-row comparisons don't have a meaningful peer group).
+        # Anomaly detection and trend deltas are independent evidence
+        # sources — both capped, combined cap keeps the reply concise.
         if plan_response(ir, rows).show_insights:
-            insights = narrative.compute_insights(ir, rows)
+            insights = (narrative.compute_insights(ir, rows) + narrative.compute_trends(ir, rows, db))[:3]
     return {
         "type": ir.intent,
         "reply": reply,
@@ -311,6 +323,18 @@ def _log_interaction(
         # the parser actually produced, not just the final label.
         resolved_ir_json = resolution.ir.model_dump_json() if resolution.ir is not None else None
 
+        # Part 10: confidence metadata for that same IR, as its own column
+        # (see ChatLog.confidence_metadata docstring) — ir.confidence_level
+        # and ir.ambiguity_reasons are populated by ir_validator.validate_ir()
+        # by the time any resolution.ir reaches here.
+        confidence_metadata_json = None
+        if resolution.ir is not None:
+            confidence_metadata_json = json.dumps({
+                **confidence_breakdown(resolution.ir),
+                "level": resolution.ir.confidence_level,
+                "ambiguity_reasons": resolution.ir.ambiguity_reasons,
+            })
+
         db.add(
             ChatLog(
                 session_id=session_id,
@@ -320,6 +344,7 @@ def _log_interaction(
                 used_llm_fallback=resolution.used_llm_fallback,
                 response_type=response["type"],
                 resolved_ir=resolved_ir_json,
+                confidence_metadata=confidence_metadata_json,
             )
         )
         db.commit()
