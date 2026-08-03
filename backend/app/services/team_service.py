@@ -1,15 +1,29 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import func
-from app.database.models import Advisor, SalesFunnel, Pipeline, Performance, PerformancePeriod, TeamTarget
+
 from app.core.exception import NotFoundError
+from app.database.models import TeamTarget
+from app.llm import aggregation
 
 
 def get_team_summary(db: Session, team: str) -> dict:
-    """Three independent pieces, all real:
-    1. team_targets — genuine team-level source (Target Achievement tab)
-    2. live rollup of advisor-level activity for that team
-    3. live rollup of advisor-level Performance (MTD + YTD cleared/target)
-    None of these are the same query — don't derive one from another."""
+    """A team summary is TWO things, and they are not the same number.
+
+    1. The ROLL-UP of the team's advisors — connects, pipeline, overdue,
+       MTD/YTD target and cleared. PHASE 4: this used to be three
+       hand-written `func.sum` queries here, near-identical to the ones in
+       company_service and hierarchy_service. It now comes from the
+       aggregation engine, so a team's connects are the same number
+       whether they are asked for here, in a comparison, or in a
+       leaderboard. They were not always.
+    2. The team's OWN figure from the Target Achievement sheet
+       (`TeamTarget`). This is a genuine independent source, not a
+       derivation of (1) — it is what the business published, and it can
+       legitimately disagree with the roll-up. Which one is authoritative
+       is still an open business question (Phase 1, Q3), so this reads it
+       explicitly and keeps it under its own keys rather than letting it
+       masquerade as an aggregate.
+    """
+    rollup = aggregation.summary(db, "team", team)
 
     target_row = (
         db.query(TeamTarget)
@@ -17,50 +31,22 @@ def get_team_summary(db: Session, team: str) -> dict:
         .first()
     )
 
-    activity = (
-        db.query(
-            func.count(Advisor.wid).label("advisors"),
-            func.sum(SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect).label("connects"),
-            func.sum(Pipeline.overdue).label("overdue"),
-            func.sum(Pipeline.pipeline).label("pipeline"),
-        )
-        .join(SalesFunnel, SalesFunnel.wid == Advisor.wid, isouter=True)
-        .join(Pipeline, Pipeline.wid == Advisor.wid, isouter=True)
-        .filter(Advisor.team.ilike(team), Advisor.in_master_sheet.is_(True))
-        .first()
-    )
-
-    if not target_row and not (activity and activity.advisors):
+    if not target_row and not rollup["advisors"]:
         raise NotFoundError(f"No team matching '{team}'")
-
-    def _revenue(period):
-        return (
-            db.query(
-                func.sum(Performance.target).label("target"),
-                func.sum(Performance.cleared).label("cleared"),
-            )
-            .join(Advisor, Advisor.wid == Performance.wid)
-            .filter(Advisor.team.ilike(team), Advisor.in_master_sheet.is_(True), Performance.period == period)
-            .first()
-        )
-
-    # bug fix: team summaries never queried Performance at all — "YTD
-    # performance" for a team had nothing to report regardless of what
-    # was asked, only TeamTarget's single ambiguous-period figure.
-    mtd_revenue = _revenue(PerformancePeriod.MTD)
-    ytd_revenue = _revenue(PerformancePeriod.YTD)
 
     return {
         "team": team,
-        "advisors": activity.advisors or 0 if activity else 0,
-        "connects": activity.connects or 0 if activity else 0,
-        "overdue": activity.overdue or 0 if activity else 0,
-        "pipeline": activity.pipeline or 0 if activity else 0,
+        "advisors": rollup["advisors"],
+        "connects": rollup["connects"],
+        "overdue": rollup["overdue"],
+        "pipeline": rollup["pipeline"],
+        # Sheet figures — source (2) above. Kept under the exact keys the
+        # API already returns.
         "target": target_row.target if target_row else None,
         "achieved": target_row.achieved if target_row else None,
         "achievement_pct": target_row.achievement_pct if target_row else None,
-        "mtd_target": (mtd_revenue.target or 0) if mtd_revenue else 0,
-        "mtd_cleared": (mtd_revenue.cleared or 0) if mtd_revenue else 0,
-        "ytd_target": (ytd_revenue.target or 0) if ytd_revenue else 0,
-        "ytd_cleared": (ytd_revenue.cleared or 0) if ytd_revenue else 0,
+        "mtd_target": rollup["mtd_target"],
+        "mtd_cleared": rollup["mtd_cleared"],
+        "ytd_target": rollup["ytd_target"],
+        "ytd_cleared": rollup["ytd_cleared"],
     }

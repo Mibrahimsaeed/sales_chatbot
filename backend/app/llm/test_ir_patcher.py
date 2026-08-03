@@ -66,6 +66,23 @@ def test_bare_entity_without_only_prefix_is_not_a_patch():
     assert try_patch(_leaderboard_ir(), "Graana", entities, plan_action="summary") is None
 
 
+def test_only_unit_head_patch_uses_generic_hierarchy_entity_keys():
+    entities = {"unit_heads": ["Zeeshan Tariq"], "unit_head": "Zeeshan Tariq"}
+    patched = try_patch(_leaderboard_ir(), "only Zeeshan Tariq", entities, plan_action="unresolved")
+    assert patched is not None
+    assert Filter(field="unit_head", operator="=", value="Zeeshan Tariq") in patched.filters
+
+
+def test_breakdown_plan_action_treated_like_summary_for_only_prefix():
+    entities = {"unit_heads": ["Zeeshan Tariq"], "unit_head": "Zeeshan Tariq"}
+    patched = try_patch(_leaderboard_ir(), "only Zeeshan Tariq", entities, plan_action="breakdown")
+    assert patched is not None
+
+    # a bare (no "only") mention with plan_action="breakdown" is a NEW
+    # question, not a patch — same as plan_action="summary" already was
+    assert try_patch(_leaderboard_ir(), "Zeeshan Tariq", entities, plan_action="breakdown") is None
+
+
 def test_remove_filters_patch():
     prior = _leaderboard_ir(filters=[Filter(field="company", operator="=", value="Graana")])
     patched = try_patch(prior, "all companies", {}, plan_action="unresolved")

@@ -37,7 +37,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from app.llm import entity_linker
+from app.llm import entity_linker, intent_catalog as cat, token_match
 from app.llm.entity_extractor import ATTENDANCE_STATUS_KEYWORDS
 
 
@@ -88,6 +88,26 @@ def _rule_help(q: str, entities: dict) -> Optional[_Candidate]:
     return None
 
 
+def _is_analytical(q: str) -> bool:
+    """Does this ask for a RANKING or a FILTERED set rather than a sweep?
+
+    Deliberately narrow. A resolved metric is NOT used as the signal: the
+    bare word "attendance" is itself an attendance_rate synonym, so every
+    generic "show attendance issues" would look analytical and the
+    shortcut would never fire at all.
+
+    A strong ranking word or an explicit threshold are unambiguous — this
+    shortcut can express neither, so a question containing one belongs to
+    the planner. Both are read from the TEXT, because this runs before
+    entity extraction and receives an empty entities dict.
+    """
+    from app.llm.entity_extractor import _extract_thresholds
+
+    if token_match.contains_any(q, cat.RANKING_STRONG):
+        return True
+    return bool(_extract_thresholds(q))
+
+
 def _rule_attendance(q: str, entities: dict) -> Optional[_Candidate]:
     # IMPORTANT: do NOT capture specific filters here — those go through
     # query_planner ("show not marked people in Blue Area", "who was late
@@ -102,14 +122,45 @@ def _rule_attendance(q: str, entities: dict) -> Optional[_Candidate]:
     # with ANY issue (late arrivals included), since this shortcut's
     # get_attendance_issues() ignores which status was actually asked
     # about, it only excludes "On Time".
+    # WORD-BOUNDED. This was an unanchored alternation, so "late" matched
+    # inside escaLATE / reLATEd / calcuLATEd / transLATE and this shortcut
+    # — which runs BEFORE entity extraction and BEFORE the planner, and
+    # returns immediately — hijacked the entire query. "How is the
+    # answered calls percentage calculated?" was answered with a list of
+    # advisors who have attendance problems.
+    #
+    # This is finding F1 in a second location: Step 1 anchored the keyword
+    # TABLES, and the flag below, but left this regex's own alternation
+    # unanchored. It is the more damaging of the two, because nothing
+    # downstream gets a chance to disagree with it.
     attendance_match = re.search(
-        r"(late|not marked|absent|missing|missed|biometric|login|attendance)", q
+        r"\b(late|not marked|absent|missing|missed|biometric|login|attendance)\b", q
     )
-    has_specific_status = any(keyword in q for keyword in ATTENDANCE_STATUS_KEYWORDS)
+    # F1: token-aware, like the extractor's scan of the same table —
+    # otherwise 'calculated'/'related' counted as naming a status here
+    # too, and this flag decides whether the shortcut fires.
+    has_specific_status = token_match.contains_any(q, ATTENDANCE_STATUS_KEYWORDS)
+    # A comparison phrase is context too: "compare Blue Area and DHA
+    # attendance" is a two-entity question, not a generic "who has
+    # attendance problems" sweep. Without this the shortcut fired first —
+    # it runs BEFORE entity extraction, so it never saw the two teams —
+    # and answered with a site-wide list of 153 people.
+    is_comparison = re.search(r"\b(compare|comparison|vs\.?|versus)\b|\bdifference between\b", q)
+    # An ANALYTICAL attendance question is not a generic sweep. "Top
+    # advisors by attendance rate" and "advisors with attendance below
+    # 60 percent" both name a measure and want it ranked or filtered;
+    # this shortcut's get_attendance_issues() can express neither, so it
+    # answered a different question with a canned list. A ranking word, a
+    # threshold, or a resolved attendance METRIC all mean the planner
+    # should handle it.
     has_context = (
         entities.get("team")
         or re.search(r"\b(in|from|at|team|zone|region)\b", q)
         or has_specific_status
+        or is_comparison
+        # An analytical attendance question is a ranking or a filtered
+        # set, which this shortcut cannot express — see _is_analytical.
+        or _is_analytical(q)
     )
     if attendance_match and not has_context:
         return _Candidate("attendance_check", 0.9)

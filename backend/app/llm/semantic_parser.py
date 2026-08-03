@@ -26,8 +26,11 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.llm import conversation_memory, semantic_retrieval
-from app.llm.entity_extractor import get_known_teams, get_known_companies
+from app.llm import conversation_memory, hierarchy, semantic_retrieval
+from app.llm.entity_extractor import (
+    get_known_teams, get_known_companies,
+    get_known_unit_heads, get_known_zonal_heads, get_known_bcms,
+)
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.ir_validator import validate_ir
 from app.llm.llm_client import call_llm_structured, QUERY_IR_JSON_SCHEMA
@@ -46,12 +49,11 @@ _COMPOUND_HINTS = re.compile(
 def looks_compound(text: str, entities: dict) -> bool:
     """Cheap heuristic gate: does this query look like it needs more than
     query_planner.py's single-metric/single-filter QueryPlan can express?
-    Multiple teams/companies, a threshold, or boolean-language keywords —
-    any of these is a signal to route to the LLM semantic parser instead
+    Multiple matches at ANY hierarchy level (team/company/unit_head/
+    zonal_head/business_center), a threshold, or boolean-language keywords
+    — any of these is a signal to route to the LLM semantic parser instead
     of trusting the rule-based fast path."""
-    if len(entities.get("teams", [])) > 1:
-        return True
-    if len(entities.get("companies", [])) > 1:
+    if any(len(entities.get(entity_key, [])) > 1 for entity_key in hierarchy.LEVEL_ENTITY_KEYS.values()):
         return True
     if entities.get("thresholds"):
         return True
@@ -77,6 +79,9 @@ def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | N
         get_known_companies(db),
         grounded_entities=entities,
         prior_ir_json=prior_ir.model_dump_json() if prior_ir else None,
+        known_unit_heads=get_known_unit_heads(db),
+        known_zonal_heads=get_known_zonal_heads(db),
+        known_bcms=get_known_bcms(db),
     )
     raw = call_llm_structured(prompt, QUERY_IR_JSON_SCHEMA, schema_name="query_ir")
     if not raw:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 
+from app.llm import hierarchy, query_compiler, temporal_parser
 from app.llm.entity_extractor import _extract_thresholds
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.query_ir import Filter, QueryIR
@@ -32,24 +33,25 @@ _TOP_N_RE = re.compile(r"\b(top|bottom)\s+(\d+)\b", re.I)
 _SORT_DIR_RE = re.compile(r"\b(ascending|descending|asc|desc|lowest first|highest first)\b", re.I)
 _SORT_BY_RE = re.compile(r"\bsort(?:ed)?\s+by\s+(.+)$", re.I)
 _REMOVE_FILTER_RE = re.compile(r"\b(all teams|all companies|everyone|remove filters?|clear filters?)\b", re.I)
-_PERIOD_PHRASES = {
-    "ytd": "YTD", "this year": "YTD", "year to date": "YTD",
-    "3m": "3M", "quarter": "3M", "three month": "3M", "3 month": "3M", "last 3 months": "3M",
-    "mtd": "MTD", "this month": "MTD",
-}
 
 
 def _patch_only_entity(ir: QueryIR, text: str, entities: dict) -> bool:
-    """'only Graana' / 'just Blue Area' — replace the same-typed entity
-    filter with the grounded match. Requires the extractor to have
-    grounded exactly one team or one company from the message."""
+    """'only Graana' / 'just Blue Area' / 'only unit head John' — replace
+    the same-typed entity filter with the grounded match. Requires the
+    extractor to have grounded exactly one entity, of any single hierarchy
+    level (team/company/unit_head/zonal_head/business_center), from the
+    message — driven generically from hierarchy.LEVEL_ENTITY_KEYS instead
+    of a hardcoded team/company-only check."""
     if not _ONLY_RE.match(text.strip()):
         return False
-    teams = entities.get("teams", [])
-    companies = entities.get("companies", [])
-    if len(teams) + len(companies) != 1:
+    matches = [
+        (level, entities[entity_key][0])
+        for level, entity_key in hierarchy.LEVEL_ENTITY_KEYS.items()
+        if entities.get(entity_key)
+    ]
+    if len(matches) != 1:
         return False
-    field, value = ("team", teams[0]) if teams else ("company", companies[0])
+    field, value = matches[0]
     ir.filters = [f for f in ir.filters if f.field != field]
     ir.filters.append(Filter(field=field, operator="=", value=value))
     return True
@@ -84,34 +86,43 @@ def _patch_sort_metric(ir: QueryIR, text: str) -> bool:
     return True
 
 
-# The compiler encodes period in the metric key (mtd_cleared vs
-# ytd_cleared bind to different Performance rows) — changing
-# time_range.period alone wouldn't change the result, so a period
-# follow-up also swaps the metric within the cleared family.
-_PERIOD_METRIC_SWAP = {
-    ("mtd_cleared", "YTD"): "ytd_cleared",
-    ("mtd_cleared", "3M"): "three_month_cleared",
-    ("ytd_cleared", "MTD"): "mtd_cleared",
-    ("ytd_cleared", "3M"): "three_month_cleared",
-    ("three_month_cleared", "MTD"): "mtd_cleared",
-    ("three_month_cleared", "YTD"): "ytd_cleared",
-}
-
-
 def _patch_period(ir: QueryIR, text: str) -> bool:
-    q = text.lower()
-    for phrase, period in _PERIOD_PHRASES.items():
-        if phrase in q:
-            ir.time_range.period = period
-            current_metric = ir.sort.metric or (ir.metric.key if ir.metric else None)
-            swapped = _PERIOD_METRIC_SWAP.get((current_metric, period))
-            if swapped:
-                if ir.metric:
-                    ir.metric.key = swapped
-                if ir.sort.metric:
-                    ir.sort.metric = swapped
-            return True
-    return False
+    """'what about ytd' — re-point the IR at the same measure, other period.
+
+    Phase 2 removed two pieces of local knowledge from this function.
+
+    The PHRASES now come from temporal_parser, the one module that also
+    knows which windows this data model cannot answer. The substring
+    table that used to live here had no such notion, so "last quarter"
+    mapped to 3M here while temporal_parser correctly refused it.
+
+    The METRIC now comes from query_compiler, the single authority on
+    which key answers a measure at a period. The hardcoded swap table
+    this replaces covered only the cleared family, so every other metric
+    kept its MTD binding while `time_range.period` recorded the new
+    period — a wrong answer that looked right in the trace.
+
+    When the measure has no data at the requested period the patch is
+    DECLINED (returns False) rather than applied partially: the message
+    then goes through the normal parse path, which can say so, instead of
+    this function quietly relabelling MTD numbers.
+    """
+    period = temporal_parser.match_period(text)
+    if period is None:
+        return False
+
+    current_metric = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    if current_metric is not None:
+        resolved = query_compiler.resolve_metric_for_period(current_metric, period)
+        if resolved is None:
+            return False
+        if ir.metric:
+            ir.metric.key = resolved
+        if ir.sort.metric:
+            ir.sort.metric = resolved
+
+    ir.time_range.period = period
+    return True
 
 
 def _patch_threshold_filter(ir: QueryIR, text: str) -> bool:
@@ -154,11 +165,11 @@ def try_patch(prior: QueryIR, text: str, entities: dict, plan_action: str) -> Qu
     resolved as its own query ("leaderboard", "lookup", ...) is treated
     as a new question, not a modifier."""
     stripped = text.strip()
-    # "summary" is what the rule planner says for a BARE entity mention
-    # ("graana") — that's a legitimate new question. But with an explicit
-    # modifier prefix ("only graana") it's unambiguously a narrowing of
-    # the previous query, so it stays patchable.
-    if plan_action == "summary":
+    # "summary"/"breakdown" is what the rule planner says for a BARE entity
+    # mention ("graana", "unit head john") — that's a legitimate new
+    # question. But with an explicit modifier prefix ("only graana") it's
+    # unambiguously a narrowing of the previous query, so it stays patchable.
+    if plan_action in ("summary", "breakdown"):
         if not _ONLY_RE.match(stripped):
             return None
     elif plan_action != "unresolved":

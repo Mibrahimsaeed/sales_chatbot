@@ -49,11 +49,32 @@ class PaginationState:
 
 
 @dataclass
+class PendingPersonChoice:
+    """Phase 5: an in-flight "which Yasir Ali did you mean?" question.
+
+    Holds the candidates that were offered plus the ORIGINAL query, so
+    once the user picks one the question they actually asked can be
+    re-run against the chosen wid — rather than making them retype it."""
+    candidates: list
+    original_text: str
+    asked_at: float = field(default_factory=time.time)
+    attempts: int = 1
+
+
+@dataclass
 class SessionState:
     saved_at: float = field(default_factory=time.time)
     last_ir: QueryIR | None = None
     pending: PendingClarification | None = None
     pagination: PaginationState | None = None
+    pending_person: PendingPersonChoice | None = None
+    # Phase 5: the advisor the user settled on, carried for the rest of
+    # the session. Once "which Yasir Ali?" has been answered, a later
+    # "what about his overdue" must not re-ask — the identity question is
+    # already settled, and re-asking is the same failure as guessing:
+    # both ignore what the conversation already established.
+    resolved_advisor_wid: int | None = None
+    resolved_advisor_name: str | None = None
 
 
 _store: dict[str, SessionState] = {}
@@ -77,10 +98,23 @@ def get(session_id: str | None) -> QueryIR | None:
 def set(session_id: str | None, ir: QueryIR) -> None:
     """A successfully resolved IR both becomes the new follow-up base and
     closes any clarification that was in flight — the question got
-    answered by resolving the query."""
+    answered by resolving the query.
+
+    The resolved advisor identity (Phase 5) deliberately SURVIVES this
+    reset: it answers "who are we talking about", which a new analytical
+    query doesn't invalidate. Rebuilding SessionState from scratch here
+    would silently drop the person the user just disambiguated and make
+    the very next follow-up ask again."""
     if not session_id:
         return
-    _store[session_id] = SessionState(saved_at=time.time(), last_ir=ir, pending=None)
+    previous = _state(session_id)
+    _store[session_id] = SessionState(
+        saved_at=time.time(),
+        last_ir=ir,
+        pending=None,
+        resolved_advisor_wid=previous.resolved_advisor_wid if previous else None,
+        resolved_advisor_name=previous.resolved_advisor_name if previous else None,
+    )
 
 
 def get_pending(session_id: str | None) -> PendingClarification | None:
@@ -111,6 +145,60 @@ def clear_pending(session_id: str | None) -> None:
     state = _state(session_id)
     if state:
         state.pending = None
+
+
+# ---------------------------------------------------------------------
+# Phase 5 — person disambiguation state
+# ---------------------------------------------------------------------
+
+def get_pending_person(session_id: str | None) -> PendingPersonChoice | None:
+    state = _state(session_id)
+    if not state or not state.pending_person:
+        return None
+    if time.time() - state.pending_person.asked_at > _PENDING_TTL_SECONDS:
+        state.pending_person = None
+        return None
+    return state.pending_person
+
+
+def set_pending_person(session_id: str | None, candidates: list, original_text: str) -> None:
+    if not session_id:
+        return
+    state = _state(session_id) or SessionState()
+    attempts = state.pending_person.attempts + 1 if state.pending_person else 1
+    state.pending_person = PendingPersonChoice(
+        candidates=list(candidates), original_text=original_text,
+        asked_at=time.time(), attempts=attempts,
+    )
+    state.saved_at = time.time()
+    _store[session_id] = state
+
+
+def clear_pending_person(session_id: str | None) -> None:
+    state = _state(session_id)
+    if state:
+        state.pending_person = None
+
+
+def set_resolved_advisor(session_id: str | None, wid: int, name: str | None = None) -> None:
+    """Remember which person the conversation is about. Set both when the
+    user answers a disambiguation AND when a query resolves to exactly
+    one person on its own, so a follow-up has a subject either way."""
+    if not session_id:
+        return
+    state = _state(session_id) or SessionState()
+    state.resolved_advisor_wid = wid
+    state.resolved_advisor_name = name
+    state.pending_person = None      # the identity question is settled
+    state.saved_at = time.time()
+    _store[session_id] = state
+
+
+def get_resolved_advisor(session_id: str | None) -> tuple[int, str | None] | None:
+    state = _state(session_id)
+    if not state or state.resolved_advisor_wid is None:
+        return None
+    return state.resolved_advisor_wid, state.resolved_advisor_name
 
 
 def get_pagination(session_id: str | None) -> PaginationState | None:

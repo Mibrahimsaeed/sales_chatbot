@@ -31,4 +31,8 @@ def extract_all() -> dict:
         "answered_calls": fetch_tab(bio, "Answered Calls"),
         "npr": fetch_tab(bio, "NPR"),
         "target_achievement": fetch_tab(bio, "Target Achievement"),  # feeds team_targets directly
+        # ---- tabs added after the sheet audit ----
+        "one_unit": fetch_tab(bio, "1 Unit"),                       # per-advisor unit ownership
+        "ytd_ccmc": fetch_tab(bio, "YTD CCMC"),                     # same shape as CCMC DATA MTD
+        "ytd_p1_overdue": fetch_tab(bio, "YTD P1 & Overdue"),       # same shape as P1 & Overdue
     }

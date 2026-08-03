@@ -32,7 +32,7 @@ import math
 
 from app.core.config import settings
 from app.core.logger import get_logger
-from app.llm.llm_client import embed_texts
+from app.llm.embeddings import embed_texts
 from app.llm.metric_ontology import METRICS
 
 log = get_logger("llm.semantic_retrieval")

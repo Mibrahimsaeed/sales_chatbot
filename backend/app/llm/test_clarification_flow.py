@@ -124,7 +124,7 @@ def test_unhelpful_answers_reask_then_give_up(clarify_db, monkeypatch):
     # still unhelpful — gives up gracefully instead of looping
     r3 = nlu_pipeline.resolve("whatever man", clarify_db, session_id=session)
     assert r3.kind == "clarify"
-    assert "start over" in r3.clarify_message
+    assert "start fresh" in r3.clarify_message
     assert conversation_memory.get_pending(session) is None
 
 
@@ -136,7 +136,7 @@ def test_low_confidence_ir_is_rejected_not_asked_about(clarify_db, monkeypatch):
     assert r1.kind == "clarify"
     assert r1.ir.confidence_level == "low"
     # the rephrase message, not a targeted "which metric" question
-    assert "start over" in r1.clarify_message
+    assert "start fresh" in r1.clarify_message
     # never set a pending slot for a query this unclear — a follow-up
     # answer would likely just compound the confusion
     assert conversation_memory.get_pending(session) is None

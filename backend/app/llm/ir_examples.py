@@ -216,6 +216,77 @@ EXAMPLES: list[dict] = [
         },
     },
     {
+        # new hierarchy level (Part: hierarchy rework) — subject_level is
+        # "unit_head", NOT "team"; "unit head" must never be inferred from
+        # a bare team mention, only from the literal phrase.
+        "utterance": "top 5 unit heads by connects",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "subject_level": "unit_head",
+            "subjects": [],
+            "metric": {"key": "total_connects", "confidence": 0.95},
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": "total_connects", "direction": "desc"},
+            "limit": 5,
+            "group_by": None,
+            "overall_confidence": 0.9,
+            "intent_confidence": 0.9,
+        },
+    },
+    {
+        # new hierarchy level comparison — same "comparison" intent shape
+        # as the team example above, just at subject_level "zonal_head".
+        "utterance": "compare zonal head Ahmed Ali with zonal head Bilal Khan on revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "comparison",
+            "subject_level": "zonal_head",
+            "subjects": [
+                {"type": "zonal_head", "value": "Ahmed Ali", "match_confidence": 1.0},
+                {"type": "zonal_head", "value": "Bilal Khan", "match_confidence": 1.0},
+            ],
+            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "limit": None,
+            "group_by": None,
+            "overall_confidence": 0.9,
+            "intent_confidence": 0.95,
+        },
+    },
+    {
+        # "breakdown" intent (Part: hierarchy rework phase 2) — a question
+        # about ONE named entity, nested by team. The utterance deliberately
+        # includes "performance" (a metric synonym) — this is exactly the
+        # phrasing that used to get mis-parsed as an unfiltered leaderboard
+        # (or with the subject dropped) before "breakdown" existed as its
+        # own intent; it is NOT a ranking, so no metric/sort is needed.
+        "utterance": "give me a breakdown of unit head Zeeshan Tariq's performance",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "breakdown",
+            "subject_level": "unit_head",
+            "subjects": [
+                {"type": "unit_head", "value": "Zeeshan Tariq", "match_confidence": 1.0},
+            ],
+            "metric": None,
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": None, "direction": "desc"},
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.9,
+            "intent_confidence": 0.9,
+        },
+    },
+    {
         # ambiguous business language — clarify with a low-confidence guess,
         # never an invented metric key. The low confidence intentionally
         # trips the validator into asking a targeted question.
@@ -240,6 +311,116 @@ EXAMPLES: list[dict] = [
             "group_by": None,
             "overall_confidence": 0.4,
             "intent_confidence": 0.4,
+        },
+    },
+    # ------------------------------------------------------------------
+    # Phase 5.2: the levels no example demonstrated. The schema accepted
+    # bcm/office/region, the prompt described them, and every worked
+    # example still showed only advisor/team/unit_head/zonal_head — so
+    # the shapes the model actually imitates never included them.
+    # ------------------------------------------------------------------
+    {
+        # BCM — a level of the verified chain, previously undemonstrated.
+        "utterance": "top 5 bcms by connects",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "subject_level": "bcm",
+            "subjects": [],
+            "metric": {"key": "total_connects", "confidence": 0.95},
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": "total_connects", "direction": "desc"},
+            "limit": 5,
+            "group_by": None,
+            "overall_confidence": 0.94,
+            "intent_confidence": 0.95,
+        },
+    },
+    {
+        # office — an ATTRIBUTE level. Rankable as a subject_level even
+        # though it does not nest in the chain.
+        "utterance": "top business centers by revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "subject_level": "office",
+            "subjects": [],
+            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "limit": 10,
+            "group_by": None,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.94,
+        },
+    },
+    {
+        # region as a FILTER rather than a subject — the shape "advisors
+        # in North Region" takes.
+        "utterance": "top advisors in North/KPK region by revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "filters": [
+                {"field": "region", "operator": "=", "value": "North/KPK", "confidence": 0.9},
+            ],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "limit": 10,
+            "group_by": None,
+            "overall_confidence": 0.92,
+            "intent_confidence": 0.93,
+        },
+    },
+    {
+        # company as a subject_level — the schema forbade this entirely
+        # before Phase 5.2's predecessor widened HIERARCHY_LEVELS.
+        "utterance": "compare Graana and IMARAT by revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "comparison",
+            "subject_level": "company",
+            "subjects": [
+                {"type": "company", "value": "Graana", "match_confidence": 0.98},
+                {"type": "company", "value": "IMARAT", "match_confidence": 0.98},
+            ],
+            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "limit": 10,
+            "group_by": None,
+            "overall_confidence": 0.94,
+            "intent_confidence": 0.96,
+        },
+    },
+    {
+        # A DAILY question (Phase 5.1 vocabulary): name the period the
+        # user used, do not substitute MTD.
+        "utterance": "top advisors by connects today",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": {"key": "total_connects", "confidence": 0.95},
+            "filters": [],
+            "time_range": {"mode": "snapshot", "period": "DAILY", "compare_to": None, "confidence": 0.95},
+            "sort": {"metric": "total_connects", "direction": "desc"},
+            "limit": 10,
+            "group_by": None,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.95,
         },
     },
 ]

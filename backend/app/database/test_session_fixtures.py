@@ -15,4 +15,9 @@ def test_db_session_fixture_creates_tables_and_persists_rows(db_session):
 def test_client_fixture_overrides_get_db_and_serves_health(client):
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    body = response.json()
+    assert body["status"] == "ok"
+    # /health also reports optional-subsystem status now (embeddings);
+    # `status` stays "ok" when that tier is down, since it degrades recall
+    # rather than making the service unhealthy.
+    assert "embeddings" in body

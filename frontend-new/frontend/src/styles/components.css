@@ -88,3 +88,9 @@
 .pill.good{background:rgba(79,174,127,0.15);color:var(--good);}
 .pill.bad{background:rgba(225,85,84,0.15);color:var(--bad);}
 .pill.warn{background:rgba(217,142,59,0.15);color:var(--warn);}
+
+.breakdown-team{margin-top:10px;padding-top:8px;border-top:1px solid var(--line);}
+.breakdown-team-title{font-weight:600;font-size:12.5px;margin-bottom:4px;display:flex;align-items:center;gap:8px;}
+.breakdown-advisor{display:flex;justify-content:space-between;padding:4px 0 4px 10px;font-size:12px;color:var(--muted);}
+.breakdown-advisor .nm{color:var(--ink);}
+.breakdown-advisor .r{font-family:'JetBrains Mono',monospace;}

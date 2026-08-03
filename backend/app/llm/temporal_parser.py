@@ -36,8 +36,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.llm import entity_linker
+from app.llm.periods import PERIODS, Period  # noqa: F401  (re-exported)
 
-Period = Literal["MTD", "YTD", "3M"]
+# The vocabulary lives in app/llm/periods.py — a leaf module with no
+# imports, because llm_client needs it for its JSON schema and cannot
+# import from here (this module reaches entity_linker -> embeddings ->
+# llm_client). Re-exported so existing callers are unaffected.
+#
+# DAILY is recognised VOCABULARY, not answerable data. See the
+# _EQUIVALENT_PATTERNS note on "today" for why it exists and what happens
+# downstream.
 
 
 @dataclass
@@ -49,7 +57,47 @@ class TemporalMatch:
 
 
 # Longest phrase first so "this month" matches before a bare "month" could.
+#
+# TODAY. "today" / "right now" / "as of now" previously matched NOTHING —
+# neither equivalent nor unsupported — so they fell through to the MTD
+# default and a question about today was answered with month-to-date
+# figures, silently. "today" is the single most common period word in the
+# KPI spec's own example questions.
+#
+# It maps to DAILY, which no metric can answer: PerformancePeriod holds
+# MTD/YTD/3M only, and the SalesFunnel columns are MTD-only. That is
+# deliberate and is the whole improvement. metric_for_period() returns
+# None for a period a measure has no data at, and its contract is
+# explicit that "callers must degrade, not substitute" — so a daily
+# metric question now says so instead of quietly answering a different
+# question. When daily data lands, DAILY is already the name for it and
+# only the bindings need to change.
+#
+# "currently" / "at the moment" map to MTD, not DAILY: they mean "as
+# things stand" rather than naming the day, and MTD is the current-state
+# figure this system actually holds.
 _EQUIVALENT_PATTERNS: list[tuple[str, Period]] = [
+    (r"\bright now\b", "DAILY"),
+    (r"\bas of (now|today)\b", "DAILY"),
+    (r"\btoday'?s?\b", "DAILY"),
+    (r"\bso far today\b", "DAILY"),
+    # Times of day NAME today. "how are we doing this morning" is a
+    # question about today, not about the month — and it used to match
+    # nothing at all, so it silently became MTD like every other
+    # unrecognised phrase.
+    (r"\bthis (morning|afternoon|evening)\b", "DAILY"),
+    (r"\btonight\b", "DAILY"),
+    # "current <unit>" before the bare "currently"/"current" below, so
+    # "current year" is YTD rather than being swallowed as MTD.
+    (r"\bcurrent month\b", "MTD"),
+    (r"\bcurrent year\b", "YTD"),
+    (r"\bcurrent quarter\b", "3M"),
+    (r"\bcurrently\b", "MTD"),
+    (r"\bat the moment\b", "MTD"),
+    # Bare "current" — "the current numbers" means as things stand, which
+    # is the month-to-date figure this system holds. Last among the
+    # "current" family so the qualified forms above win.
+    (r"\bcurrent\b", "MTD"),
     (r"\bmonth to date\b", "MTD"),
     (r"\bthis month\b", "MTD"),
     (r"\bmtd\b", "MTD"),
@@ -60,7 +108,12 @@ _EQUIVALENT_PATTERNS: list[tuple[str, Period]] = [
     (r"\bthree month(s)?\b", "3M"),
     (r"\bquarter\b", "3M"),
     (r"\b3m\b", "3M"),
-    (r"\b3[\s-]?month\b", "3M"),
+    # Plural. `\b3[\s-]?month\b` required a boundary right after "month",
+    # so "last 3 months" — the phrasing this module's own docstring gives
+    # as supported, and the one the exemplar corpus lists — matched
+    # nothing and fell through to the MTD default. Deterministic
+    # matching, not the embedding tier, is what should be answering it.
+    (r"\b3[\s-]?months?\b", "3M"),
 ]
 
 _UNSUPPORTED_PATTERNS: list[tuple[str, str]] = [
@@ -99,6 +152,22 @@ _TEMPORAL_HINT_RE = re.compile(
     r"\b(month|year|quarter|week|day|since|so far|to date|period|recent|annual|ytd|mtd)\b", re.I
 )
 _SEMANTIC_TEMPORAL_FLOOR = 0.85
+
+
+def match_period(text: str) -> Period | None:
+    """The period this text names, or None — including None for a window
+    this data model cannot answer.
+
+    Phase 2: the single entry point for "does this text pick a period?".
+    ir_patcher used to keep its own substring table (`_PERIOD_PHRASES`)
+    with no unsupported-window handling at all, so a follow-up saying
+    "last quarter" mapped to 3M there while this module correctly refused
+    it. Two vocabularies for one question, only one of them safe. Callers
+    that just need the period — not the refusal message — use this;
+    callers that must explain the refusal use parse_period().
+    """
+    match = parse_period(text)
+    return match.period if match is not None and match.kind == "equivalent" else None
 
 
 def parse_period(text: str) -> TemporalMatch | None:

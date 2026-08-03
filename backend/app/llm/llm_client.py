@@ -1,41 +1,44 @@
 import json
 
-import ollama
+from openai import OpenAI
 
+from app.core import audit
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.llm.hierarchy import HIERARCHY_LEVELS
+from app.llm.periods import PERIODS
 
 log = get_logger("llm.client")
 
-# Local Ollama server — no API key, so there's no "key missing" precondition
-# to gate on like the old OpenAI client had. Client construction is cheap
-# and doesn't connect eagerly; "unavailable" (daemon down, model not
-# pulled, timeout) surfaces as an exception at call time, caught by each
-# function below exactly like every other failure mode already was.
-_client = ollama.Client(host=settings.ollama_host, timeout=15.0)
-
-# Ollama unloads a model from memory after its keep_alive window of
-# inactivity (default 5m) — the next request then pays a ~15-30s reload
-# cost. Chat traffic is bursty, not constant, so a generous window here
-# (instead of Ollama's default) keeps qwen3 resident through normal gaps
-# between messages; app startup (main.py) also warms it once at boot so
-# the FIRST real request isn't the one that pays the cold-start cost.
-_KEEP_ALIVE = "30m"
+# Back on OpenAI's hosted API (was Ollama — see git history) since a local
+# model was too slow for interactive chat latency. Client construction is
+# cheap and doesn't connect eagerly; "unavailable" (bad key, no quota,
+# network error, timeout) surfaces as an exception at call time, caught by
+# each function below exactly like every other failure mode already was.
+#
+# max_retries=0: the SDK's default (2 retries, exponential backoff) is
+# actively counterproductive here — a 429 insufficient_quota or bad-key
+# error can never succeed on retry, so the default just triples the
+# latency of every failed call before this module's own fail-soft path
+# (return None -> rule-based degrade) ever gets a chance to run. One
+# attempt, fail fast, degrade immediately.
+_client = OpenAI(api_key=settings.openai_api_key, timeout=20.0, max_retries=0)
 
 # Hand-written rather than derived from QueryIR.model_json_schema(): keeping
 # one schema that mirrors query_ir.QueryIR field-for-field (see
 # prompt_builder.IR_SCHEMA, which documents the same shape for the model to
 # read) is simpler than reshaping pydantic's generated schema on every call.
-# Passed to Ollama's `format` param as-is — Ollama's grammar-constrained
-# decoding reads standard JSON Schema (type/properties/required/enum/anyOf),
-# no OpenAI-specific wrapper needed.
+# Passed as OpenAI's Structured Outputs `response_format` as-is — every
+# object (including nested ones) already has additionalProperties: False
+# and every property already listed in `required`, which is what OpenAI's
+# strict mode needs.
 QUERY_IR_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["intent", "subject_level", "subjects", "metric", "filters", "time_range", "sort", "limit", "group_by", "overall_confidence", "intent_confidence"],
+    "required": ["intent", "subject_level", "subjects", "metric", "filters", "time_range", "sort", "limit", "group_by", "flat", "overall_confidence", "intent_confidence"],
     "properties": {
-        "intent": {"type": "string", "enum": ["leaderboard", "comparison", "lookup", "trend", "filtered_list", "clarify"]},
-        "subject_level": {"type": "string", "enum": ["advisor", "team", "company"]},
+        "intent": {"type": "string", "enum": ["leaderboard", "comparison", "lookup", "trend", "filtered_list", "breakdown", "clarify"]},
+        "subject_level": {"type": "string", "enum": HIERARCHY_LEVELS},
         "subjects": {
             "type": "array",
             "items": {
@@ -43,7 +46,7 @@ QUERY_IR_JSON_SCHEMA = {
                 "additionalProperties": False,
                 "required": ["type", "value", "match_confidence"],
                 "properties": {
-                    "type": {"type": "string", "enum": ["advisor", "team", "company"]},
+                    "type": {"type": "string", "enum": HIERARCHY_LEVELS},
                     "value": {"type": "string"},
                     "match_confidence": {"type": "number"},
                 },
@@ -80,7 +83,13 @@ QUERY_IR_JSON_SCHEMA = {
             "required": ["mode", "period", "compare_to", "confidence"],
             "properties": {
                 "mode": {"type": "string", "enum": ["snapshot", "compare"]},
-                "period": {"type": "string", "enum": ["MTD", "YTD", "3M"]},
+                # DERIVED. Hardcoding the triple here is why the LLM could
+                # not emit DAILY: with strict:True the grammar forbade a
+                # value temporal_parser had recognised for weeks, so an
+                # LLM-parsed "revenue today" was forced back to MTD —
+                # finding F5, alive on the default path while the
+                # rule-based path was already fixed.
+                "period": {"type": "string", "enum": list(PERIODS)},
                 "compare_to": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                 "confidence": {"type": "number"},
             },
@@ -95,7 +104,8 @@ QUERY_IR_JSON_SCHEMA = {
             },
         },
         "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        "group_by": {"anyOf": [{"type": "string", "enum": ["advisor", "team", "company"]}, {"type": "null"}]},
+        "group_by": {"anyOf": [{"type": "string", "enum": HIERARCHY_LEVELS}, {"type": "null"}]},
+        "flat": {"type": "boolean"},
         "overall_confidence": {"type": "number"},
         "intent_confidence": {"type": "number"},
     },
@@ -103,30 +113,45 @@ QUERY_IR_JSON_SCHEMA = {
 
 
 def call_llm_structured(prompt: str, schema: dict, schema_name: str) -> dict | None:
-    """Schema-constrained structured output (Part 5.3): Ollama's `format`
-    param grammar-constrains decoding to the given JSON schema, so a
-    malformed shape becomes a provider-level error this function catches —
-    not a `json.JSONDecodeError` or a QueryIR that silently fails pydantic
-    validation downstream. `think=False` — this is a single-turn extraction
-    task, not one that benefits from qwen3's visible reasoning, and skipping
-    it cuts latency noticeably.
+    """Schema-constrained structured output (Part 5.3): OpenAI's Structured
+    Outputs (`response_format={"type": "json_schema", ...}`) grammar-
+    constrains decoding to the given JSON schema, so a malformed shape
+    becomes a provider-level error this function catches — not a
+    `json.JSONDecodeError` or a QueryIR that silently fails pydantic
+    validation downstream. `schema_name` (previously unused under Ollama,
+    which has no equivalent naming requirement) is the schema's name in
+    OpenAI's request — required by the API, has no effect on the output
+    shape itself.
 
-    Fails soft exactly like call_llm_json(): any error (daemon down, model
-    not pulled, timeout, malformed output) returns None so semantic_parser.py
-    degrades to the rule-based plan_to_ir() path. `schema_name` is unused —
-    kept for call-site compatibility (it named the schema for OpenAI's
-    strict-mode wrapper, which Ollama's format param doesn't need).
+    Fails soft exactly like call_llm_json(): any error (bad key, no quota,
+    network error, timeout, malformed output, a safety refusal) returns
+    None so semantic_parser.py degrades to the rule-based plan_to_ir()
+    path.
     """
+    # Audit capture happens BEFORE the call (and outside the try) so a
+    # prompt is recorded even when inference times out or is refused —
+    # those runs degrade to the rule-based path, which is precisely the
+    # kind of "why was this answer different?" the audit is here to
+    # explain. No-op unless CHAT_AUDIT_DEBUG is on.
+    # Hoisted only so the audit can record the LITERAL payload — same list,
+    # same single user message, unchanged content.
+    messages = [{"role": "user", "content": prompt}]
+    audit.record_prompt(
+        prompt, purpose=f"structured:{schema_name}", model=settings.openai_model, messages=messages
+    )
     try:
-        response = _client.chat(
-            model=settings.ollama_model,
-            messages=[{"role": "user", "content": prompt}],
-            format=schema,
-            think=False,
-            options={"num_predict": 800},
-            keep_alive=_KEEP_ALIVE,
+        response = _client.chat.completions.create(
+            model=settings.openai_model,
+            messages=messages,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+            },
+            max_completion_tokens=800,
         )
-        return json.loads(response.message.content.strip())
+        raw = response.choices[0].message.content.strip()
+        audit.record_llm_response(raw)
+        return json.loads(raw)
 
     except json.JSONDecodeError:
         log.warning("LLM returned unparseable JSON despite schema constraint")
@@ -143,20 +168,23 @@ def call_llm_json(prompt: str) -> dict | None:
     a QueryIR should call call_llm_structured() with QUERY_IR_JSON_SCHEMA
     instead — see semantic_parser.py.
 
-    Fails soft — returns None on any error (daemon down, model not pulled,
-    malformed JSON, timeout) so the pipeline can degrade to the rule-based
-    fallback rather than crash the chat endpoint or block on a retry loop.
+    Fails soft — returns None on any error (bad key, no quota, network
+    error, timeout, malformed JSON) so the pipeline can degrade to the
+    rule-based fallback rather than crash the chat endpoint or block on a
+    retry loop.
     """
+    messages = [{"role": "user", "content": prompt}]
+    audit.record_prompt(prompt, purpose="json", model=settings.openai_model, messages=messages)
     try:
-        response = _client.chat(
-            model=settings.ollama_model,
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-            think=False,
-            options={"num_predict": 600},
-            keep_alive=_KEEP_ALIVE,
+        response = _client.chat.completions.create(
+            model=settings.openai_model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            max_completion_tokens=600,
         )
-        return json.loads(response.message.content.strip())
+        raw = response.choices[0].message.content.strip()
+        audit.record_llm_response(raw)
+        return json.loads(raw)
 
     except json.JSONDecodeError:
         log.warning("LLM returned unparseable JSON")
@@ -172,18 +200,18 @@ def classify_with_llm(prompt: str) -> dict | None:
     return call_llm_json(prompt)
 
 
-def embed_texts(texts: list[str]) -> list[list[float]] | None:
-    """Part 8: fail-soft embeddings primitive for semantic_retrieval.py,
-    same contract as call_llm_structured() — any failure (daemon down,
-    embedding model not pulled, timeout) returns None so the caller
-    degrades to its next-best option instead of raising."""
+def create_embeddings(texts: list[str]) -> list[list[float]]:
+    """RAW embeddings call — RAISES on any provider failure.
+
+    Unlike every other function in this module, this one does not fail
+    soft. Availability policy (classify the error, disable the subsystem,
+    stop calling) lives in app/llm/embeddings.py, and it needs the
+    exception to decide WHY it failed: swallowing it here would collapse
+    "no quota" and "network blip" into an indistinguishable None, and
+    both would then be retried forever.
+
+    Callers should use embeddings.embed_texts(), not this."""
     if not texts:
         return []
-
-    try:
-        response = _client.embed(model=settings.ollama_embedding_model, input=texts, keep_alive=_KEEP_ALIVE)
-        return list(response.embeddings)
-
-    except Exception:
-        log.exception("Embedding call failed")
-        return None
+    response = _client.embeddings.create(model=settings.openai_embedding_model, input=texts)
+    return [d.embedding for d in response.data]

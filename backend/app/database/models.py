@@ -54,7 +54,22 @@ class Advisor(Base):
 
 class SalesFunnel(Base):
     """MTD connects/meetings/conversion. Consolidates MasterSheet, Data,
-    Connect Session, PC Meeting, and CCMC DATA MTD — they're the same metrics."""
+    Connect Session, PC Meeting, and CCMC DATA MTD — they're the same metrics.
+
+    YTD lives in PARALLEL COLUMNS rather than as period ROWS (the shape
+    `Performance` uses). Two reasons, both structural:
+
+    1. The MTD columns are NAMED for their period (`mtd_new_connect`), so
+       a YTD row would carry year-to-date figures in columns saying
+       "mtd". A period dimension here would require renaming every
+       column.
+    2. Every existing binding on this table has `period=None` and applies
+       no period filter. Adding rows would make `SUM(mtd_new_connect)`
+       sum MTD *and* YTD rows — silently doubling every funnel metric.
+       Fixing that means changing bindings, which is outside the ETL.
+
+    So the YTD import is additive and inert: nothing reads `ytd_*` yet,
+    and nothing that reads `mtd_*` can see it."""
     __tablename__ = "sales_funnel"
 
     wid = Column(Integer, ForeignKey("advisors.wid"), primary_key=True)
@@ -67,6 +82,21 @@ class SalesFunnel(Base):
     mtd_todo = Column(Float, default=0)
     mtd_booking_stored = Column(Float, default=0)
     mtd_conversion = Column(Float, default=0)
+    # From MasterSheet's own "Meetings Planned"/"Meetings Conducted"
+    # columns — the IBD boards' source. Verified identical to the
+    # "P/C Meeting" tab across all 608 shared WIDs, and MasterSheet is
+    # already fetched, so it is preferred per the audit.
+    mtd_meetings_planned = Column(Float, default=0)
+    mtd_meetings_conducted = Column(Float, default=0)
+    # ---- YTD mirror (tab: "YTD CCMC"). See the class docstring. ----
+    ytd_new_connect = Column(Float, default=0)
+    ytd_followup_connect = Column(Float, default=0)
+    ytd_cr = Column(Float, default=0)
+    ytd_new_meeting = Column(Float, default=0)
+    ytd_followup_meeting = Column(Float, default=0)
+    ytd_todo = Column(Float, default=0)
+    ytd_booking_stored = Column(Float, default=0)
+    ytd_conversion = Column(Float, default=0)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     advisor = relationship("Advisor", back_populates="sales_funnel")
@@ -80,6 +110,11 @@ class Pipeline(Base):
     wid = Column(Integer, ForeignKey("advisors.wid"), primary_key=True)
     pipeline = Column(Float, default=0)
     overdue = Column(Float, default=0)
+    # ---- YTD mirror (tab: "YTD P1 & Overdue"), parallel columns for the
+    # same reason as SalesFunnel — the bindings here also carry
+    # period=None and would double-count period rows. ----
+    ytd_pipeline = Column(Float, default=0)
+    ytd_overdue = Column(Float, default=0)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     advisor = relationship("Advisor", back_populates="pipeline")
@@ -99,6 +134,10 @@ class Attendance(Base):
     login_status = Column(String)
     login_mtd_ontime = Column(Float, default=0)
     login_mtd_late = Column(Float, default=0)
+    # The "Login Report" tab carries this column and always has; only the
+    # Biometric half was reading its equivalent, so the two attendance
+    # sources could not share a denominator shape.
+    login_mtd_not_marked = Column(Float, default=0)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     advisor = relationship("Advisor", back_populates="attendance")
@@ -167,6 +206,7 @@ class Calls(Base):
     answered_calls_mtd = Column(Float, default=0)
     answered_calls_daily = Column(Float, default=0)
     connects_mtd = Column(Float, default=0)
+    connects_daily = Column(Float, default=0)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     advisor = relationship("Advisor", back_populates="calls")
@@ -216,6 +256,21 @@ class AdvisorHistory(Base):
 
 
 class SyncLog(Base):
+    """One row per ETL run. The columns past `error` were added by the
+    reliability rework (migration 0008) so a run is diagnosable after the
+    fact instead of only "success/failed":
+
+    - `attempts` > 1 with status='success' is the early warning that
+      transient Sheets/DB failures are happening and being absorbed by the
+      retry loop — invisible before, since only the final outcome was kept.
+    - `trigger` distinguishes a missing SCHEDULED run (the scheduler is
+      down — the actual root cause of the stale-data incident this rework
+      addresses) from a quiet period with no manual runs.
+    - `validation_report` / `join_report` store the JSON produced by
+      etl/validation.py and etl/join_integrity.py, so "when did this data
+      gap first appear" is answerable from history rather than only the
+      current snapshot.
+    """
     __tablename__ = "sync_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -224,6 +279,12 @@ class SyncLog(Base):
     status = Column(String)              # 'running' | 'success' | 'failed'
     rows_synced = Column(Integer)
     error = Column(String)
+    duration_seconds = Column(Float)
+    attempts = Column(Integer)
+    trigger = Column(String)             # 'scheduled' | 'manual' | 'startup'
+    rows_by_table = Column(String)       # JSON: {"advisors": 3182, ...}
+    validation_report = Column(String)   # JSON: etl.validation.ValidationReport.to_dict()
+    join_report = Column(String)         # JSON: etl.join_integrity.JoinIntegrityReport.to_dict()
 
 
 class ChatLog(Base):
@@ -258,6 +319,25 @@ class ChatLog(Base):
     response_type = Column(String)
     resolved_ir = Column(String)          # QueryIR.model_dump_json(), null for shortcut/plan-kind resolutions
     confidence_metadata = Column(String)  # JSON: {intent, metric, entities, filters, time, level, ambiguity_reasons}
+
+    # Phase 7 (request tracing). `trace` is the full decision chain as
+    # JSON — extracted entities, the identity candidates considered, the
+    # planner's decision, the QueryIR, and the literal SQL executed with
+    # its bind params. That combination is what makes a production
+    # failure REPRODUCIBLE: every wrong-person bug in the pipeline audit
+    # had to be diagnosed by hand-instrumenting a REPL because none of it
+    # was recorded.
+    #
+    # The scalars beside it are denormalized out of that JSON purely so
+    # the common triage questions are indexable rather than requiring a
+    # JSON scan of every row: "which requests resolved to this advisor",
+    # "which returned zero rows", "what got slow".
+    trace = Column(String)
+    trace_id = Column(String, index=True)
+    resolved_wid = Column(Integer, index=True)
+    row_count = Column(Integer)
+    duration_ms = Column(Float)
+
     created_at = Column(DateTime, server_default=func.now())
 
 

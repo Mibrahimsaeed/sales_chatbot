@@ -36,6 +36,40 @@ def _no_live_entity_linking(monkeypatch):
     monkeypatch.setattr(entity_linker.settings, "entity_linking_enabled", False)
 
 
+# app/services/advisor_service.py reads the advisor_profile VIEW, which is
+# created by an Alembic migration rather than by Base.metadata — so it did
+# not exist in the in-memory test DB and every advisor-lookup path was
+# silently untestable (any test touching it died on "no such table").
+# Mirrors migrations/0006's definition, in SQLite-compatible form: the
+# enum comparison is a plain string here since SQLAlchemy stores
+# PerformancePeriod by value.
+_ADVISOR_PROFILE_VIEW = """
+CREATE VIEW advisor_profile AS
+SELECT
+    a.wid, a.name, a.company, a.team, a.region, a.office,
+    a.portfolio_lead, a.management_lead, a.bm, a.zm, a.rm,
+    sf.mtd_new_connect, sf.mtd_followup_connect, sf.system_connect,
+    sf.mtd_cr, sf.mtd_new_meeting, sf.mtd_followup_meeting, sf.mtd_conversion,
+    p.pipeline, p.overdue,
+    att.biometric_time, att.biometric_status, att.login_time, att.login_status,
+    mtd.target AS mtd_target, mtd.cleared AS mtd_cleared, mtd.pct AS mtd_pct,
+    ytd.target AS ytd_target, ytd.cleared AS ytd_cleared, ytd.pct AS ytd_pct,
+    port.value AS portfolio_value, port.retention_pct AS portfolio_retention_pct,
+    b.confirmed AS npr_confirmed, b.expected AS npr_expected,
+    c.answered_calls_mtd
+FROM advisors a
+LEFT JOIN sales_funnel sf ON sf.wid = a.wid
+LEFT JOIN pipeline p ON p.wid = a.wid
+LEFT JOIN attendance att ON att.wid = a.wid
+LEFT JOIN performance mtd ON mtd.wid = a.wid AND mtd.period = 'MTD'
+LEFT JOIN performance ytd ON ytd.wid = a.wid AND ytd.period = 'YTD'
+LEFT JOIN portfolio port ON port.wid = a.wid
+LEFT JOIN bookings b ON b.wid = a.wid
+LEFT JOIN calls c ON c.wid = a.wid
+WHERE a.in_master_sheet = 1;
+"""
+
+
 @pytest.fixture()
 def db_session():
     engine = create_engine(
@@ -44,6 +78,8 @@ def db_session():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(_ADVISOR_PROFILE_VIEW)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = TestingSessionLocal()
     try:

@@ -36,10 +36,17 @@ from sqlalchemy import asc, desc, func
 from sqlalchemy.orm import Session, aliased
 
 from app.database.models import Advisor, Attendance, PerformancePeriod
-from app.llm.metric_ontology import METRICS, ColumnBinding
+from app.llm import aggregation, hierarchy
+from app.llm.metric_ontology import (
+    METRICS, ColumnBinding, lower_is_better, metric_for_period,
+)
 from app.llm.query_ir import QueryIR, Filter
 
-_LEVEL_GROUP_COLUMN = {"team": Advisor.team, "company": Advisor.company}
+# Derived from the single hierarchy mapping (app/llm/hierarchy.py) instead
+# of hardcoding one dict entry per level here — team/company keep their
+# original entries (now sourced the same way), unit_head/zonal_head/
+# business_center are included for free.
+_LEVEL_GROUP_COLUMN = {level: hierarchy.column_for(level) for level in hierarchy.GROUP_LEVELS}
 
 _COMPARATORS = {
     "=": op.eq, "!=": op.ne, ">": op.gt, ">=": op.ge, "<": op.lt, "<=": op.le,
@@ -60,20 +67,111 @@ def _order(column, direction: str):
     return asc(column) if direction == "asc" else desc(column)
 
 
+def resolve_metric_for_period(metric_key: str, period=None) -> str | None:
+    """THE authority for "which metric key answers this measure at this
+    period" (Phase 2).
+
+    Period used to be resolved in two incompatible ways: the metric key
+    encoded it (mtd_cleared vs ytd_cleared) and ir_patcher owned a
+    hardcoded six-entry swap table covering only the cleared family. Any
+    other metric kept its MTD binding while the IR recorded the requested
+    period — so "top 5 by connects" followed by "what about YTD" returned
+    MTD numbers labelled YTD, invisibly.
+
+    Returning None means the measure has NO data at that period, which is
+    the truthful answer for every SalesFunnel-sourced metric (those
+    columns are MTD-only). Callers must degrade, not substitute.
+    """
+    return metric_for_period(metric_key, period)
+
+
+def effective_metric(ir) -> str | None:
+    """Public alias for _effective_metric.
+
+    Everything that NAMES the metric in a reply must resolve it the same
+    way the value was computed. Once a stated period could reach the
+    compiler (Step 2), reading the raw `ir.sort.metric` for a label
+    produced a YTD number under the header "MTD Revenue Cleared" — the
+    right figure with the wrong name on it, which is its own kind of
+    silently wrong answer.
+    """
+    return _effective_metric(ir)
+
+
+def _effective_metric(ir) -> str | None:
+    """The metric key this IR should actually be compiled against.
+
+    THE one place (metric, period) becomes a binding. The IR carries the
+    measure in `sort.metric`/`metric.key` and the period in
+    `time_range.period`; only reading the first is how a YTD request
+    returned MTD numbers. Both are read here, and a request the measure
+    cannot answer returns None — which `compile_and_run` already turns
+    into the caller's "I don't have a way to answer that yet" path.
+
+    Consistency note: plan_to_ir sets `time_range.period` from the chosen
+    metric, so a rule-built IR always agrees with itself and this is a
+    no-op for it. It bites only on an LLM-built IR that names a measure
+    and a period that don't match — exactly the case worth catching.
+    """
+    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    if not metric_key:
+        return None
+    period = getattr(ir.time_range, "period", None)
+    return resolve_metric_for_period(metric_key, period)
+
+
+def default_direction(metric_key: str | None) -> str:
+    """"asc" | "desc" — the sort a ranking should use when the user
+    didn't say. Read from the metric's own `lower_is_better`, so a
+    metric where less is better (overdue, late arrivals) can no longer
+    be ranked worst-first and presented as the leaders."""
+    return "asc" if lower_is_better(metric_key) else "desc"
+
+
 def _binding_for(metric_key: str, level: str) -> ColumnBinding | None:
+    """Explicit ontology bindings win when they exist — team/company keep
+    their exact prior behavior (including team-named TeamTarget bindings
+    that have no advisor-rooted equivalent) unchanged.
+
+    For the three NEW hierarchy levels (unit_head/zonal_head/business_
+    center), metric_ontology.py declares no per-metric binding at all —
+    requiring one would mean duplicating every metric's advisor-level
+    binding ~3x, exactly the per-level hardcoding requirement 4 says to
+    avoid. Since these levels are plain Advisor-column rollups (never
+    team-named — there's no per-unit-head source table the way TeamTarget
+    is a genuine team-level source), any such level generically reuses the
+    metric's advisor-level binding: `_value_expr` already knows how to
+    sum/avg it for a rollup, and `_LEVEL_GROUP_COLUMN` already knows which
+    Advisor column to group by. Company is deliberately NOT included in
+    this fallback — its existing binding-or-None behavior (some metrics
+    were never given a company binding) stays exactly as it was.
+
+    PHASE 4. That advisor-binding fallback was the right rule scoped too
+    narrowly: it applied to the three NEW levels only, so `team` still
+    preferred its team-named TeamTarget binding while unit_head/zonal_
+    head/bcm rolled advisors up. That is one of the ways a single team's
+    achievement had two answers. Binding selection now comes from the
+    aggregation engine, which applies the fallback at EVERY group level.
+
+    The TeamTarget figure is not lost — it answers a different question
+    (the sheet's own team target, not a roll-up of that team's advisors),
+    and team_service reads it explicitly under its own keys."""
     metric = METRICS.get(metric_key)
     if not metric:
         return None
-    return metric.bindings.get(level)
+    if level == "advisor":
+        return metric.bindings.get("advisor")
+    return aggregation.binding_for(metric_key, level)
 
 
-def _value_expr(binding: ColumnBinding, agg_for_rollup: bool, level: str):
-    """The SQL expression to select/order/filter by for this binding at
-    this level: the raw per-advisor expression, or the team/company
-    rollup aggregation (sum/avg) when the level requires grouping."""
-    if not agg_for_rollup or level == "advisor" or binding.team_named:
-        return binding.expr
-    return func.avg(binding.expr) if binding.agg == "avg" else func.sum(binding.expr)
+def is_answerable(metric_key: str, level: str) -> bool:
+    """Public predicate: can the compiler actually build a query for this
+    (metric, level) pair — an explicit ontology binding, or the generic
+    new-hierarchy-level rollup fallback in `_binding_for` above. Used by
+    ir_validator.py so it never resets a subject_level the compiler would
+    in fact have honored (that used to only check membership in
+    METRICS[key].bindings directly, which doesn't know about the fallback)."""
+    return _binding_for(metric_key, level) is not None
 
 
 def compile_and_run(db: Session, ir: QueryIR, offset: int = 0) -> list[dict] | None:
@@ -84,7 +182,7 @@ def compile_and_run(db: Session, ir: QueryIR, offset: int = 0) -> list[dict] | N
     result — default 0 preserves the exact prior behavior for every
     existing caller."""
     level = ir.subject_level
-    sort_metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    sort_metric_key = _effective_metric(ir)
     if not sort_metric_key:
         return None
 
@@ -104,7 +202,7 @@ def count_ir(db: Session, ir: QueryIR) -> int | None:
     pagination needs the true total to decide whether/how many pages
     exist, decoupled from however many rows get displayed)."""
     level = ir.subject_level
-    sort_metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    sort_metric_key = _effective_metric(ir)
     if not sort_metric_key:
         return None
 
@@ -158,33 +256,62 @@ def _run_team_named(db, ir: QueryIR, binding: ColumnBinding, offset: int = 0) ->
 
 
 def _apply_entity_filters(query, ir: QueryIR):
+    """Any filter field that names a hierarchy level (team/company/advisor/
+    unit_head/zonal_head/business_center) filters Advisor by that level's
+    column, generically via hierarchy.LEVEL_COLUMNS — metric filters and
+    attendance_status are handled by their own dedicated functions below
+    and simply aren't in that mapping, so they're a no-op here."""
     for f in ir.filters:
-        if f.field == "team":
-            query = query.filter(Advisor.team.ilike(f"%{f.value}%"))
-        elif f.field == "company":
-            query = query.filter(Advisor.company.ilike(f"%{f.value}%"))
-        elif f.field == "advisor":
-            query = query.filter(Advisor.name.ilike(f"%{f.value}%"))
+        column = hierarchy.column_for(f.field)
+        if column is not None:
+            query = query.filter(column.ilike(f"%{f.value}%"))
     return query
 
 
 def _apply_subject_filter(query, ir: QueryIR):
-    """Comparisons compile as a normal query with an added 'subject name is
-    one of these' filter — no separate comparison code path needed."""
-    if ir.intent != "comparison" or not ir.subjects:
+    """Any grounded subject scopes the query down to it — not just for
+    intent=="comparison" (comparisons compile as a normal query with an
+    added 'subject name is one of these' filter, no separate code path
+    needed), but for ANY intent. Bug fix: a "leaderboard"-shaped question
+    about one specific named entity ("show me unit head X's performance")
+    has the parser correctly ground X into ir.subjects while keeping
+    intent="leaderboard" (it isn't comparing two things) — gating this
+    filter to comparison-only meant that subject was silently dropped and
+    the query ran as an unfiltered top-N ranking of everyone instead of
+    the one row asked about. A single grounded subject is exactly as real
+    a scoping signal as an explicit team/company/... filter; response_
+    planner already collapses a single resulting row to shape=
+    "single_value" once this actually filters it down to one. The
+    team-named path below (_build_team_named_query) already applied its
+    subject filter unconditionally — this brings the advisor-rooted path
+    in line with that instead of the other way around.
+
+    Phase 1 identity refactor: for advisor subjects carrying a resolved
+    WID, the filter binds to Advisor.wid instead of Advisor.name. Name
+    equality cannot address one specific person — 238 name groups in
+    production map to more than one human, so `Advisor.name.in_(["Yasir
+    Ali"])` silently matches 8 different people and sums their numbers
+    into one row. WIDs are used only when EVERY advisor subject has one;
+    a partially-resolved set falls back to name matching rather than
+    silently dropping the unresolved subjects out of a comparison."""
+    if not ir.subjects:
         return query
+    column = hierarchy.column_for(ir.subject_level)
+    if column is None:
+        return query
+
+    subjects = [s for s in ir.subjects if s.type == ir.subject_level]
+    if not subjects:
+        return query
+
     if ir.subject_level == "advisor":
-        names = [s.resolved_id or s.value for s in ir.subjects if s.type == "advisor"]
-        if names:
-            query = query.filter(Advisor.name.in_(names))
-    elif ir.subject_level == "team":
-        names = [s.resolved_id or s.value for s in ir.subjects if s.type == "team"]
-        if names:
-            query = query.filter(Advisor.team.in_(names))
-    elif ir.subject_level == "company":
-        names = [s.resolved_id or s.value for s in ir.subjects if s.type == "company"]
-        if names:
-            query = query.filter(Advisor.company.in_(names))
+        wids = [s.resolved_wid for s in subjects if s.resolved_wid is not None]
+        if wids and len(wids) == len(subjects):
+            return query.filter(Advisor.wid.in_(wids))
+
+    names = [s.resolved_id or s.value for s in subjects]
+    if names:
+        query = query.filter(column.in_(names))
     return query
 
 
@@ -199,6 +326,13 @@ def _join_fact_table(query, joined: dict, model: type, period):
     column access for this join must go through entity, not the raw
     model class.
     """
+    # Advisor IS the query root, so "joining" it is a no-op. A metric
+    # whose column lives on the advisor row itself (1-Unit ownership)
+    # binds to Advisor; without this guard the compiler would emit
+    # `FROM advisors JOIN advisors ON advisors.wid = advisors.wid`.
+    if model is Advisor:
+        return query, Advisor
+
     key = (model, period)
     if key in joined:
         return query, joined[key]
@@ -246,7 +380,19 @@ def _apply_attendance_filter(query, ir: QueryIR, joined: dict):
 def _apply_metric_filters(query, ir: QueryIR, level: str, joined: dict):
     """Filters on a metric OTHER than the sort metric (Root Cause #1/#3 fix:
     "high sales but poor attendance" filters on late_count while sorting
-    by mtd_cleared). Each distinct (model, period) fact table is joined once."""
+    by mtd_cleared). Each distinct (model, period) fact table is joined once.
+
+    A filter field is taken LITERALLY and is deliberately not re-resolved
+    against ir.time_range. "Rank by MTD revenue, but only advisors whose
+    YTD revenue exceeds 1500" is a real query, and a filter naming a
+    period-specific metric is already saying which window it means —
+    forcing it to the IR's period would silently rewrite it (see
+    test_filter_on_different_period_than_sort_metric_binds_to_its_own_period).
+
+    A threshold the user stated without its own period is a different
+    thing, and is resolved where that distinction is still visible: at
+    IR construction, in query_ir._threshold_filters().
+    """
     for f in ir.filters:
         if f.field not in METRICS:
             continue
@@ -259,27 +405,58 @@ def _apply_metric_filters(query, ir: QueryIR, level: str, joined: dict):
     return query
 
 
+def _join_declared_models(query, joined: dict, binding: ColumnBinding):
+    """JOIN the extra tables a binding's expression references.
+
+    FIX 3. A ratio may span two fact tables (Connect->CR divides client
+    registrations by answered calls). Referencing the second table
+    without joining it does not raise — SQLAlchemy appends it to the FROM
+    clause, producing a cartesian product that silently inflates the
+    denominator. `join_models` declares the requirement on the binding;
+    this honours it, reusing the same `joined` registry so a table is
+    never joined twice.
+    """
+    for model in getattr(binding, "join_models", ()) or ():
+        query, _entity = _join_fact_table(query, joined, model, None)
+    return query
+
+
 def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
     """Filtered/joined/grouped-but-unordered/unlimited query, rooted at
     Advisor — shared by _run_advisor_rooted (adds order_by/limit/offset)
     and count_ir (wraps in a count) so the join/filter logic lives in one
     place. Returns (query, value_expr) — value_expr is needed by the
-    caller to order by (the raw per-advisor column, or the sum()/avg()
-    rollup at team/company level)."""
+    caller to order by (the raw per-advisor column at the leaf, or the
+    engine's roll-up expression at a group level)."""
     level = ir.subject_level
     joined: dict = {}
-    is_rollup = level in ("team", "company")
-
-    value_expr = _value_expr(binding, agg_for_rollup=is_rollup, level=level)
+    # PHASE 4: the compiler no longer decides whether or how to roll up.
+    # It used to compute `is_rollup = level != "advisor"` and pick sum()
+    # or avg() itself — a second copy of a rule that also lived in
+    # comparison_service, which is how ranking teams by achievement and
+    # comparing the same two teams gave different numbers. The engine
+    # returns the raw column at the leaf and the declared roll-up above
+    # it. The metric comes from the IR via the same resolver the rest of
+    # the compiler uses, so a period-resolved sibling reads its own rule.
+    value_expr = aggregation.value_expression(
+        binding, _effective_metric(ir), level,
+    )
 
     if level == "advisor":
         query = db.query(Advisor.wid, Advisor.name, Advisor.team, Advisor.company)
         query, _sort_entity = _join_fact_table(query, joined, binding.model, binding.period)
+        query = _join_declared_models(query, joined, binding)
         query = query.add_columns(value_expr.label("value"))
     else:
         group_col = _LEVEL_GROUP_COLUMN[level]
         query = db.query(group_col.label("name"))
         query, _sort_entity = _join_fact_table(query, joined, binding.model, binding.period)
+        # The group path needs the declared joins as much as the leaf
+        # does. A cross join happens to leave a pure RATIO unchanged (both
+        # sums scale by the same factor), so the number looks right — but
+        # the SQL is wrong, it is quadratic, and any filter or non-ratio
+        # use of the same binding would be wrong too.
+        query = _join_declared_models(query, joined, binding)
         query = query.add_columns(value_expr.label("value"))
         query = query.filter(group_col.isnot(None))
 

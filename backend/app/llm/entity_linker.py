@@ -55,7 +55,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.logger import get_logger
-from app.llm.llm_client import embed_texts
+from app.llm import embeddings
+from app.llm.embeddings import embed_texts
 
 log = get_logger("llm.entity_linker")
 
@@ -73,6 +74,15 @@ SEMANTIC_FLOOR = 0.75
 # fuzzy/exact-findable, without re-embedding the whole gazetteer on every
 # single query.
 _INDEX_TTL_SECONDS = 300
+
+# NOTE: this module no longer implements any retry policy of its own.
+# Availability is owned entirely by app/llm/embeddings.py, which probes
+# once and then STOPS CALLING on failure — so a build here that finds
+# embeddings unavailable simply returns, and the next call short-circuits
+# inside embed_texts() without touching the network. The timed-retry
+# cooldown that used to live here was removed with it: two independent
+# retry policies in one path is how a single broken key turned into a
+# dozen doomed round trips per chat message.
 
 
 @dataclass
@@ -133,10 +143,11 @@ def _build_one(name: str, db: Session) -> None:
 
     vectors = embed_texts(values)
     if vectors is None:
-        # leave built_at untouched so the next call retries instead of
-        # treating this type as permanently dead — Ollama coming back
-        # (or getting pulled) should self-heal without a restart.
-        log.warning(f"Entity index build skipped for '{name}' — embeddings unavailable")
+        # Embeddings are unavailable. embeddings.py has already logged the
+        # single actionable WARNING and disabled the subsystem, so this
+        # stays at DEBUG rather than repeating it once per registered type
+        # (9 duplicate warnings per build was the reported log spam).
+        log.debug("Entity index build skipped for '%s' — embeddings unavailable", name)
         return
 
     idx.values, idx.vectors, idx.built_at = values, vectors, time.time()
@@ -146,7 +157,10 @@ def build_index(db: Session, force: bool = False) -> None:
     """Embeds every registered entity type's current candidate list.
     Best-effort — called eagerly at app startup (main.py) and refreshed
     lazily here on a TTL so index staleness tracks gazetteer staleness.
-    Safe to call repeatedly; a type whose TTL hasn't expired is a no-op."""
+    Safe to call repeatedly; a type whose TTL hasn't expired is a no-op,
+    and the whole loop short-circuits when embeddings are unavailable."""
+    if not embeddings.is_available():
+        return
     now = time.time()
     for name, idx in _INDEXES.items():
         if not force and idx.built_at and now - idx.built_at < _INDEX_TTL_SECONDS:
@@ -163,6 +177,10 @@ def semantic_candidates(
     or nothing clears the floor — every case the caller should treat as
     "ask for clarification", never as "assume no match was possible"."""
     if not settings.entity_linking_enabled or entity_type not in _REGISTRY:
+        return []
+    # embeddings given up on -> skip the semantic tier entirely; the
+    # caller falls back to exact/fuzzy, which is the whole point
+    if not embeddings.is_available():
         return []
 
     build_index(db)
@@ -235,7 +253,9 @@ def _build_exemplar_index(name: str) -> None:
     phrases = [phrase for phrase, _label in corpus]
     vectors = embed_texts(phrases)
     if vectors is None:
-        log.warning(f"Exemplar index build skipped for '{name}' — embeddings unavailable")
+        # See _build_one: embeddings.py already emitted the one actionable
+        # WARNING and disabled the subsystem.
+        log.debug("Exemplar index build skipped for '%s' — embeddings unavailable", name)
         return
 
     idx.phrases = phrases
@@ -257,6 +277,8 @@ def semantic_classify(
     query; callers with a DB session (entity_extractor.py) simply don't
     pass one through."""
     if not settings.entity_linking_enabled or exemplar_type not in _EXEMPLAR_REGISTRY:
+        return []
+    if not embeddings.is_available():
         return []
 
     idx = _EXEMPLAR_INDEXES[exemplar_type]

@@ -133,6 +133,31 @@ def test_build_index_force_rebuilds(monkeypatch, widget_type):
     assert len(widget_calls) == 2
 
 
+def test_build_index_is_skipped_entirely_when_embeddings_are_unavailable(monkeypatch, widget_type):
+    """Availability is owned by app/llm/embeddings.py, not here. Once it
+    has given up on the provider, index building must not even be
+    attempted — this module deliberately implements NO retry policy of
+    its own, because two independent retry policies in one path is how a
+    single broken key became a dozen doomed round trips per message."""
+    calls = []
+    monkeypatch.setattr(entity_linker, "embed_texts", lambda texts: calls.append(texts) or None)
+    monkeypatch.setattr(entity_linker.embeddings, "is_available", lambda: False)
+
+    build_index(db=None)
+    build_index(db=None)
+    assert calls == []
+
+
+def test_a_failed_build_leaves_the_index_empty_rather_than_raising(monkeypatch, widget_type):
+    """embed_texts returning None is the "no semantic tier" signal; the
+    index simply stays empty and lookups fall back to exact/fuzzy."""
+    monkeypatch.setattr(entity_linker, "embed_texts", lambda texts: None)
+
+    build_index(db=None)
+    assert entity_linker._INDEXES["widget"].vectors == []
+    assert semantic_candidates("anything", "widget", db=None) == []
+
+
 def test_registered_types_reflects_registrations(widget_type):
     assert "widget" in entity_linker.registered_types()
 
@@ -166,6 +191,18 @@ def test_semantic_classify_unregistered_type_returns_empty(monkeypatch):
 def test_semantic_classify_embed_failure_returns_empty(monkeypatch, mood_type):
     monkeypatch.setattr(entity_linker, "embed_texts", lambda texts: None)
     assert semantic_classify("hey", "mood") == []
+
+
+def test_semantic_classify_is_skipped_entirely_when_embeddings_are_unavailable(monkeypatch, mood_type):
+    """Same contract as build_index: once embeddings.py has given up, the
+    semantic tier is skipped without touching the provider."""
+    calls = []
+    monkeypatch.setattr(entity_linker, "embed_texts", lambda texts: calls.append(texts) or None)
+    monkeypatch.setattr(entity_linker.embeddings, "is_available", lambda: False)
+
+    assert semantic_classify("hey", "mood") == []
+    assert semantic_classify("hey", "mood") == []
+    assert calls == []
 
 
 def test_semantic_classify_returns_canonical_label_not_phrase(monkeypatch, mood_type):

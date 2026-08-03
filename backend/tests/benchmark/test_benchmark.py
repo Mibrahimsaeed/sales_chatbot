@@ -9,8 +9,8 @@ scores four dimensions:
 - sql:      compile_and_run rows vs expect.sql (row_count / first_row)
 
 Each dimension is scored only when the case declares it. Requires a
-reachable Ollama server with settings.ollama_model pulled (this measures
-the actual LLM parser) — run explicitly:
+reachable OpenAI API with a valid key/quota (this measures the actual LLM
+parser) — run explicitly:
 
     pytest tests/benchmark -m benchmark -s
 
@@ -23,11 +23,10 @@ import json
 import pathlib
 import uuid
 
-import ollama
 import pytest
 
-from app.core.config import settings
 from app.llm import conversation_memory, entity_extractor, nlu_pipeline
+from app.llm.llm_client import call_llm_json
 from app.llm.query_compiler import compile_and_run
 
 from tests.benchmark import fixture_data
@@ -36,23 +35,20 @@ CASES_DIR = pathlib.Path(__file__).parent / "cases"
 REPORT_PATH = pathlib.Path(__file__).parent / "benchmark_report.json"
 
 
-def _ollama_unavailable_reason() -> str | None:
-    """Live reachability probe (not just a config check, since Ollama has
-    no API key to test for presence/absence) — only runs when -m benchmark
-    is explicitly passed, so the one-time connection cost here is fine."""
-    try:
-        models = {m.model for m in ollama.Client(host=settings.ollama_host).list().models}
-    except Exception as e:
-        return f"Ollama server unreachable at {settings.ollama_host}: {e}"
-    if not any(m.startswith(settings.ollama_model) for m in models):
-        return f"model '{settings.ollama_model}' not pulled — run `ollama pull {settings.ollama_model}`"
+def _openai_unavailable_reason() -> str | None:
+    """Live reachability probe (not just a config check, since a present-
+    but-invalid/no-quota key looks fine until actually called) — only runs
+    when -m benchmark is explicitly passed, so the one-time call cost here
+    is fine."""
+    if call_llm_json('Return ONLY JSON: {"ok": true}') is None:
+        return "OpenAI API unreachable — check OPENAI_API_KEY / quota (see logs for the underlying error)"
     return None
 
 
 pytestmark = [
     pytest.mark.benchmark,
     pytest.mark.skipif(
-        (reason := _ollama_unavailable_reason()) is not None, reason=reason or ""
+        (reason := _openai_unavailable_reason()) is not None, reason=reason or ""
     ),
 ]
 

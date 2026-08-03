@@ -33,9 +33,12 @@ from sqlalchemy.orm import Session
 
 import re
 
-from app.llm import conversation_memory, multi_intent, semantic_parser
+from app.llm import (
+    advisor_resolver, conversation_memory, cross_turn_resolver, hierarchy,
+    llm_planner, metric_intent, multi_intent, routing, semantic_parser,
+)
 from app.llm.conversation_memory import MAX_CLARIFY_ATTEMPTS, PendingClarification
-from app.llm.entity_extractor import extract_entities
+from app.llm.entity_extractor import extract_entities, PROVENANCE_KEY
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.intent_detector import classify_intent as classify_shortcut
 from app.llm.ir_patcher import try_patch
@@ -46,15 +49,53 @@ from app.llm.ir_validator import (
     validate_ir,
 )
 from app.llm.preprocessing import normalize
+from app.llm.response_formatter import format_person_disambiguation_reply
 from app.llm.query_ir import MetricRef, QueryIR, Subject
 from app.llm.query_planner import build_query_plan, QueryPlan
 from app.llm.metric_ontology import describe_available_metrics
+from app.core import audit, tracing
 from app.core.logger import get_logger
 
 log = get_logger("llm.nlu_pipeline")
 
 SHORTCUT_INTENTS = ("greeting", "thanks", "help", "attendance_check")
-_RULE_BASED_ACTIONS = ("lookup", "summary", "attendance_filter")
+# "breakdown" (unit_head/zonal_head/business_center nested-by-team view) is
+# the same simple "bare entity mention" shape as "summary" — see
+# query_planner.build_query_plan — so it stays on the same rule-based path.
+# "clarify_person" (Phase 1 identity refactor) is rule-based by nature —
+# it's the deterministic "this name matches several real people" answer,
+# and must never be routed to the LLM, which has no way to know which WID
+# was meant either.
+_RULE_BASED_ACTIONS = (
+    "lookup", "summary", "breakdown", "attendance_filter", "clarify_person",
+    # M7: "connects of X" is one metric off one advisor row, reached
+    # through the ontology binding — deterministic, and there is nothing
+    # for the LLM to contribute that the resolved metric key doesn't
+    # already say.
+    "advisor_metric",
+    # "reverse_hierarchy" ("who is X's BM") is a direct column read off one
+    # advisor row — there is nothing for the metric compiler or the LLM to
+    # contribute, so it stays on the deterministic path.
+    "reverse_hierarchy",
+    # "ancestry" ("the full hierarchy above X") is the same kind of read,
+    # repeated once per level of the chain. Deterministic by construction
+    # — the chain decides which levels, and the columns hold the values.
+    "ancestry",
+    # "roster" ("all advisors in X") is a plain filtered list off one
+    # Advisor column — deterministic, nothing for the LLM to add.
+    "roster",
+    # "comparison" is a COMPLETE deterministic parse: two grounded
+    # entities plus an explicit comparison phrase. It is also exempt from
+    # the looks_compound() gate below — that heuristic routes multi-entity
+    # queries to the LLM precisely BECAUSE the rule-based planner used to
+    # have no way to express them, which is no longer true.
+    "comparison",
+    "comparison_incomplete",
+)
+
+# Actions complete enough to serve directly even when looks_compound()
+# would otherwise send the query to the LLM.
+_COMPOUND_EXEMPT_ACTIONS = ("comparison", "comparison_incomplete")
 
 # Part 8: typed "show more" — the alternative to clicking the button
 # (POST /chat/more, see app/api/chat.py). Only recognized when there's an
@@ -134,8 +175,8 @@ def _clarify(missing: list[str], db: Session) -> tuple[str, list[str]]:
 
 
 _GIVE_UP_MESSAGE = (
-    "Let's start over — try a full question like 'top 5 advisors by revenue' "
-    "or 'compare Blue Area with Downtown on achievement %'."
+    "I'm having trouble following that one — let's start fresh. Try something like "
+    "'top 5 advisors by revenue' or 'compare Blue Area with Downtown on achievement %'."
 )
 
 
@@ -158,7 +199,7 @@ def _handle_pending(
         result = validate_ir(filled, db)
         if result.is_valid:
             conversation_memory.set(session_id, result.ir)  # also closes the pending
-            return Resolution(kind="ir", ir=result.ir, entities=entities)
+            return _ir_resolution(result.ir, entities)
         if pending.attempts >= MAX_CLARIFY_ATTEMPTS or result.confidence_level == "low":
             conversation_memory.clear_pending(session_id)
             return Resolution(kind="clarify", entities=entities, clarify_message=_GIVE_UP_MESSAGE)
@@ -187,10 +228,116 @@ def _handle_pending(
     )
 
 
+# A follow-up that carries a pronoun or a bare possessive is asking about
+# the person already under discussion ("what about his overdue", "and her
+# team"). Deliberately narrow — a message naming its own subject resolves
+# that subject normally and never reaches this.
+_PERSON_FOLLOWUP_RE = re.compile(
+    r"\b(he|him|his|she|her|hers|they|them|their|this person|that person)\b", re.I
+)
+
+
+def _looks_like_person_followup(text: str) -> bool:
+    return bool(_PERSON_FOLLOWUP_RE.search(text))
+
+
+def _handle_pending_person(
+    pending, cleaned: str, db: Session, session_id: str | None
+) -> Resolution | None:
+    """Phase 5: read this message as the answer to "which <name>?".
+
+    Returns a Resolution to serve, or None to fall through when the
+    message is plainly a new question rather than a choice. Picking is
+    delegated to advisor_resolver.resolve_choice, which returns None
+    unless the answer identifies exactly ONE candidate — re-asking beats
+    guessing a second time."""
+    chosen = advisor_resolver.resolve_choice(cleaned, pending.candidates)
+
+    if chosen is not None:
+        conversation_memory.set_resolved_advisor(session_id, chosen.wid, chosen.name)
+        # Re-run the ORIGINAL question now that identity is settled, so
+        # "which Yasir Ali?" -> "2" answers what was actually asked
+        # instead of making the user retype it.
+        return resolve(pending.original_text, db, session_id=session_id, _depth=1)
+
+    # not a choice, and it stands on its own as a query -> user moved on
+    if len(re.findall(r"\S+", cleaned)) > 4:
+        conversation_memory.clear_pending_person(session_id)
+        return None
+
+    if pending.attempts >= MAX_CLARIFY_ATTEMPTS:
+        conversation_memory.clear_pending_person(session_id)
+        return Resolution(
+            kind="clarify", entities={},
+            clarify_message=(
+                "I still couldn't tell which person you meant — try including their team, "
+                "e.g. 'Yasir Ali in North/KPK'."
+            ),
+        )
+
+    conversation_memory.set_pending_person(session_id, pending.candidates, pending.original_text)
+    return Resolution(
+        kind="clarify",
+        entities={},
+        clarify_message=format_person_disambiguation_reply(
+            pending.candidates[0].name if pending.candidates else "that name", pending.candidates
+        ),
+        clarify_options=[c.label() for c in pending.candidates],
+    )
+
+
+def _plan(text: str, entities: dict, db: Session, session_id: str | None) -> QueryPlan:
+    """Choose a planner (USE_LLM_PLANNER), with the rule-based one as the
+    fallback in every failure case.
+
+    The fallback is what makes the flag safe to flip in either direction:
+    if the LLM planner is off, unreachable, out of quota, or returns
+    something unusable, planning silently continues with the rule-based
+    planner — so the worst case is exactly today's behaviour, never an
+    error. Both planners emit the SAME QueryPlan shape, so nothing
+    downstream (dispatch, resolver, compiler, formatter) can tell which
+    one ran, which is also what makes an A/B comparison meaningful."""
+    if llm_planner.is_enabled():
+        try:
+            planned = llm_planner.plan_query(text, entities, db, session_id)
+            if planned is not None:
+                return planned
+            log.debug("LLM planner unavailable for %r — using rule-based planner", text)
+        except Exception:
+            # planning must never be the reason a request fails
+            log.exception("LLM planner raised — falling back to the rule-based planner")
+
+    return build_query_plan(text, entities)
+
+
+def _ir_resolution(ir, entities: dict, **kwargs) -> Resolution:
+    """Return an IR resolution, or a refusal when routing validation says
+    the IR is complete but not answerable as asked.
+
+    Every kind="ir" exit goes through here so the last gate before the
+    compiler cannot be bypassed by adding a fourth return site later.
+    """
+    problem = routing.validate_route(ir)
+    if problem is not None:
+        routing.decide("Validation", "refused", problem)
+        return Resolution(kind="clarify", ir=ir, entities=entities,
+                          clarify_message=problem, **kwargs)
+    routing.decide("Validation", "passed", "metric, level and period are all answerable")
+    return Resolution(kind="ir", ir=ir, entities=entities, **kwargs)
+
+
 def resolve(text: str, db: Session, session_id: str | None = None, _depth: int = 0) -> Resolution:
     cleaned = normalize(text)
+    # One trace per user message. A split sub-query (_depth > 0) keeps
+    # appending to its parent's trace rather than starting a new one, so
+    # a compound message reads as a single ordered story.
+    if _depth == 0:
+        routing.start_trace(cleaned)
 
     if _SHOW_MORE_RE.match(cleaned.strip()) and conversation_memory.get_pagination(session_id) is not None:
+        audit.decision("routing", "paginate",
+                       "matched the 'show more' pattern AND this session has an active "
+                       "pagination cursor — no re-parse, the stored IR is reused")
         return Resolution(kind="paginate", entities={})
 
     # Part 8 (light multi-intent): checked BEFORE shortcut classification
@@ -208,26 +355,228 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     if _depth == 0:
         segments = multi_intent.split_subqueries(cleaned)
         if segments is not None:
+            audit.decision("routing", "multi_intent",
+                           f"split_subqueries() found {len(segments)} independent sub-queries: "
+                           f"{segments} — each resolved separately")
             sections = [(seg, resolve(seg, db, session_id, _depth=1)) for seg in segments]
             return Resolution(kind="multi", entities={}, sections=sections)
 
-    shortcut = classify_shortcut(cleaned, {})
-    if shortcut.intent in SHORTCUT_INTENTS:
-        return Resolution(kind="shortcut", shortcut_intent=shortcut.intent, entities={})
+    # Phase 5: an in-flight "which Yasir Ali did you mean?" takes
+    # precedence — "2" or "the one in Downtown" only means something as
+    # the answer to that question. Answering it re-runs the ORIGINAL
+    # query against the chosen wid, so the user doesn't retype it.
+    pending_person = conversation_memory.get_pending_person(session_id)
+    if pending_person is not None:
+        served = _handle_pending_person(pending_person, cleaned, db, session_id)
+        if served is not None:
+            return served
 
     entities = extract_entities(cleaned, db)
+
+    # M4: relations of the person the conversation is already about
+    # ("how is his team doing"). Runs BEFORE the carry below on purpose —
+    # the carry writes a remembered advisor INTO `entities`, and the
+    # cross-turn gate needs to see whether THIS message named anyone.
+    # Ordered after extraction and before planning, so an inferred entity
+    # reaches the planner exactly as a literally-named one would.
+    inferred_levels = cross_turn_resolver.resolve(
+        cleaned, entities, db, session_id, PROVENANCE_KEY
+    )
+
+    # Phase 5: once the conversation has settled on a person, that choice
+    # sticks. Two cases, both of which otherwise throw away what the user
+    # already told us:
+    #
+    #  a) the message re-states the ambiguous NAME (including the re-run
+    #     of the original question right after the user picked). Without
+    #     this the same "which Yasir Ali?" question is asked forever —
+    #     answering it would be impossible, since the answer is exactly
+    #     what gets discarded.
+    #  b) the message names nobody and refers back by pronoun ("what
+    #     about his overdue").
+    #
+    # M4 adds one exclusion to (b): when cross-turn inference just bound
+    # a GROUP the follow-up asked about, the subject of this message is
+    # that group, not the person. Carrying the person as well would put
+    # advisor_profile in the running against it — and win, since a
+    # resolved identity outscores an entity summary — so "how is his team
+    # doing" would answer with his own profile. The exclusion can only
+    # fire on messages where inference bound something, which is new
+    # behaviour by definition, so nothing that worked before changes.
+    carried = conversation_memory.get_resolved_advisor(session_id)
+    if carried:
+        wid, name = carried
+        carried_matches_candidates = wid in (entities.get("advisor_wids") or [])
+        names_nobody = not entities.get("advisor_wids")
+        followup_about_the_person = (
+            names_nobody and _looks_like_person_followup(cleaned) and not inferred_levels
+        )
+        if carried_matches_candidates or followup_about_the_person:
+            entities = {**entities, "advisor_wid": wid, "advisor_name": name,
+                        "advisor_wids": [wid], "advisor_match_score": 1.0}
+            entities.pop("advisor_ambiguous", None)
+            entities.pop("advisor_resolution", None)
+
+    # ---- Phase 1 routing gates -------------------------------------
+    # All three run HERE, after extraction/cross-turn/carry have produced
+    # the full identity picture and before any component commits to a
+    # route. Each replaces a decision that used to be made with less
+    # information than it needed. See app/llm/routing.py for the defects.
+
+    # P2: a measure this system knows about and cannot compute always
+    # explains itself. Checked before every other routing decision
+    # because availability is a property of the METRIC, not of the query
+    # shape — the old code reached this explanation only on the branch
+    # where no person resolved, so naming the person in full downgraded
+    # the answer to a profile card.
+    unavailable = routing.unavailable_metric(cleaned)
+    if unavailable is not None:
+        routing.decide(
+            "Metric", f"{unavailable.phrase} (unavailable)",
+            f"declared in metric_aliases.UNAVAILABLE — {unavailable.reason}",
+        )
+        message = routing.explain_unavailable(unavailable)
+        return Resolution(
+            kind="clarify",
+            # The plan travels with the refusal, exactly as the
+            # clarify_metric branch below does. Consumers (the golden
+            # harness, the trace) read plan.action to tell WHICH
+            # clarification this is; moving the check earlier must not
+            # change that contract, only the point at which it fires.
+            plan=QueryPlan(action="clarify_metric",
+                           entity_value=unavailable.phrase,
+                           reason=message),
+            entities=entities,
+            clarify_message=message,
+            clarify_options=clarification_options("metric", db),
+        )
+
+    # P1: shortcuts are a FALLBACK. classify_intent() now receives the
+    # real entity dict (it was handed a hardcoded {} before, which made
+    # its own entities.get("team") guard dead code in production), and a
+    # resolved person or an explicit rate/percentage phrase outranks it.
+    shortcut = classify_shortcut(cleaned, entities)
+    if shortcut.intent in SHORTCUT_INTENTS:
+        allowed, why = routing.shortcut_allowed(cleaned, entities)
+        if allowed:
+            routing.decide("Shortcut", shortcut.intent, why)
+            audit.mark_rule_path(
+                f"classify_intent() matched shortcut '{shortcut.intent}' and routing "
+                f"allowed it — {why}. Answered from a canned handler.",
+                chose=f"shortcut:{shortcut.intent}",
+            )
+            return Resolution(kind="shortcut", shortcut_intent=shortcut.intent,
+                              entities=entities)
+        routing.decide("Shortcut", "skipped", why)
+    else:
+        routing.decide("Shortcut", "skipped", "no shortcut intent matched")
+
+    # P3: the user named a person we could not ground. Answering about
+    # their team (metric_def.primary_level) or about the whole roster
+    # silently changes the subject of the question, which is the one
+    # thing routing must never do.
+    unresolved = routing.unresolved_subject(cleaned, entities)
+    if unresolved is not None:
+        routing.decide(
+            "Advisor", f"{unresolved} (NOT FOUND)",
+            "the query names a person identity resolution could not ground — "
+            "asked who was meant rather than answering about their group",
+        )
+        return Resolution(
+            kind="clarify",
+            entities=entities,
+            clarify_message=routing.explain_unresolved_subject(unresolved),
+        )
 
     # Part 8: a genuinely unsupported time window (last month, yesterday,
     # this week, past N days, a custom date range) must never silently
     # fall back to MTD — say so plainly instead of guessing wrong.
     if entities.get("period_unsupported"):
+        audit.decision("routing", "clarify:period_unsupported",
+                       f"entity extraction flagged an unsupported time window "
+                       f"({entities['period_unsupported']!r}) — refused rather than "
+                       "silently defaulting to MTD")
         return Resolution(
             kind="clarify",
             entities=entities,
             clarify_message=entities["period_unsupported"] + ". Try 'this month', 'year to date', or 'last 3 months' instead.",
         )
 
-    plan = build_query_plan(cleaned, entities)
+    if entities.get("advisor_wids"):
+        routing.decide(
+            "Advisor",
+            f"{entities.get('advisor_name')} ({entities.get('advisor_match_score')})",
+            "grounded by entity extraction",
+        )
+    if entities.get("period"):
+        routing.decide("Period", str(entities["period"]), "from the query text")
+
+    plan = _plan(cleaned, entities, db, session_id)
+    routing.decide("Planner", plan.action, f"metric={plan.metric} level={plan.level}")
+    # Phase 7: record the planner's decision HERE, where it's made —
+    # recording it from Resolution in chat_service only captured
+    # kind=="plan" outcomes, so a clarification or an IR-routed query (the
+    # two shapes most likely to be reported as wrong) showed plan=null,
+    # hiding exactly the routing decision the trace exists to explain.
+    tracing.record_plan(plan)
+    tracing.record_entities(entities)
+    # Same two artifacts for the readable audit. It keeps the FULL entity
+    # dict (tracing keeps a curated subset), because "the requirement was
+    # extracted but then dropped" is only visible against everything the
+    # extractor actually produced.
+    audit.record_entities(entities)
+    audit.record_plan(plan)
+
+    # A name matched under more than one hierarchy level (entity_extractor.
+    # _detect_ambiguous_entity) — ask which one was meant instead of
+    # silently picking one, fully rule-based so this can't itself introduce
+    # a spurious guess the way routing an ambiguous name to the LLM could.
+    if plan.action == "clarify_ambiguous":
+        ambiguous = plan.ambiguous or {}
+        value = ambiguous.get("value", "")
+        levels = ambiguous.get("levels", [])
+        options = [hierarchy.label_for(lvl) for lvl in levels]
+        audit.decision("routing", "clarify:ambiguous_entity",
+                       f"{value!r} grounded at more than one hierarchy level {levels} — "
+                       "asked which was meant rather than picking one")
+        return Resolution(
+            kind="clarify",
+            # As with clarify_metric: the plan travels with the refusal so
+            # a consumer can see WHICH clarification this is, not merely
+            # that the pipeline stopped.
+            plan=plan,
+            entities=entities,
+            clarify_message=f"'{value}' could mean the {' or the '.join(options)} — which did you mean?",
+            clarify_options=options,
+        )
+
+    # F6: the user named a measure this system has no metric for. Handled
+    # here, before the rule-based/LLM split, because the answer is the
+    # same either way — there is nothing to rank by, and the failure this
+    # replaces was answering anyway with whatever default was to hand.
+    # Every widening tier (exact, fuzzy, embedding) has already run inside
+    # metric_intent.detect(), so this is the end of the line rather than a
+    # shortcut past them.
+    if plan.action == "clarify_metric":
+        audit.decision("routing", "clarify:metric_unresolved",
+                       f"the query named a measure ({plan.entity_value!r}) that resolves to no "
+                       "metric — refused rather than ranking by the default and "
+                       "presenting it as the answer")
+        return Resolution(
+            kind="clarify",
+            # The plan travels with the refusal so a consumer (the trace,
+            # the golden-query harness) can see WHICH clarification this
+            # is rather than only that the pipeline gave up.
+            plan=plan,
+            entities=entities,
+            clarify_message=metric_intent.clarification(
+                plan.entity_value or plan.reason,
+                reason=plan.reason if plan.reason != plan.entity_value else None,
+            ),
+            # The same option list the validator offers when the gap is
+            # 'which metric' — one source for what we can rank by.
+            clarify_options=clarification_options("metric", db),
+        )
 
     # an in-flight clarification takes precedence: a bare "revenue" or
     # "Blue Area" only means something as the answer to last turn's question
@@ -235,6 +584,9 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     if pending is not None:
         served = _handle_pending(pending, cleaned, entities, plan, db, session_id)
         if served is not None:
+            audit.decision("routing", "answer_to_pending_clarification",
+                           f"a clarification was in flight (missing={pending.missing}); "
+                           "this message was read as its answer, not as a new query")
             return served
 
     # short follow-up modifiers ("only Graana", "top 5", "sort ascending")
@@ -247,24 +599,78 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             result = validate_ir(patched, db)
             if result.is_valid:
                 conversation_memory.set(session_id, result.ir)
-                return Resolution(kind="ir", ir=result.ir, entities=entities)
+                audit.mark_rule_path(
+                    "try_patch() recognised this as a follow-up modifier on the previous "
+                    "turn's IR — patched deterministically, no LLM call",
+                    chose="ir_patch",
+                )
+                audit.record_ir(result.ir)
+                return _ir_resolution(result.ir, entities)
             # an invalid patch falls through to the normal parse path
+
+    # Phase 5: a name matching several real people — record the question
+    # (candidates + the original query) so the next message can answer it,
+    # then ask. Never picked here, and never routed to the LLM, which has
+    # no way to know which wid was meant either.
+    if plan.action == "clarify_person":
+        conversation_memory.set_pending_person(session_id, plan.person_candidates, cleaned)
+        audit.decision("identity", "clarify_person",
+                       f"{plan.entity_value!r} matched {len(plan.person_candidates)} real "
+                       "people — asked which one instead of picking")
+        audit.record_advisor(None, plan.entity_value, status="ambiguous",
+                             candidates=plan.person_candidates)
+        return Resolution(
+            kind="clarify",
+            plan=plan,
+            entities=entities,
+            clarify_message=format_person_disambiguation_reply(
+                plan.entity_value, plan.person_candidates
+            ),
+            clarify_options=[c.label() for c in plan.person_candidates],
+        )
+
+    # Phase 5: a query that resolved to exactly one person establishes who
+    # the conversation is about, so a later pronoun follow-up has a
+    # subject without asking again.
+    if plan.entity_wid is not None:
+        conversation_memory.set_resolved_advisor(session_id, plan.entity_wid, plan.entity_value)
+        audit.record_advisor(plan.entity_wid, plan.entity_value, status="resolved",
+                             candidates=plan.person_candidates)
+        audit.decision("identity", f"wid={plan.entity_wid}",
+                       f"entity resolution grounded {plan.entity_value!r} to a single wid; "
+                       "the conversation's subject is now this person")
 
     # lookup/summary/attendance_filter stay on the simple rule-based path,
     # but only when the query doesn't look compound — "summary for Graana
     # AND Downtown" belongs to the semantic parser, not a single-entity plan.
-    if plan.action in _RULE_BASED_ACTIONS and not semantic_parser.looks_compound(cleaned, entities):
+    if plan.action in _RULE_BASED_ACTIONS and (
+        plan.action in _COMPOUND_EXEMPT_ACTIONS
+        or not semantic_parser.looks_compound(cleaned, entities)
+    ):
+        audit.mark_rule_path(
+            f"plan.action={plan.action!r} is in _RULE_BASED_ACTIONS and "
+            + (
+                f"is compound-exempt ({plan.action!r} in _COMPOUND_EXEMPT_ACTIONS)"
+                if plan.action in _COMPOUND_EXEMPT_ACTIONS
+                else "looks_compound() returned False"
+            )
+            + " — returned before semantic_parser.parse(), so NO LLM call is made "
+            "for this query regardless of NLU_MODE"
+        )
         return Resolution(kind="plan", plan=plan, entities=entities)
 
+    audit.decision(
+        "routing", "semantic_parser",
+        f"plan.action={plan.action!r} is "
+        + ("not in _RULE_BASED_ACTIONS" if plan.action not in _RULE_BASED_ACTIONS
+           else "rule-based but looks_compound() returned True")
+        + " — handed to the LLM semantic parser",
+    )
     outcome = semantic_parser.parse(cleaned, entities, db, session_id)
 
     if outcome.ir and not outcome.missing:
-        return Resolution(
-            kind="ir",
-            ir=outcome.ir,
-            entities=entities,
-            used_llm_fallback=outcome.used_llm,
-        )
+        return _ir_resolution(outcome.ir, entities,
+                              used_llm_fallback=outcome.used_llm)
 
     if outcome.ir and outcome.missing:
         # Part 10: "low" confidence means the parse itself is too shaky to
@@ -297,7 +703,7 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         kind="clarify",
         entities=entities,
         clarify_message=(
-            f"I couldn't match that to something I track. I can answer about: "
+            f"I'm not tracking that one, sorry! I can help with: "
             f"{describe_available_metrics()} — or look up an advisor, team, or company by name."
         ),
     )

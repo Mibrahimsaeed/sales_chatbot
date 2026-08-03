@@ -5,3 +5,7 @@ requirements.txt
 __pycache__/
 *.py[cod]
 .venv
+
+# Chat audit logs (app/core/audit.py, CHAT_AUDIT_DEBUG=true) — verbatim
+# user queries and LLM prompts, never committed.
+backend/logs/

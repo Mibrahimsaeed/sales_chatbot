@@ -43,12 +43,22 @@ from app.core.config import settings
 from app.core.logger import get_logger
 from app.database.models import AdvisorHistory
 from app.llm.llm_client import call_llm_json
-from app.llm.metric_ontology import METRICS, is_percentage_metric, metric_label
+from app.llm import hierarchy
+from app.llm.metric_ontology import (
+    METRICS, is_percentage_metric, measures_target_attainment, metric_label,
+    metric_phrase,
+)
 from app.llm.query_ir import QueryIR
+from app.llm.query_compiler import effective_metric
 
 log = get_logger("llm.narrative")
 
-_LEVEL_PLURAL = {"advisor": "advisors", "team": "teams", "company": "companies"}
+# Derived from the hierarchy's labels so a new or rebound level cannot
+# be missing a plural.
+_LEVEL_PLURAL = {
+    level: ("companies" if level == "company" else f"{label.lower()}s")
+    for level, label in hierarchy.LEVEL_LABELS.items()
+}
 
 
 def _round(value) -> float | None:
@@ -57,7 +67,7 @@ def _round(value) -> float | None:
 
 def compute_facts(ir: QueryIR, rows: list[dict]) -> dict:
     """Deterministic per-intent insight computation from compiled rows."""
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     metric_label_ = METRICS[metric_key].label if metric_key in METRICS else metric_key
 
     facts: dict = {
@@ -142,9 +152,21 @@ def explain_subject(
     label = metric_label(metric_key)
     percentage = is_percentage_metric(metric_key)
 
-    if percentage:
+    # Target/goal language belongs ONLY to a metric whose denominator is
+    # an assigned target. Applied to every percentage it produced
+    # "has achieved 66.7% of the assigned target" for a 1-Unit ratio.
+    attainment = measures_target_attainment(metric_key)
+    if percentage and attainment:
         pct = round(value, 1)
         parts = [f"{name} has achieved {pct:g}% of the assigned target"]
+    elif percentage:
+        pct = round(value, 1)
+        # metric_phrase(), not the raw label: the label already ends in
+        # "%" for these, so "66.7% 1 Unit Ratio %" reads twice. The
+        # trailing marker is dropped because the number carries it.
+        # collapse the double space the removed "%" leaves behind
+        phrase = " ".join(metric_phrase(metric_key).replace("%", "").split())
+        parts = [f"{name} is at {pct:g}% {phrase}"]
     else:
         parts = [f"{name} has {value:,.0f} {label}"]
 
@@ -152,7 +174,7 @@ def explain_subject(
         plural = _LEVEL_PLURAL.get(level, level + "s")
         parts.append(f"ranking {_ordinal(rank)} of {total} {plural} shown{_filters_clause(ir)}")
 
-    if percentage:
+    if percentage and attainment:
         pct = round(value, 1)
         if pct < 100:
             parts.append(f"remaining {100 - pct:g}% short of the monthly goal")
@@ -207,7 +229,7 @@ def build_explanation(ir: QueryIR, rows: list[dict], total_count: int | None = N
     metric at all)."""
     if not rows:
         return ""
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     level = ir.subject_level
 
     if ir.intent == "comparison":
@@ -233,7 +255,7 @@ def compute_insights(ir: QueryIR, rows: list[dict]) -> list[str]:
     from `rows`, so it's automatically consistent with compute_facts() —
     no separate evidence guard needed, unlike polish_explanation()'s
     LLM-output check."""
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     label = METRICS[metric_key].label if metric_key in METRICS else (metric_key or "value")
 
     values = [r["value"] for r in rows if r.get("value") is not None]
@@ -282,7 +304,6 @@ _TREND_METRIC_TO_HISTORY_FIELD = {
     "total_connects": "connects",
     "total_meetings": "meetings",
     "overdue": "overdue",
-    "overdue_amount": "overdue",
 }
 
 _MAX_TRENDS = 2
@@ -296,7 +317,7 @@ def compute_trends(ir: QueryIR, rows: list[dict], db: Session) -> list[str]:
     moved) rather than guessing at a direction."""
     if ir.subject_level != "advisor":
         return []
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     history_field = _TREND_METRIC_TO_HISTORY_FIELD.get(metric_key)
     if not history_field:
         return []
@@ -374,8 +395,9 @@ def polish_explanation(explanation: str, facts: dict) -> str:
 
     prompt = (
         "Lightly copy-edit the following explanation from a sales-operations chatbot so it reads "
-        "naturally in 1-3 concise sentences. Do NOT add, remove, invent, recompute, or round any "
-        "number or claim in it — phrasing and flow only.\n"
+        "like a warm, conversational colleague explaining the numbers — 1-3 concise sentences, "
+        "friendly but not chatty. Do NOT add, remove, invent, recompute, or round any number or "
+        "claim in it — phrasing and flow only.\n"
         f"Explanation: {explanation}\n"
         'Return ONLY JSON: {"summary": "<your rewrite>"}'
     )

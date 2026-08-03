@@ -6,6 +6,13 @@ format_attendance_reply are unchanged — they still serve the rule-based
 "lookup" / "summary" / "attendance_filter" plan path in chat_service.py,
 which was intentionally left alone (see nlu_pipeline.py's docstring).
 
+format_breakdown_reply serves the "breakdown" intent (unit_head/zonal_head/
+business_center), nested by team instead of a single flat aggregate (see
+hierarchy_service.get_level_breakdown) — reachable from both the rule-based
+plan path and, since the hierarchy rework's phase 2, the LLM IR pipeline
+(QueryIR.intent == "breakdown"). format_flat_breakdown_reply is the
+explicit flat opt-in (QueryIR.flat / a "flat"/"list all" phrase).
+
 format_ir_reply is new: it formats by QueryIR.intent shape (leaderboard /
 comparison / filtered_list) rather than by an ad hoc response "type"
 string scattered through chat_service.py, per Part 5.6 of the redesign —
@@ -14,9 +21,38 @@ list, a leaderboard needs a ranked list; each is one function here, not a
 new pipeline stage.
 """
 
-from app.llm.metric_ontology import METRICS
+from app.llm.metric_ontology import METRICS, is_percentage_metric, metric_phrase
 from app.llm.query_ir import QueryIR
 from app.llm.response_planner import plan_response
+from app.llm.query_compiler import effective_metric
+
+
+def format_metric_value(metric_key: str | None, value) -> str:
+    """One metric value, rendered with its unit.
+
+    TWO defects in one function.
+
+    CRASH. The leaderboard formatter did `f"{value:,.0f}"` directly, and
+    a RATIO metric whose denominator sums to zero compiles to NULL by
+    design — `aggregation.value_expression` documents that callers
+    "render it as no data rather than as 0%". No caller did: one advisor
+    with no recorded attendance made the ENTIRE reply raise TypeError, so
+    a whole leaderboard failed because one row had nothing to divide by.
+
+    UNITS. It also printed a bare number, so an achievement of 99% read
+    as "99" — indistinguishable from a count. The metric already knows
+    whether it is a percentage; nothing was asking it.
+
+    Kept here rather than at each call site so a new formatter cannot
+    reintroduce either half.
+    """
+    from app.llm.metric_ontology import is_percentage_metric
+
+    if value is None:
+        return "no data"
+    if metric_key and is_percentage_metric(metric_key):
+        return f"{value:,.1f}%".replace(".0%", "%")
+    return f"{value:,.0f}"
 
 
 def _pct(cleared, target):
@@ -96,6 +132,256 @@ def format_company_reply(summary: dict) -> str:
     )
 
 
+def _qualified(label: str, value: str) -> str:
+    """"Region North", but "Unit 1" rather than "Unit Unit 1".
+
+    Some level values already carry their level's name — units are
+    literally called "Unit 1", and a team can be named "Team Rashid
+    Majeed". Prefixing the label again reads as a stutter. Comparing
+    generically rather than special-casing a level means this holds for
+    whatever levels exist, including ones added later."""
+    label = label or ""
+    value = str(value or "")
+    if not label:
+        return value
+    if value.lower().startswith(label.lower()):
+        return value
+    return f"{label} {value}".strip()
+
+
+def _breakdown_header(data: dict, group_note: str) -> str:
+    """Shared top line for format_breakdown_reply/format_flat_breakdown_
+    reply — same fields either way, `group_note` is the only thing that
+    differs ("across N team(s)" vs a flat-list note)."""
+    label = data.get("level_label") or "Group"
+    value = data.get("value", "")
+    return (
+        f"{_qualified(label, value)} has {data.get('advisors', 0)} advisors{group_note}, "
+        f"{data.get('connects', 0):.0f} MTD connects, and has cleared "
+        f"{data.get('mtd_cleared', 0):,.0f} of a {data.get('mtd_target', 0):,.0f} target "
+        f"({_pct(data.get('mtd_cleared', 0), data.get('mtd_target', 0))})."
+        f"{_ytd_note(data)}"
+    )
+
+
+def format_person_disambiguation_reply(name: str, candidates: list) -> str:
+    """Phase 1 identity refactor: several real people match this name, so
+    ask which one instead of silently answering about the lowest WID.
+    Each option carries team/company context, because the name alone is
+    exactly what failed to distinguish them.
+
+    Two distinct shapes of ambiguity share this reply, and the wording
+    has to tell them apart honestly: several people with the SAME name
+    ("8 people named Yasir Ali"), versus a near-tie between DIFFERENT
+    names the query couldn't separate ("Ahmed Ali" vs "Ali Ahmed") —
+    calling the latter "people named Ahmed Ali" would be plainly false."""
+    distinct_names = {c.name for c in candidates}
+    if len(distinct_names) == 1:
+        header = f"I found multiple advisors named {candidates[0].name}."
+    else:
+        header = f"'{name}' matches more than one advisor."
+
+    lines = [header, ""]
+    for i, candidate in enumerate(candidates, start=1):
+        lines.append(f"{i}. {candidate.name} — {_distinguishing_context(candidate, candidates)}")
+    lines.append("")
+    lines.append("Which one did you mean?")
+    return "\n".join(lines)
+
+
+def _distinguishing_context(candidate, candidates: list) -> str:
+    """Context that actually tells this candidate apart from the others.
+
+    Team alone is usually enough, but not always: production has 8 people
+    named "Yasir Ali" of whom 6 share the team "North/KPK Region". Listing
+    six identical lines asks a question the user cannot answer, which is
+    no better than the silent guess this whole flow replaced. So the
+    context escalates only as far as it needs to — team, then team +
+    company, then the wid, which is unique by definition."""
+    team = candidate.team or "no team on file"
+    if sum(1 for c in candidates if (c.team or "no team on file") == team) == 1:
+        return team
+
+    with_company = f"{team} · {candidate.company}" if candidate.company else team
+    if sum(
+        1 for c in candidates
+        if (f"{c.team or 'no team on file'} · {c.company}" if c.company else (c.team or "no team on file")) == with_company
+    ) == 1:
+        return with_company
+
+    return f"{with_company} · ID {candidate.wid}"
+
+
+ROSTER_PREVIEW_LIMIT = 40
+
+
+def format_roster_reply(roster: dict) -> str:
+    """A plain list of people — deliberately NOT the aggregate metrics an
+    entity summary returns, because "all advisors in Blue Area" asks who
+    they are, not how they're doing.
+
+    Team is shown per advisor only when the roster spans more than one
+    (so a team roster doesn't repeat the same team on every line, while a
+    company or unit-head roster stays informative)."""
+    label = roster.get("level_label") or "Group"
+    value = roster.get("value", "")
+    advisors = roster.get("advisors", [])
+    count = roster.get("count", len(advisors))
+
+    if not advisors:
+        return f"I couldn't find any advisors in {_qualified(label, value)}."
+
+    show_team = len({a.get("team") for a in advisors}) > 1
+    lines = [f"{count} advisor(s) in {_qualified(label, value)}:", ""]
+    for advisor in advisors[:ROSTER_PREVIEW_LIMIT]:
+        suffix = f" — {advisor['team']}" if show_team and advisor.get("team") else ""
+        lines.append(f"• {advisor['name']}{suffix}")
+
+    remaining = count - min(count, ROSTER_PREVIEW_LIMIT)
+    if remaining > 0:
+        lines.append("")
+        lines.append(f"…and {remaining} more.")
+    return "\n".join(lines)
+
+
+def format_comparison_reply(comparison: dict) -> str:
+    """Side-by-side comparison — one row per KPI, one column per entity.
+
+    Values are aligned in fixed-width columns so the numbers can actually
+    be compared by eye; a bulleted list of "A: 5, B: 7" per metric is
+    technically the same information and much harder to read across.
+    The leader on each row is marked, since "which is better" is usually
+    the actual question behind "compare A and B"."""
+    entities = comparison.get("entities", [])
+    rows = comparison.get("rows", [])
+    winners = comparison.get("winners", {})
+    if len(entities) < 2:
+        return "I need two things to compare."
+
+    names = [e["value"] for e in entities]
+    metric_note = ""
+    if comparison.get("metric"):
+        label = next((r["label"] for r in rows if r["key"] == comparison["metric"]), comparison["metric"])
+        metric_note = f" on {label}"
+
+    # Column width must account for the widest VALUE as well as the
+    # widest name, or a long figure (889,781,772) overflows its column
+    # and shifts every column to its right out of alignment.
+    def _rendered(entity, row) -> str:
+        value = entity["metrics"].get(row["key"])
+        if value is None:
+            return "n/a"
+        return f"{value:,.0f}%" if row["is_percentage"] else f"{value:,.0f}"
+
+    label_width = max((len(r["label"]) for r in rows), default=10)
+    widest_value = max(
+        (len(_rendered(e, r)) for e in entities for r in rows), default=0
+    )
+    col_width = max(max(len(n) for n in names), widest_value, 12) + 2  # +2 for the winner marker
+
+    header = "  ".join(n.ljust(col_width) for n in names)
+    lines = [
+        f"📊 Comparing {' vs '.join(names)}{metric_note}",
+        "",
+        " " * (label_width + 2) + header,
+    ]
+
+    for row in rows:
+        cells = []
+        for entity in entities:
+            value = entity["metrics"].get(row["key"])
+            if value is None:
+                text = "n/a"
+            elif row["is_percentage"]:
+                text = f"{value:,.0f}%"
+            else:
+                text = f"{value:,.0f}"
+            # pad BEFORE appending the marker — padding after it makes the
+            # marked column wider than the others and skews every
+            # subsequent column, which defeats the point of a table
+            if winners.get(row["key"]) == entity["value"]:
+                text = f"{text} ←"
+            cells.append(text.ljust(col_width))
+        lines.append(f"{row['label'].ljust(label_width)}  " + "  ".join(cells).rstrip())
+
+    return "\n".join(lines)
+
+
+def format_advisor_metric_reply(name: str, metric_key: str, value) -> str:
+    """ONE metric for one person: "Shehryar Abbasi has 2 MTD connects."
+
+    Deliberately a single sentence with nothing else in it. The full
+    profile already answers this question in the sense of containing the
+    number — the reason this exists is that containing it is not the same
+    as answering it, so adding team, manager or targets "for context"
+    would undo the point.
+
+    `None` means the person has no row in that metric's fact table, which
+    is said plainly rather than rendered as a zero — zero is a real value
+    and claiming it would be a wrong answer.
+    """
+    phrase = metric_phrase(metric_key)
+    if value is None:
+        return f"I don't have {phrase} on file for {name}."
+    if is_percentage_metric(metric_key):
+        return f"{name} is at {value:,.0f}% {phrase.replace('%', '').strip()}."
+    return f"{name} has {_metric_number(value)} {phrase}."
+
+
+def _metric_number(value: float) -> str:
+    """Counts read as integers, money keeps its separators, and a genuine
+    fraction keeps one decimal — "2 MTD connects", not "2.0"."""
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:,.1f}"
+
+
+def format_manager_reply(result: dict) -> str:
+    """Reverse hierarchy answer — "who is X's BM/zonal head"."""
+    return (
+        f"{result['advisor']}'s {result['level_label']} is {result['manager']}."
+    )
+
+
+def format_breakdown_reply(breakdown: dict) -> str:
+    """Nested-by-team reply for the new hierarchy levels (unit_head/
+    zonal_head/business_center/company via hierarchy_service.get_level_
+    breakdown) — decision: the default response for these levels is always
+    nested by team, not a single flat aggregate number, since one Unit
+    Head/Zonal Head/Business Center can span several teams."""
+    teams = breakdown.get("teams", [])
+    header = _breakdown_header(breakdown, f" across {len(teams)} team(s)")
+
+    lines = [header, ""]
+    for team in teams:
+        lines.append(f"• {team['team']} ({team['advisor_count']} advisor(s))")
+        for advisor in team["advisors"]:
+            lines.append(
+                f"   - {advisor['name']}: {advisor['connects']:.0f} connects, "
+                f"{advisor['mtd_cleared']:,.0f} cleared"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_flat_breakdown_reply(data: dict) -> str:
+    """The explicit flat opt-in (hierarchy_service.get_level_flat_list) —
+    same top line as format_breakdown_reply, an ungrouped advisor list
+    (each with its own team shown inline) instead of nested team sections."""
+    header = _breakdown_header(data, "")
+
+    lines = [header, ""]
+    for advisor in data.get("advisor_list", []):
+        team_note = f" ({advisor['team']})" if advisor.get("team") else ""
+        lines.append(
+            f"• {advisor['name']}{team_note}: {advisor['connects']:.0f} connects, "
+            f"{advisor['mtd_cleared']:,.0f} cleared"
+        )
+
+    return "\n".join(lines)
+
+
 def format_leaderboard_reply(metric: str, rows: list[dict]) -> str:
     if not rows:
         return "No data available for that leaderboard yet."
@@ -105,7 +391,7 @@ def format_leaderboard_reply(metric: str, rows: list[dict]) -> str:
 
     for i, row in enumerate(rows, start=1):
         value = row.get("value", 0)
-        lines.append(f"{i}. {row['name']} — {value:,.0f}")
+        lines.append(f"{i}. {row['name']} — {format_metric_value(metric_key, value)}")
         if row.get("team"):
             lines.append(f"   Team: {row['team']}")
         if row.get("company"):
@@ -165,7 +451,7 @@ def format_ir_leaderboard_reply(
 ) -> str:
     if not rows:
         return "No data available for that yet."
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     label = _metric_label(metric_key)
     if paginated:
         header = f"Showing {_shown_through(rows, start_index)} of {total_count} by {label}{_filters_summary(ir)}"
@@ -174,7 +460,7 @@ def format_ir_leaderboard_reply(
     lines = [header, ""]
     for i, row in enumerate(rows, start=start_index):
         value = row.get("value", 0)
-        lines.append(f"{i}. {row['name']} — {value:,.0f}")
+        lines.append(f"{i}. {row['name']} — {format_metric_value(metric_key, value)}")
         if row.get("team"):
             lines.append(f"   Team: {row['team']}")
         if row.get("company"):
@@ -188,7 +474,7 @@ def format_ir_comparison_reply(
 ) -> str:
     if not rows:
         return "I couldn't find data for those to compare."
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     label = _metric_label(metric_key)
     if paginated:
         header = f"Showing {_shown_through(rows, start_index)} of {total_count} comparing by {label}{_filters_summary(ir)}"
@@ -205,7 +491,7 @@ def format_ir_filtered_list_reply(
 ) -> str:
     if not rows:
         return "No results matched those conditions."
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    metric_key = effective_metric(ir)
     label = _metric_label(metric_key) if metric_key else None
     if paginated:
         header = f"Showing {_shown_through(rows, start_index)} of {total_count} result(s){_filters_summary(ir)}"
@@ -251,3 +537,37 @@ def format_ir_reply(
     else:
         formatter = _SHAPE_FORMATTERS.get(plan.shape, format_ir_leaderboard_reply)
     return formatter(ir, rows, total_count=total_count, start_index=start_index, paginated=paginated)
+
+
+def format_group_manager_reply(result: dict) -> str:
+    """"Usman Ghani's Zonal Head is Fawad Hafeez."
+
+    The plural branch is not defensive padding: if a group's advisors
+    report to two different managers the chain is contradicted by the
+    data, and naming both is the honest answer. Picking one would hide a
+    data problem behind a confident sentence.
+    """
+    subject = f"{result['level_label']} {result['value']}"
+    managers = result["managers"]
+    label = result["target_level_label"]
+
+    if len(managers) == 1:
+        return f"{subject}'s {label} is {managers[0]}."
+    joined = ", ".join(managers[:-1]) + f" and {managers[-1]}"
+    return (
+        f"{subject} spans more than one {label}: {joined}. "
+        f"That usually means the source data disagrees with the reporting chain."
+    )
+
+
+def format_ancestry_reply(result: dict) -> str:
+    """The whole reporting line, innermost first.
+
+    Rendered as a chain rather than a sentence because that is the shape
+    of the answer — four names in a list read as four unrelated facts.
+    """
+    header = f"Reporting line above {result['level_label']} {result['value']}:"
+    lines = [header, ""]
+    for depth, step in enumerate(result["ancestry"], start=1):
+        lines.append(f"{'  ' * (depth - 1)}\u21b3 {step['level_label']}: {step['value']}")
+    return "\n".join(lines)

@@ -32,15 +32,41 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.llm import entity_linker
+from app.llm import advisor_resolver, entity_linker, hierarchy
+from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.fuzzy_match import best_match
 from app.llm.metric_ontology import METRICS
-from app.llm.entity_extractor import get_known_teams, get_known_companies
+from app.llm.query_compiler import is_answerable
+from app.llm.entity_extractor import (
+    get_known_teams, get_known_companies, get_known_offices,
+    get_known_unit_heads, get_known_zonal_heads, get_known_bcms,
+    get_known_regions,
+)
 from app.llm.query_ir import ConfidenceLevel, QueryIR, Subject
 
 _MATCH_FLOOR = 0.55
 _CONFIDENCE_FLOOR = 0.5     # below this, treat an LLM-supplied field as if it weren't provided
-_NON_METRIC_FILTER_FIELDS = {"team", "company", "advisor", "attendance_status"}
+# Every hierarchy group level (team/company/unit_head/zonal_head/business_
+# center) is a valid non-metric filter field, plus "advisor" and
+# "attendance_status" which aren't part of the hierarchy grouping mapping.
+_NON_METRIC_FILTER_FIELDS = set(hierarchy.GROUP_LEVELS) | {"advisor", "attendance_status"}
+
+# Gazetteer fetch function per GROUPABLE level that has one (advisor names
+# are grounded at lookup time against the DB view instead — see
+# _ground_subject). One dict instead of a growing if/elif chain, per
+# requirement to drive level-specific behavior from the hierarchy mapping.
+# One fetcher per GROUPABLE level. Keyed by the hierarchy's own level
+# names so a rebind there cannot leave grounding pointed at a level that
+# no longer exists — the completeness test asserts the two agree.
+_SUBJECT_GAZETTEERS = {
+    "team": get_known_teams,
+    "company": get_known_companies,
+    "unit_head": get_known_unit_heads,
+    "zonal_head": get_known_zonal_heads,
+    "bcm": get_known_bcms,
+    "office": get_known_offices,
+    "region": get_known_regions,
+}
 _UNSUPPORTED_INTENTS = {
     # "lookup" is intentionally handled by the pre-existing rule-based
     # query_planner.py path (nlu_pipeline.py never routes a plain single-
@@ -74,13 +100,31 @@ class ValidationResult:
 
 
 def _ground_subject(subject: Subject, db: Session) -> tuple[Subject, str | None]:
-    if subject.type == "team":
-        match = best_match(subject.value, get_known_teams(db), kind="team", floor=_MATCH_FLOOR)
-    elif subject.type == "company":
-        match = best_match(subject.value, get_known_companies(db), kind="company", floor=_MATCH_FLOOR)
+    gazetteer_fn = _SUBJECT_GAZETTEERS.get(subject.type)
+    if gazetteer_fn is not None:
+        match = best_match(
+            subject.value, gazetteer_fn(db), kind=hierarchy.match_kind_for(subject.type), floor=_MATCH_FLOOR
+        )
     else:
-        # advisor names are matched at lookup time against the DB view —
-        # grounding here only affects filter confidence, not existence.
+        # Phase 1 identity refactor: an advisor subject is resolved to a
+        # WID here rather than left as a bare name for the compiler to
+        # match on. A name that maps to exactly one person yields
+        # resolved_wid (the compiler then filters Advisor.wid); a name
+        # that maps to SEVERAL real people is deliberately left without
+        # one, so the compiler falls back to name matching rather than
+        # this layer silently picking a person the user never chose.
+        # Grounding still never rejects an advisor for non-existence —
+        # unchanged from before.
+        resolution = advisor_resolver.resolve_by_name(subject.value, db)
+        if resolution.is_resolved:
+            identity = resolution.identity
+            return Subject(
+                type=subject.type,
+                value=identity.name,
+                resolved_id=identity.name,
+                resolved_wid=identity.wid,
+                match_confidence=subject.match_confidence,
+            ), None
         return subject, None
 
     if not match:
@@ -110,6 +154,24 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
     if ir.intent in ("leaderboard", "comparison", "filtered_list"):
         metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
         metric_confidence = ir.metric.confidence if ir.metric else 1.0
+
+        if metric_key and metric_key not in METRICS:
+            # the LLM sometimes invents a close-but-wrong key (e.g.
+            # "achievement" instead of "achievement_pct") despite the
+            # prompt's explicit "only use catalog keys" instruction — small
+            # local models aren't perfectly reliable about this. Recover it
+            # the same way a raw user typo/synonym would be recovered
+            # (fallback_reasoning.fuzzy_resolve_metric's exact-synonym-
+            # substring pass — "achievement" IS literally one of achievement_
+            # pct's synonyms) instead of asking the user to repeat
+            # themselves for something this unambiguous.
+            corrected = fuzzy_resolve_metric(metric_key)
+            if corrected:
+                metric_key = corrected
+                if ir.metric:
+                    ir.metric.key = corrected
+                ir.sort.metric = corrected
+
         if not metric_key:
             missing.append("metric")
         elif metric_key not in METRICS:
@@ -119,10 +181,29 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
             # per-field confidence (Part 5.1) means this is treated the
             # same as "missing", not silently trusted.
             missing.append(f"metric_low_confidence:{metric_key}")
-        elif ir.subject_level not in METRICS[metric_key].bindings:
-            # requested level has no resolver for this metric — fall back
-            # to the metric's primary level rather than hard-failing,
-            # mirroring the old query_planner.py behavior.
+        elif not is_answerable(metric_key, ir.subject_level):
+            # The level has no resolver for this metric — degrade rather
+            # than hard-fail. is_answerable (not a bare `in
+            # METRICS[key].bindings` check) so a new hierarchy level
+            # answerable only via the compiler's generic rollup fallback
+            # isn't incorrectly reset here.
+            #
+            # Phase 2 narrowed this deliberately. It used to run as the
+            # validator's own opinion about the right level, which made
+            # it a SECOND owner of a decision subject_level.decide()
+            # already made — and since it always chose primary_level, it
+            # silently undid a correctly chosen entity level on the way
+            # to the compiler. It now fires ONLY when the chosen level is
+            # genuinely uncomputable, and records that it did, so a
+            # degraded level is visible rather than looking like the
+            # planner's choice.
+            from app.llm import routing
+
+            routing.decide(
+                "Level", METRICS[metric_key].primary_level,
+                f"DEGRADED from {ir.subject_level!r}: {metric_key} has no resolver "
+                f"at that level, so the metric's own level is the nearest answerable one",
+            )
             ir.subject_level = METRICS[metric_key].primary_level
 
     # ---- filters — presence, validity, AND confidence floor ----
@@ -154,6 +235,14 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
     ir.subjects = grounded_subjects
 
     if ir.intent == "comparison" and len(ir.subjects) < 2:
+        missing.append("subjects")
+
+    # "breakdown" (Part: hierarchy rework phase 2) is about exactly ONE
+    # named entity — mirrors comparison's 2+ check above. Not a metric
+    # compiler operation (see chat_service._dispatch_breakdown), so no
+    # metric/is_answerable check applies here, only that the subject itself
+    # is present and grounded.
+    if ir.intent == "breakdown" and len(ir.subjects) < 1:
         missing.append("subjects")
 
     # intent="clarify" is the parser explicitly saying "ask the user" — it
@@ -221,10 +310,11 @@ def _ask_for(item: str) -> str:
     if item.startswith("subject_low_confidence:"):
         _, s_type, s_value = item.split(":", 2)
         return f"which {s_type} you meant by '{s_value}' — I wasn't confident enough to assume that"
-    if item.startswith("subject:team:"):
-        return f"which team you meant by '{item.split(':', 2)[2]}'"
-    if item.startswith("subject:company:"):
-        return f"which company you meant by '{item.split(':', 2)[2]}'"
+    if item.startswith("subject:"):
+        parts = item.split(":", 2)
+        if len(parts) == 3:
+            _, s_type, s_value = parts
+            return f"which {hierarchy.label_for(s_type).lower()} you meant by '{s_value}'"
     if item == "subjects":
         return "which two (or more) things you'd like to compare"
     if item.startswith("unsupported_intent:"):
@@ -252,8 +342,8 @@ def build_targeted_clarification(missing: list[str]) -> str:
     unresolved one — per turn."""
     item = pick_clarification_slot(missing)
     if item is None:
-        return "I need a bit more detail to answer that."
-    return "I need a bit more detail — " + _ask_for(item) + "?"
+        return "Just need a bit more detail to answer that — could you fill me in?"
+    return "Quick question — " + _ask_for(item) + "?"
 
 
 def clarification_options(item: str | None, db: Session) -> list[str]:
@@ -268,10 +358,8 @@ def clarification_options(item: str | None, db: Session) -> list[str]:
     if item == "metric" or item.startswith("metric:") or item.startswith("metric_low_confidence:"):
         return sorted({m.label for m in METRICS.values()})
     parts = item.split(":")
-    if len(parts) >= 2 and parts[-2] == "team":
-        return get_known_teams(db)
-    if len(parts) >= 2 and parts[-2] == "company":
-        return get_known_companies(db)
+    if len(parts) >= 2 and parts[-2] in _SUBJECT_GAZETTEERS:
+        return _SUBJECT_GAZETTEERS[parts[-2]](db)
     return []
 
 

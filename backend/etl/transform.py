@@ -259,6 +259,7 @@ source for org hierarchy) runs before CCMC DATA MTD, and Biometric/Login
 Report are added as a last-resort fallback source for org columns.
 """
 from app.database.models import PerformancePeriod
+from etl.normalize import normalize_field, normalize_org_name
 
 
 def _num(value):
@@ -293,13 +294,42 @@ def _clean(value):
     return value
 
 
+# The CCMC funnel column layout, declared ONCE. "CCMC DATA MTD" and
+# "YTD CCMC" have identical headers, so the only difference between the
+# two loops below is the destination prefix — writing the mapping twice
+# is exactly how the two would drift.
+_FUNNEL_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("new_connect", "New Connect"),
+    ("followup_connect", "Follow-up Connect"),
+    ("cr", "CR"),
+    ("new_meeting", "New Meeting"),
+    ("followup_meeting", "Follow-up Meeting"),
+    ("todo", "Todo"),
+    ("booking_stored", "Booking Stored"),
+    ("conversion", "Conversion"),
+)
+
+
+def _funnel_fields(row: dict, prefix: str) -> dict:
+    """The funnel numbers from one CCMC-shaped row, keyed `<prefix>_<field>`."""
+    return {f"{prefix}_{field}": _num(row.get(column))
+            for field, column in _FUNNEL_COLUMNS}
+
+
 def _assign(a: dict, key: str, value):
     """Write `value` into advisor dict `a[key]` UNLESS value is empty, and
     UNLESS `a[key]` already holds a real (non-empty) value from a
     higher-priority source that ran earlier. This is the single choke point
     that replaces every ad-hoc `.update()` / `.setdefault()` call below, so
-    field-loss like the team/company bug can't reoccur silently."""
-    value = _clean(value)
+    field-loss like the team/company bug can't reoccur silently.
+
+    Also the single place canonical normalization is applied (etl/
+    normalize.py) — collapsing the whitespace/separator/casing variants
+    that were splitting one real office or person across several stored
+    spellings. Being the one choke point is exactly why it belongs here:
+    every org/person field on `advisors` already flows through this
+    function, so no source-sheet loop needs its own normalization call."""
+    value = normalize_field(key, _clean(value))
     if value is None:
         return
     if not _clean(a.get(key)):
@@ -343,13 +373,21 @@ def transform(src: dict) -> dict:
         res = ensure_advisor(row.get("User ID"), row.get("Advisor Name"))
         if not res:
             continue
-        _, a = res
+        wid_ms, a = res
         a["in_master_sheet"] = True
         _assign(a, "company", row.get("Company"))
         _assign(a, "region", row.get("Regional"))
         _assign(a, "team", row.get("Teams"))
         _assign(a, "portfolio_lead", row.get("Portfolio Lead"))
         _assign(a, "management_lead", row.get("Management Lead"))
+        # MasterSheet carries the IBD meeting figures too. Verified equal
+        # to the "P/C Meeting" tab on all 608 shared WIDs, and this tab is
+        # already fetched — so it is the source, per the audit.
+        sales_funnel.setdefault(wid_ms, {"wid": wid_ms})
+        sales_funnel[wid_ms].update({
+            "mtd_meetings_planned": _num(row.get("Meetings Planned")),
+            "mtd_meetings_conducted": _num(row.get("Meetings Conducted")),
+        })
 
     # ---- 2. sales_funnel + org columns on advisors (CCMC DATA MTD) ----
     for row in src["ccmc_mtd"]:
@@ -364,17 +402,8 @@ def transform(src: dict) -> dict:
         _assign(a, "company", row.get("Company"))
         _assign(a, "region", row.get("Region"))
         _assign(a, "office", row.get("Office"))
-        sales_funnel[wid] = {
-            "wid": wid,
-            "mtd_new_connect": _num(row.get("New Connect")),
-            "mtd_followup_connect": _num(row.get("Follow-up Connect")),
-            "mtd_cr": _num(row.get("CR")),
-            "mtd_new_meeting": _num(row.get("New Meeting")),
-            "mtd_followup_meeting": _num(row.get("Follow-up Meeting")),
-            "mtd_todo": _num(row.get("Todo")),
-            "mtd_booking_stored": _num(row.get("Booking Stored")),
-            "mtd_conversion": _num(row.get("Conversion")),
-        }
+        sales_funnel.setdefault(wid, {"wid": wid})
+        sales_funnel[wid].update(_funnel_fields(row, "mtd"))
 
     # ---- 3. system-verified connect count layered onto sales_funnel (Connect Session) ----
     for row in src.get("connect_session", []):
@@ -435,6 +464,7 @@ def transform(src: dict) -> dict:
             "login_status": row.get("Comment"),
             "login_mtd_ontime": _num(row.get("MTD On Time")),
             "login_mtd_late": _num(row.get("MTD Late")),
+            "login_mtd_not_marked": _num(row.get("MTD Not Marked")),
         })
 
     # ---- 7. performance: one row per (wid, period) ----
@@ -493,12 +523,59 @@ def transform(src: dict) -> dict:
             "answered_calls_mtd": _num(row.get("Answered Calls MTD")),
             "answered_calls_daily": _num(row.get("Answered Calls Daily")),
             "connects_mtd": _num(row.get("Connects MTD")),
+            "connects_daily": _num(row.get("Connects Daily")),
         }
+
+    # ---- 10b. unit ownership (1 Unit) — the "1 Unit" leaderboard's source.
+    #          `Advisor.unit` was declared for this tab from the start
+    #          (models.py) and the tab was never fetched, so the column
+    #          was permanently NULL.
+    #
+    #          The tab carries BOTH `Unit` (a tally, observed 0-4) and
+    #          `Count` (a flag, 1 where Unit > 0). The tally is stored
+    #          because a flag is derivable from it and the reverse is not.
+    #          Keyed by SAP ID — this tab has no WID column. ----
+    for row in src.get("one_unit", []):
+        res = ensure_advisor(row.get("SAP ID"), row.get("Advisor Name"))
+        if not res:
+            continue
+        _, a = res
+        _assign(a, "unit", row.get("Unit"))
+
+    # ---- 10c. YTD mirrors. Same sheet layout as their MTD counterparts,
+    #          so both reuse the shared mappers rather than restating the
+    #          column names. Written to parallel `ytd_*` fields, never as
+    #          period rows — see the SalesFunnel/Pipeline docstrings. ----
+    for row in src.get("ytd_ccmc", []):
+        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        if not res:
+            continue
+        wid, _ = res
+        sales_funnel.setdefault(wid, {"wid": wid})
+        sales_funnel[wid].update(_funnel_fields(row, "ytd"))
+
+    for row in src.get("ytd_p1_overdue", []):
+        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        if not res:
+            continue
+        wid, _ = res
+        pipeline.setdefault(wid, {"wid": wid})
+        pipeline[wid].update({
+            "ytd_pipeline": _num(row.get("Pipeline")),
+            # NOTE the header differs from the MTD tab: "P1 & Overdue"
+            # calls it "Total Overdue", "YTD P1 & Overdue" calls it
+            # "Overdue".
+            "ytd_overdue": _num(row.get("Overdue")),
+        })
 
     # ---- 11. team_targets (Target Achievement) — standalone, not keyed by wid ----
     team_targets = []
     for row in src.get("target_achievement", []):
-        team = _clean(row.get("Team"))
+        # normalize_org_name, not bare _clean: team_targets.team is joined
+        # to advisors.team BY NAME (there's no FK), so the two sides must
+        # be normalized identically or a whitespace variant here silently
+        # becomes a team with "no target on file".
+        team = normalize_org_name(_clean(row.get("Team")))
         if not team:
             continue
         team_targets.append({

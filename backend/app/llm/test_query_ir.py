@@ -30,3 +30,18 @@ def test_confidence_level_accepts_all_three_tiers():
     for level in ("high", "medium", "low"):
         ir = QueryIR(intent="leaderboard", confidence_level=level)
         assert ir.confidence_level == level
+
+
+def test_breakdown_is_a_valid_intent():
+    ir = QueryIR(intent="breakdown", subject_level="unit_head")
+    assert ir.intent == "breakdown"
+
+
+def test_flat_defaults_false_for_backward_compatibility():
+    ir = QueryIR(intent="leaderboard", metric=MetricRef(key="mtd_cleared"), sort=Sort(metric="mtd_cleared"))
+    assert ir.flat is False
+
+
+def test_flat_is_independently_settable():
+    ir = QueryIR(intent="breakdown", subject_level="unit_head", flat=True)
+    assert ir.flat is True
