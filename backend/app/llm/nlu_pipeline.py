@@ -34,8 +34,9 @@ from sqlalchemy.orm import Session
 import re
 
 from app.llm import (
-    advisor_resolver, conversation_memory, cross_turn_resolver, hierarchy,
-    llm_planner, metric_intent, multi_intent, routing, semantic_parser,
+    advisor_resolver, conversation_context, conversation_memory,
+    cross_turn_resolver, hierarchy, llm_planner, metric_intent, multi_intent,
+    routing, semantic_parser,
 )
 from app.llm.conversation_memory import MAX_CLARIFY_ATTEMPTS, PendingClarification
 from app.llm.entity_extractor import extract_entities, PROVENANCE_KEY
@@ -66,6 +67,20 @@ SHORTCUT_INTENTS = ("greeting", "thanks", "help", "attendance_check")
 # it's the deterministic "this name matches several real people" answer,
 # and must never be routed to the LLM, which has no way to know which WID
 # was meant either.
+# Plan actions that name a capability this system does not have, mapped
+# to the registry entry that explains why. DERIVED from
+# ir_validator._UNSUPPORTED_INTENTS rather than restated: the same
+# limitation reached through the rule planner and through the LLM parser
+# must give the same answer, and two copies of the wording is how they
+# would stop doing so.
+def _unsupported_actions() -> dict[str, str]:
+    from app.llm.ir_validator import _UNSUPPORTED_INTENTS
+
+    return {"trend": _UNSUPPORTED_INTENTS["trend"]}
+
+
+_UNSUPPORTED_ACTIONS = _unsupported_actions()
+
 _RULE_BASED_ACTIONS = (
     "lookup", "summary", "breakdown", "attendance_filter", "clarify_person",
     # M7: "connects of X" is one metric off one advisor row, reached
@@ -557,6 +572,41 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     # Every widening tier (exact, fuzzy, embedding) has already run inside
     # metric_intent.detect(), so this is the end of the line rather than a
     # shortcut past them.
+    # Context is established BEFORE any "do we have enough to answer?"
+    # decision. Asking the user for a measure the previous turn already
+    # supplied is the same defect as answering without one — both ignore
+    # what the conversation has already established.
+    turn_spec = conversation_context.specified(cleaned, entities)
+    prior_ir = conversation_memory.get(session_id)
+    _context = conversation_context.ellipsis(turn_spec, prior_ir is not None)
+
+    if plan.action == "clarify_metric" and _context.is_elliptical and (
+        prior_ir is not None and prior_ir.metric is not None
+    ):
+        # "now only IMARAT" after "show Downtown pipeline" names a
+        # subject and no measure. Clarifying here would ask which metric
+        # the user meant one turn after they said it.
+        routing.decide(
+            "Context", f"inherit metric {prior_ir.metric.key}",
+            "this turn named a subject but no measure, and the previous turn "
+            "supplies one — answered instead of re-asking",
+        )
+        plan.action = "leaderboard"
+        plan.metric = prior_ir.metric.key
+
+    # A capability this system does not have. Distinct from a
+    # clarification (there is nothing the user could add that would make
+    # it answerable) and from no-data (the query was never run). The
+    # reason comes from ir_validator's registry so there is one list of
+    # what we cannot do, with one wording each.
+    if plan.action in _UNSUPPORTED_ACTIONS:
+        reason = _UNSUPPORTED_ACTIONS[plan.action]
+        routing.decide("Response", "unsupported", reason)
+        return Resolution(
+            kind="unsupported", plan=plan, entities=entities,
+            clarify_message=reason,
+        )
+
     if plan.action == "clarify_metric":
         audit.decision("routing", "clarify:metric_unresolved",
                        f"the query named a measure ({plan.entity_value!r}) that resolves to no "
@@ -592,9 +642,8 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     # short follow-up modifiers ("only Graana", "top 5", "sort ascending")
     # patch the previous turn's IR deterministically — no LLM round trip.
     # try_patch declines anything that stands alone as its own query.
-    prior_ir = conversation_memory.get(session_id)
     if prior_ir is not None:
-        patched = try_patch(prior_ir, cleaned, entities, plan.action)
+        patched = try_patch(prior_ir, cleaned, entities, plan.action, turn_spec)
         if patched is not None:
             result = validate_ir(patched, db)
             if result.is_valid:
@@ -666,10 +715,27 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
            else "rule-based but looks_compound() returned True")
         + " — handed to the LLM semantic parser",
     )
-    outcome = semantic_parser.parse(cleaned, entities, db, session_id)
+    outcome = semantic_parser.parse(cleaned, entities, db, session_id, plan=plan)
 
     if outcome.ir and not outcome.missing:
-        return _ir_resolution(outcome.ir, entities,
+        # THE carry-over point. The other two kind="ir" exits already
+        # derive from the previous turn — the pending-slot fill answers a
+        # question we asked, and try_patch returns a copy of the prior IR
+        # — so this fresh parse is the only place context could be lost,
+        # and before Phase 2 it always was: plan_to_ir() builds from this
+        # turn's words alone.
+        merged = conversation_context.merge(
+            prior_ir, outcome.ir, turn_spec,
+            conversation_context.ellipsis(turn_spec, prior_ir is not None),
+        )
+        routing.decide("Context", merged.trace(), merged.detail())
+        # Phase 4: stored unconditionally, and only here. semantic_parser
+        # used to store the pre-merge IR from inside _finish, so the IR
+        # that ANSWERED and the IR the next turn INHERITED could differ
+        # whenever the merge changed anything. One writer, one value, and
+        # it is the one the user was shown.
+        conversation_memory.set(session_id, merged.ir)
+        return _ir_resolution(merged.ir, entities,
                               used_llm_fallback=outcome.used_llm)
 
     if outcome.ir and outcome.missing:

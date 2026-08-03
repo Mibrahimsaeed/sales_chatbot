@@ -482,6 +482,36 @@ def _names_a_role(q: str) -> bool:
     return any(pattern.search(q) for _level, pattern in cat.REVERSE_LEVEL_PATTERNS)
 
 
+def _score_trend(ctx: _Intent) -> _Candidate | None:
+    """"Show me the trend of revenue", "is Yasir Ali improving?"
+
+    Recognised so the system can REFUSE it honestly. The data model
+    stores only the current row per period, so there is no earlier value
+    to diff against — ir_validator._UNSUPPORTED_INTENTS carries that
+    reason, and this scorer is what makes it reachable. Until this
+    existed, a trend question scored as a leaderboard and answered with a
+    point-in-time ranking, which is a different question wearing the
+    right words.
+
+    Scored at W_HARD_GATE: a trend word is an unambiguous statement about
+    the SHAPE of the answer wanted, and no snapshot reading of the same
+    message is preferable to saying we cannot do it yet.
+    """
+    if not cat.TREND_RE.search(ctx.q):
+        return None
+
+    return _Candidate(
+        intent="trend",
+        score=cat.W_HARD_GATE,
+        evidence=["trend_vocabulary"],
+        build=lambda: QueryPlan(
+            action="trend",
+            metric=ctx.metric,
+            level=ctx.entities.get("level"),
+        ),
+    )
+
+
 def _score_ancestry(ctx: _Intent) -> _Candidate | None:
     """"Show me the full hierarchy above X" — every level up, at once.
 
@@ -823,6 +853,7 @@ def _score_leaderboard(ctx: _Intent) -> _Candidate | None:
 # evidence overrides that.
 _SCORERS: tuple[Callable[[_Intent], _Candidate | None], ...] = (
     _score_clarify_ambiguous,
+    _score_trend,
     _score_comparison,
     _score_roster,
     _score_ancestry,

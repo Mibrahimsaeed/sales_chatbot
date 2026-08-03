@@ -172,3 +172,67 @@ def test_follow_up_chain_patches_without_extra_llm_calls(chain_db, monkeypatch):
     assert len(llm_calls) == 1
     assert r4.ir.time_range.period == "YTD"
     assert r4.ir.limit == 5
+
+
+# ---------------------------------------------------------------------
+# The bare-modifier gate
+# ---------------------------------------------------------------------
+#
+# "top 5" reaches try_patch with plan_action="leaderboard": the planner
+# sees an explicit ranking word and supplies a default metric. That
+# verdict describes what the planner WOULD DO with the message, not what
+# the message contains, and reading it as an ellipsis test sent a pure
+# limit change through a full LLM parse — dropping the prior turn's
+# filters. _is_bare_modifier() closes that gap, and these pin its edges
+# so it cannot widen into swallowing real questions.
+
+
+def test_a_bare_limit_change_is_a_modifier():
+    from app.llm.ir_patcher import _is_bare_modifier
+
+    assert _is_bare_modifier("top 5", {})
+    assert _is_bare_modifier("bottom 3", {})
+    assert _is_bare_modifier("ascending", {})
+    assert _is_bare_modifier("all teams", {})
+
+
+def test_a_message_naming_a_measure_is_not_a_modifier():
+    """"top 5 by revenue" is a self-standing question — it says what to
+    rank by, so it must go through the normal parse path."""
+    from app.llm.ir_patcher import _is_bare_modifier
+
+    assert not _is_bare_modifier("top 5 by revenue", {})
+    assert not _is_bare_modifier("top 3 by overdue", {})
+
+
+def test_a_message_naming_a_subject_is_not_a_modifier():
+    """A grounded entity means the message can stand alone."""
+    from app.llm.ir_patcher import _is_bare_modifier
+
+    assert not _is_bare_modifier("top 5", {"team": "Blue Area"})
+    assert not _is_bare_modifier("top 5", {"advisor_wids": [1]})
+
+
+def test_a_message_with_no_modifier_pattern_is_not_a_modifier():
+    from app.llm.ir_patcher import _is_bare_modifier
+
+    assert not _is_bare_modifier("who is the best", {})
+    assert not _is_bare_modifier("graana", {})
+
+
+def test_a_self_standing_query_still_declines_the_patch(chain_db):
+    """The guardrail the module was built around: a new question after a
+    leaderboard is a new question, not a patch."""
+    from app.llm.entity_extractor import extract_entities
+    from app.llm.ir_patcher import try_patch
+    from app.llm.query_ir import MetricRef, QueryIR, Sort
+    from app.llm.query_planner import build_query_plan
+
+    prior = QueryIR(intent="leaderboard", subject_level="advisor",
+                    metric=MetricRef(key="mtd_cleared"),
+                    sort=Sort(metric="mtd_cleared"), limit=10)
+    text = "show top teams by overdue"
+    entities = extract_entities(text, chain_db)
+    plan = build_query_plan(text, entities)
+
+    assert try_patch(prior, text, entities, plan.action) is None

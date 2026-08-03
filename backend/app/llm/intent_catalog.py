@@ -232,6 +232,29 @@ DEFAULT_REVERSE_LEVEL = "unit_head"
 # with no role named is the same question asked without knowing the
 # vocabulary, so it belongs here rather than being answered about
 # whichever level DEFAULT_REVERSE_LEVEL happens to be.
+# Movement over time, as opposed to a figure at a point in time.
+#
+# Phase 3. `trend` has been in QueryIR's intent set and in
+# ir_validator._UNSUPPORTED_INTENTS (with a written reason: the monthly
+# snapshots a trend needs are not stored yet) since the redesign — but
+# nothing in the rule planner ever produced it, so the refusal was
+# unreachable and "show the trend of revenue" silently answered with a
+# CURRENT leaderboard. A snapshot presented as a trend is a wrong answer,
+# not a degraded one; detecting the request is what lets the system say
+# so.
+TREND_RE = re.compile(
+    r"\btrends?\b"
+    r"|\btrending\b"
+    r"|\bover\s+time\b"
+    r"|\bmonth\s+over\s+month\b|\bmonth-over-month\b"
+    r"|\byear\s+over\s+year\b|\byear-over-year\b"
+    r"|\bhistory\b|\bhistorical\b"
+    r"|\bprogress(ion)?\s+(over|across)\b"
+    r"|\b(improving|declining|worsening)\b"
+    r"|\bgrowth\s+(rate|over)\b",
+    re.I,
+)
+
 ANCESTRY_RE = re.compile(
     r"\b(full|whole|entire|complete)\s+(hierarchy|chain|reporting\s+line|management\s+chain)\b"
     r"|\bhierarchy\s+above\b"

@@ -81,7 +81,16 @@ _UNSUPPORTED_INTENTS = {
     # per period, so there is no "last month" to diff against yet.
     # Silently running a snapshot query and calling it a trend would be a
     # wrong answer, not a degraded one, so this is a hard reject.
-    "trend": "trend/period-over-period comparisons need historical snapshots not yet stored (Phase 4, not implemented)",
+    # Phase 3 made this reachable (intent_catalog.TREND_RE +
+    # query_planner._score_trend) and therefore user-facing, so the
+    # wording is now addressed to the person asking rather than to the
+    # roadmap. It stays the single source: nlu_pipeline._UNSUPPORTED_
+    # ACTIONS and response_planner._capability_problem both read it.
+    "trend": (
+        "I can't show trends over time yet — I only hold the current figures "
+        "for each period, so there's no earlier value to compare against. I can "
+        "give you where things stand right now for any metric, team, or advisor."
+    ),
 }
 
 

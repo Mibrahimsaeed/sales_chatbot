@@ -90,12 +90,34 @@ def test_llm_first_unanswerable_query_asks_for_intent(db_session, llm_spy, monke
     assert outcome.missing == ["intent"]
 
 
-def test_valid_ir_is_stored_in_conversation_memory(db_session, llm_spy, monkeypatch):
+def test_parsing_does_not_store_conversation_state(db_session, llm_spy, monkeypatch):
+    """INVERTED in Phase 4. This asserted that parse() wrote the IR to
+    conversation_memory, which made four writers of last_ir across two
+    modules — and this one wrote the PRE-MERGE IR, so the IR that
+    answered and the IR the next turn inherited could differ whenever
+    conversation_context changed anything.
+
+    nlu_pipeline.resolve() is the single owner of conversation state now;
+    it stores the merged IR once, after the merge. The parser produces an
+    IR and returns it — storing is not its job.
+    """
     from app.llm import conversation_memory
 
     _set_mode(monkeypatch, "llm_first")
-    semantic_parser.parse(SIMPLE_QUERY, {"limit": 5}, db_session, session_id="s-1")
+    outcome = semantic_parser.parse(SIMPLE_QUERY, {"limit": 5}, db_session, session_id="s-1")
 
-    stored = conversation_memory.get("s-1")
+    assert isinstance(outcome.ir, QueryIR)
+    assert outcome.ir.metric.key == "mtd_cleared"
+    assert conversation_memory.get("s-1") is None, "the parser stored state it does not own"
+
+
+def test_the_pipeline_stores_what_the_parser_produced(db_session, llm_spy, monkeypatch):
+    """The other half: removing the parser's write must not lose the IR."""
+    from app.llm import conversation_memory, nlu_pipeline
+
+    _set_mode(monkeypatch, "llm_first")
+    nlu_pipeline.resolve(SIMPLE_QUERY, db_session, session_id="s-2")
+
+    stored = conversation_memory.get("s-2")
     assert isinstance(stored, QueryIR)
     assert stored.metric.key == "mtd_cleared"

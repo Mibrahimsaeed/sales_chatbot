@@ -131,12 +131,21 @@ def test_trace_records_the_matched_name_span(traced_db, captured):
 
 
 def test_leaderboard_trace_records_ir_and_row_count(traced_db, captured):
+    """The query INTENT and the response MODE are recorded separately.
+
+    Phase 3 changed the last assertion from "leaderboard" to
+    "metric_value". `response_type` used to be `ir.intent` passed
+    straight through, so a ranking that matched exactly one advisor — see
+    row_count below — was still reported and rendered as a leaderboard,
+    header and all. The intent is still "leaderboard": the user did ask
+    for a ranking. The ANSWER is one subject's figure.
+    """
     handle_chat_message(traced_db, "top 3 advisors by connects", session_id="t5")
     trace = captured[-1]
     assert trace["ir"]["intent"] == "leaderboard"
     assert trace["ir"]["sort"]["metric"] == "total_connects"
     assert trace["row_count"] == 1
-    assert trace["response_type"] == "leaderboard"
+    assert trace["response_type"] == "metric_value"
 
 
 def test_sql_is_captured_with_statements(traced_db, captured):

@@ -114,15 +114,36 @@ def _rule_based_ir(text: str, entities: dict, plan: QueryPlan) -> QueryIR | None
 
 
 def _finish(ir: QueryIR, db: Session, session_id: str | None, used_llm: bool) -> ParseOutcome:
+    """Validate and return. Deliberately does NOT store the IR.
+
+    Phase 4: this used to write conversation_memory itself, making four
+    writers of last_ir across two modules. Worse, it wrote the PRE-MERGE
+    IR — the one built from this turn's words alone — so the turn that
+    actually answered and the turn the next message inherited from could
+    differ. nlu_pipeline.resolve() owns conversation state now and stores
+    the merged IR once, after conversation_context has run.
+    """
     result = validate_ir(ir, db)
     result.ir.nlu_mode = settings.nlu_mode
-    if result.is_valid:
-        conversation_memory.set(session_id, result.ir)
     return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=used_llm)
 
 
-def parse(text: str, entities: dict, db: Session, session_id: str | None) -> ParseOutcome:
-    plan: QueryPlan = build_query_plan(text, entities)
+def parse(text: str, entities: dict, db: Session, session_id: str | None,
+          plan: QueryPlan | None = None) -> ParseOutcome:
+    """Phase 4: `plan` is supplied by the caller.
+
+    nlu_pipeline.resolve() has already planned this message — it routes on
+    plan.action — and this function then planned it AGAIN from the same
+    text and the same entities, so build_query_plan ran twice per request
+    for an identical result. Planning is deterministic and pure, so the
+    duplicate was invisible in behaviour and paid for twice in work.
+
+    The parameter is optional so the module stays independently callable
+    (its own tests do), but the pipeline always passes the plan it
+    already made. One message, one planner run.
+    """
+    if plan is None:
+        plan = build_query_plan(text, entities)
 
     # ---- llm_first (P1 inversion): LLM parses everything reaching here ----
     if settings.nlu_mode == "llm_first":

@@ -469,6 +469,39 @@ def format_ir_leaderboard_reply(
     return "\n".join(lines)
 
 
+def format_ir_single_value_reply(
+    ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1, paginated: bool = False
+) -> str:
+    """One subject's figure, stated as a sentence.
+
+    Phase 3. response_planner has returned shape="single_value" for a
+    one-row result since Part 8, but _SHAPE_FORMATTERS mapped it to the
+    LEADERBOARD formatter — so the plan was computed correctly and then
+    discarded, and "What is Downtown revenue?" answered with
+
+        🏆 Top 1 by MTD Revenue Cleared (filtered by team = Downtown)
+        1. Downtown — 1,100
+
+    A ranking of one is not a ranking. The figure was right; the KIND of
+    answer was not.
+
+    Paginated results keep the list rendering: pagination only happens
+    over a set, so a paginated single row is a page of a longer list, not
+    a subject's figure.
+    """
+    if not rows:
+        return "No data available for that yet."
+    if paginated:
+        return format_ir_leaderboard_reply(
+            ir, rows, total_count=total_count, start_index=start_index, paginated=True
+        )
+
+    row = rows[0]
+    metric_key = effective_metric(ir)
+    value = format_metric_value(metric_key, row.get("value", 0))
+    return f"{row['name']} has {value} {_metric_label(metric_key)}."
+
+
 def format_ir_comparison_reply(
     ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1, paginated: bool = False
 ) -> str:
@@ -521,7 +554,10 @@ _FORMATTER_BY_INTENT = {
 # one row reads as a single value, not a "Top 1" list. Same formatter
 # functions as before, just re-keyed by shape.
 _SHAPE_FORMATTERS = {
-    "single_value": format_ir_leaderboard_reply,
+    # Phase 3: single_value has its own renderer. It shared the
+    # leaderboard's until now, which silently undid the planner's
+    # decision — see format_ir_single_value_reply.
+    "single_value": format_ir_single_value_reply,
     "ranked_list": format_ir_leaderboard_reply,
     "comparison_table": format_ir_comparison_reply,
     "filtered_table": format_ir_filtered_list_reply,
@@ -529,9 +565,21 @@ _SHAPE_FORMATTERS = {
 
 
 def format_ir_reply(
-    ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1, paginated: bool = False
+    ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1,
+    paginated: bool = False, plan=None
 ) -> str:
-    plan = plan_response(ir, rows)
+    """Render the response the planner chose.
+
+    Phase 4: `plan` is supplied by the caller. This function used to call
+    plan_response() itself while chat_service called it too, so the
+    response mode was decided twice per request — and two callers of a
+    decision are two places it can diverge, which is the shape of every
+    defect these phases have removed. The formatter now RENDERS a plan
+    rather than making one; the parameter stays optional so the module
+    remains independently callable.
+    """
+    if plan is None:
+        plan = plan_response(ir, rows)
     if plan.shape == "empty":
         formatter = _FORMATTER_BY_INTENT.get(ir.intent, format_ir_leaderboard_reply)
     else:

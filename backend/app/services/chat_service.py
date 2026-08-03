@@ -2,13 +2,13 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.llm import conversation_memory, hierarchy, narrative
+from app.llm import conversation_memory, hierarchy, narrative, routing
 from app.llm.ir_validator import confidence_breakdown
 from app.llm.nlu_pipeline import resolve, Resolution
 from app.llm.metric_ontology import metric_for_period
 from app.llm.query_compiler import compile_and_run, count_ir
 from app.llm.query_ir import QueryIR
-from app.llm.response_planner import plan_response
+from app.llm.response_planner import plan_response, respond
 from app.llm.response_formatter import (
     format_advisor_reply,
     format_advisor_metric_reply,
@@ -120,11 +120,7 @@ def _show_more(db: Session, session_id: str | None) -> dict:
     it already has, per the pagination cursor in conversation_memory."""
     state = conversation_memory.get_pagination(session_id)
     if state is None:
-        return {
-            "type": "text",
-            "reply": "There's nothing more to show right now — try asking a new question.",
-            "data": None,
-        }
+        return respond("text", "There's nothing more to show right now — try asking a new question.", None)
 
     # capture these BEFORE advance_pagination/clear_pagination — state is a
     # mutable reference into the stored PaginationState (get_pagination
@@ -144,17 +140,17 @@ def _show_more(db: Session, session_id: str | None) -> dict:
     else:
         conversation_memory.clear_pagination(session_id)
 
+    # Phase 4: the planner owns the mode here too. This returned
+    # `ir.intent` — the second surviving place the QUESTION's shape was
+    # reported as the ANSWER's kind, and easy to miss because a "show
+    # more" never re-parses.
+    response_plan = plan_response(ir, rows)
     reply = format_ir_reply(
-        ir, rows, total_count=capped_total, start_index=page_offset + 1, paginated=True
+        ir, rows, total_count=capped_total, start_index=page_offset + 1,
+        paginated=True, plan=response_plan,
     )
-    return {
-        "type": ir.intent,
-        "reply": reply,
-        "data": rows,
-        "total_count": capped_total,
-        "shown_count": new_shown,
-        "has_more": has_more,
-    }
+    return respond(response_plan.mode, reply, rows, why=response_plan.trace(),
+                   total_count=capped_total, shown_count=new_shown, has_more=has_more)
 
 
 def _dispatch_breakdown(db: Session, level: str, value: str, flat: bool = False) -> dict:
@@ -176,12 +172,8 @@ def _dispatch_breakdown(db: Session, level: str, value: str, flat: bool = False)
                                    f"flat=False — {level} {value!r} nested by team")
             reply = format_breakdown_reply(data)
     except NotFoundError:
-        return {
-            "type": "not_found",
-            "reply": f"I couldn't find a {level.replace('_', ' ')} matching '{value}' — mind double-checking the spelling?",
-            "data": None,
-        }
-    return {"type": "breakdown", "reply": reply, "data": data}
+        return respond("not_found", f"I couldn't find a {level.replace('_', ' ')} matching '{value}' — mind double-checking the spelling?", None)
+    return respond("breakdown", reply, data)
 
 
 def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
@@ -194,13 +186,14 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
     if resolution.kind == "paginate":
         return handle_show_more(db, session_id)
 
+    if resolution.kind == "unsupported":
+        # Distinct from a clarification: no answer the user could give
+        # would make this answerable, so offering options would be a
+        # false promise. No `options` key for the same reason.
+        return respond("unsupported", resolution.clarify_message, None)
+
     if resolution.kind == "clarify":
-        return {
-            "type": "clarification",
-            "reply": resolution.clarify_message,
-            "data": None,
-            "options": resolution.clarify_options or [],
-        }
+        return respond("clarification", resolution.clarify_message, None, options=resolution.clarify_options or [])
 
     if resolution.kind == "ir" and resolution.ir.intent == "breakdown":
         # Never a metric-ranking operation (no compile_and_run/count_ir/
@@ -223,14 +216,10 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         # A comparison was asked for but only one side grounded. Naming
         # the side we DID find is what makes this actionable — the usual
         # cause is a typo or an entity that doesn't exist.
-        return {
-            "type": "clarification",
-            "reply": (
-                f"I could only find '{plan.entity_value}' — I need two things to compare. "
-                "Could you check the other name?"
-            ),
-            "data": None,
-        }
+        return respond("clarification", (
+            f"I could only find '{plan.entity_value}' — I need two things to compare. "
+            "Could you check the other name?"
+        ), None)
 
     if plan.action == "comparison":
         # "Compare Graana and Agency21" — side by side. Previously only
@@ -241,21 +230,13 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
                 db, plan.comparison_targets, metric=plan.metric
             )
         except NotFoundError as e:
-            return {"type": "not_found", "reply": str(e.message), "data": None}
+            return respond("not_found", str(e.message), None)
         except ValueError:
-            return {
-                "type": "clarification",
-                "reply": "I need two things to compare — try 'compare Graana and Agency21'.",
-                "data": None,
-            }
+            return respond("clarification", "I need two things to compare — try 'compare Graana and Agency21'.", None)
         audit.record_formatter("format_comparison_reply",
                                f"plan.action='comparison' over {plan.comparison_targets} "
                                f"on metric {plan.metric!r}")
-        return {
-            "type": "comparison",
-            "reply": format_comparison_reply(comparison),
-            "data": comparison,
-        }
+        return respond("comparison", format_comparison_reply(comparison), comparison)
 
     if plan.action == "roster":
         # "All advisors in Blue Area" — enumerate the people. Previously
@@ -264,31 +245,24 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         try:
             roster = hierarchy_service.get_level_roster(db, plan.level, plan.entity_value)
         except NotFoundError:
-            return {
-                "type": "not_found",
-                "reply": f"I couldn't find a {plan.level.replace('_', ' ')} matching '{plan.entity_value}'.",
-                "data": None,
-            }
+            return respond("not_found", f"I couldn't find a {plan.level.replace('_', ' ')} matching '{plan.entity_value}'.", None)
         audit.record_formatter("format_roster_reply",
                                f"plan.action='roster' — flat enumeration of people in "
                                f"{plan.level} {plan.entity_value!r}")
-        return {"type": "roster", "reply": format_roster_reply(roster), "data": roster}
+        return respond("roster", format_roster_reply(roster), roster)
 
     if plan.action == "ancestry":
         # "The full hierarchy above X" — every level up, not one.
         chain = hierarchy_service.get_ancestry(db, plan.level, plan.entity_value)
         if not chain:
             label = hierarchy.label_for(plan.level)
-            return {
-                "type": "not_found",
-                "reply": f"I don't have a reporting line on file for {label.lower()} "
-                         f"'{plan.entity_value}'.",
-                "data": None,
-            }
+            return respond("not_found",
+                           f"I don't have a reporting line on file for {label.lower()} "
+                           f"'{plan.entity_value}'.", None)
         audit.record_formatter("format_ancestry_reply",
                                f"plan.action='ancestry' — {len(chain['ancestry'])} levels "
                                f"above {plan.level} {plan.entity_value!r}")
-        return {"type": "ancestry", "reply": format_ancestry_reply(chain), "data": chain}
+        return respond("ancestry", format_ancestry_reply(chain), chain)
 
     if plan.action == "reverse_hierarchy" and plan.subject_level:
         # Phase 5.4: the subject is a GROUP (a BCM, a zonal head), so
@@ -300,25 +274,18 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         if not result:
             label = hierarchy.label_for(plan.level)
             subject_label = hierarchy.label_for(plan.subject_level)
-            return {
-                "type": "not_found",
-                "reply": f"I don't have a {label} on file for {subject_label.lower()} "
-                         f"'{plan.entity_value}'.",
-                "data": None,
-            }
+            return respond("not_found",
+                           f"I don't have a {label} on file for {subject_label.lower()} "
+                           f"'{plan.entity_value}'.", None)
         audit.record_formatter("format_group_manager_reply",
                                f"plan.action='reverse_hierarchy' with a {plan.subject_level} "
                                f"subject — the level ABOVE it is {plan.level!r}")
-        return {"type": "manager", "reply": format_group_manager_reply(result), "data": result}
+        return respond("manager", format_group_manager_reply(result), result)
 
     if plan.action == "reverse_hierarchy":
         # "Who is X's BM?" — the person ABOVE X, keyed by X's wid.
         if plan.entity_wid is None:
-            return {
-                "type": "not_found",
-                "reply": f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?",
-                "data": None,
-            }
+            return respond("not_found", f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?", None)
         result = hierarchy_service.get_manager_of(db, plan.entity_wid, plan.level)
         if not result:
             # The advisor exists but has no manager recorded at this level.
@@ -326,26 +293,17 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
             # audit's point that a capability gap must not silently become
             # a different, confident answer.
             label = hierarchy.label_for(plan.level)
-            return {
-                "type": "not_found",
-                "reply": f"I don't have a {label} on file for {plan.entity_value}.",
-                "data": None,
-            }
+            return respond("not_found", f"I don't have a {label} on file for {plan.entity_value}.", None)
         audit.record_formatter("format_manager_reply",
                                f"plan.action='reverse_hierarchy' — the one person ABOVE "
                                f"wid={plan.entity_wid} at level {plan.level!r}")
-        return {"type": "manager", "reply": format_manager_reply(result), "data": result}
+        return respond("manager", format_manager_reply(result), result)
 
     if plan.action == "clarify_person":
         # Phase 1: a name matching several real people asks which one,
         # instead of the old behavior of silently returning whichever had
         # the lowest wid.
-        return {
-            "type": "clarification",
-            "reply": format_person_disambiguation_reply(plan.entity_value, plan.person_candidates),
-            "data": None,
-            "options": [c.label() for c in plan.person_candidates],
-        }
+        return respond("clarification", format_person_disambiguation_reply(plan.entity_value, plan.person_candidates), None, options=[c.label() for c in plan.person_candidates])
 
     if plan.action == "advisor_metric":
         # M7: the user named a metric, so answer with that metric alone.
@@ -358,23 +316,14 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         else:
             resolution = advisor_service.resolve_advisor(db, plan.entity_value)
             if resolution.is_ambiguous:
-                return {
-                    "type": "clarification",
-                    "reply": format_person_disambiguation_reply(plan.entity_value, resolution.candidates),
-                    "data": None,
-                    "options": [c.label() for c in resolution.candidates],
-                }
+                return respond("clarification", format_person_disambiguation_reply(plan.entity_value, resolution.candidates), None, options=[c.label() for c in resolution.candidates])
             advisor = (
                 advisor_service.find_advisor_by_wid(db, resolution.wid)
                 if resolution.is_resolved else None
             )
 
         if not advisor:
-            return {
-                "type": "not_found",
-                "reply": f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?",
-                "data": None,
-            }
+            return respond("not_found", f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?", None)
 
         value = advisor_service.get_advisor_metric(db, advisor["wid"], plan.metric)
         audit.record_formatter(
@@ -382,12 +331,12 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
             f"plan.action='advisor_metric' metric={plan.metric!r} for wid={advisor['wid']} — "
             "one number, not the profile",
         )
-        return {
-            "type": "advisor_metric",
-            "reply": format_advisor_metric_reply(advisor["name"], plan.metric, value),
-            "data": {"wid": advisor["wid"], "name": advisor["name"],
-                     "metric": plan.metric, "value": value},
-        }
+        return respond(
+            "advisor_metric",
+            format_advisor_metric_reply(advisor["name"], plan.metric, value),
+            {"wid": advisor["wid"], "name": advisor["name"],
+             "metric": plan.metric, "value": value},
+        )
 
     if plan.action == "lookup":
         # Identity-first: fetch by WID when entity resolution produced one
@@ -401,23 +350,14 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         else:
             resolution = advisor_service.resolve_advisor(db, plan.entity_value)
             if resolution.is_ambiguous:
-                return {
-                    "type": "clarification",
-                    "reply": format_person_disambiguation_reply(plan.entity_value, resolution.candidates),
-                    "data": None,
-                    "options": [c.label() for c in resolution.candidates],
-                }
+                return respond("clarification", format_person_disambiguation_reply(plan.entity_value, resolution.candidates), None, options=[c.label() for c in resolution.candidates])
             advisor = (
                 advisor_service.find_advisor_by_wid(db, resolution.wid)
                 if resolution.is_resolved else None
             )
 
         if not advisor:
-            return {
-                "type": "not_found",
-                "reply": f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?",
-                "data": None,
-            }
+            return respond("not_found", f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?", None)
         audit.record_formatter(
             "format_advisor_reply",
             f"plan.action='lookup' for {plan.entity_value!r} (wid={plan.entity_wid}) — ONE "
@@ -425,27 +365,27 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
             "only; it has no team-roster or manager section, so anything the query asked "
             "about beyond this person is not represented in the reply.",
         )
-        return {"type": "advisor", "reply": format_advisor_reply(advisor), "data": advisor}
+        return respond("profile", format_advisor_reply(advisor), advisor)
 
     if plan.action == "summary" and plan.level == "team":
         try:
             summary = team_service.get_team_summary(db, plan.entity_value)
         except NotFoundError:
-            return {"type": "not_found", "reply": f"I couldn't find a team matching '{plan.entity_value}'.", "data": None}
+            return respond("not_found", f"I couldn't find a team matching '{plan.entity_value}'.", None)
         audit.record_formatter("format_team_reply",
                                f"plan.action='summary' with level='team' — aggregate "
                                f"performance for {plan.entity_value!r}, not its roster")
-        return {"type": "team", "reply": format_team_reply(summary), "data": summary}
+        return respond("hierarchy_summary", format_team_reply(summary), summary)
 
     if plan.action == "summary" and plan.level == "company":
         try:
             summary = company_service.get_company_summary(db, plan.entity_value)
         except NotFoundError:
-            return {"type": "not_found", "reply": f"I couldn't find a company matching '{plan.entity_value}'.", "data": None}
+            return respond("not_found", f"I couldn't find a company matching '{plan.entity_value}'.", None)
         audit.record_formatter("format_company_reply",
                                f"plan.action='summary' with level='company' — aggregate "
                                f"performance for {plan.entity_value!r}")
-        return {"type": "company", "reply": format_company_reply(summary), "data": summary}
+        return respond("company_summary", format_company_reply(summary), summary)
 
     if plan.action == "breakdown":
         return _dispatch_breakdown(db, plan.level, plan.entity_value, plan.flat)
@@ -459,7 +399,7 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         audit.record_formatter("format_attendance_reply",
                                f"plan.action='attendance_filter' status={plan.reason!r} "
                                f"team={plan.entity_value!r}")
-        return {"type": "attendance", "reply": format_attendance_reply(rows), "data": rows}
+        return respond("attendance", format_attendance_reply(rows), rows)
 
     audit.record_formatter(
         "(none — canned text)",
@@ -467,7 +407,7 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         "planner but nothing here can answer that action, so the reply is the generic "
         "'could you rephrase' text",
     )
-    return {"type": "unknown", "reply": "Hmm, I'm not quite sure how to answer that one yet — could you rephrase it?", "data": None}
+    return respond("no_data", "Hmm, I'm not quite sure how to answer that one yet — could you rephrase it?", None)
 
 
 def _unanswerable_reply(ir) -> str:
@@ -507,11 +447,7 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
     true_total = count_ir(db, ir)
 
     if true_total is None:
-        return {
-            "type": "unknown",
-            "reply": _unanswerable_reply(ir),
-            "data": None,
-        }
+        return respond("no_data", _unanswerable_reply(ir), None)
 
     # Part 8: cap the first page at PAGE_SIZE regardless of how many rows
     # actually match — a "Show More" cursor picks up the rest instead of
@@ -525,10 +461,23 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
     else:
         conversation_memory.clear_pagination(session_id)
 
+    # THE response-mode decision, made once, here, from the IR and the
+    # result set. Everything below renders it.
+    response_plan = plan_response(ir, rows)
+    routing.decide("Response", response_plan.mode, response_plan.trace())
+
+    if response_plan.mode == "unsupported":
+        # A capability limit is not an empty result. Saying so plainly
+        # beats running a neighbouring query and presenting it as the
+        # answer, which is what happened while this state was unreachable.
+        return respond("unsupported", response_plan.reason, None)
+
     audit.record_formatter("format_ir_reply",
-                           f"QueryIR path, intent={ir.intent!r} — compiled and executed "
+                           f"QueryIR path, intent={ir.intent!r} -> response mode "
+                           f"{response_plan.mode!r} — compiled and executed "
                            "through query_compiler")
-    reply = format_ir_reply(ir, rows, total_count=capped_total, paginated=has_more)
+    reply = format_ir_reply(ir, rows, total_count=capped_total,
+                            paginated=has_more, plan=response_plan)
     insights: list[str] = []
     if rows:
         # Part 11: evidence-aware explanation — 100% deterministic (every
@@ -544,25 +493,26 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
         facts = narrative.compute_facts(ir, rows)
         explanation = narrative.build_explanation(ir, rows, total_count=capped_total)
         explanation = narrative.polish_explanation(explanation, facts)
-        if explanation:
+        if explanation and response_plan.show_explanation:
             reply = f"{explanation}\n\n{reply}"
         # Part 8/11: only attach insights when the response planner judges
         # the result set large enough for "outlier"/"trend" to mean
         # anything (2-row comparisons don't have a meaningful peer group).
         # Anomaly detection and trend deltas are independent evidence
         # sources — both capped, combined cap keeps the reply concise.
-        if plan_response(ir, rows).show_insights:
+        if response_plan.show_insights:
             insights = (narrative.compute_insights(ir, rows) + narrative.compute_trends(ir, rows, db))[:3]
-    return {
-        "type": ir.intent,
-        "reply": reply,
-        "data": rows,
-        "insights": insights,
-        "confidence": confidence_breakdown(ir),
-        "total_count": capped_total,
-        "shown_count": len(rows),
-        "has_more": has_more,
-    }
+    # Phase 3 made this the RESPONSE mode rather than the QUERY intent;
+    # Phase 4 routes it through respond() like every other exit, so the
+    # dispatcher has exactly one way out.
+    return respond(
+        response_plan.mode, reply, rows, why=response_plan.trace(),
+        insights=insights,
+        confidence=confidence_breakdown(ir),
+        total_count=capped_total,
+        shown_count=len(rows),
+        has_more=has_more,
+    )
 
 
 def _dispatch_multi(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
@@ -583,45 +533,29 @@ def _dispatch_multi(db: Session, resolution: Resolution, session_id: str | None 
         sub_response = _dispatch(db, sub_resolution, session_id)
         parts.append(f"{i}. {sub_response['reply']}")
         all_data.append(sub_response.get("data"))
-    return {
-        "type": "multi",
-        "reply": "\n\n".join(parts),
-        "data": all_data,
-    }
+    return respond("multi", "\n\n".join(parts), all_data)
 
 
 def _dispatch_shortcut(db: Session, intent: str, entities: dict) -> dict:
     if intent == "greeting":
-        return {
-            "type": "text",
-            "reply": "Hey! Happy to help — I can look up an advisor, a team, or a company, pull up a leaderboard, or check attendance. What would you like to know?",
-            "data": None,
-        }
+        return respond("text", "Hey! Happy to help — I can look up an advisor, a team, or a company, pull up a leaderboard, or check attendance. What would you like to know?", None)
 
     if intent == "thanks":
-        return {
-            "type": "text",
-            "reply": "Anytime! Let me know if there's anything else you'd like to dig into.",
-            "data": None,
-        }
+        return respond("text", "Anytime! Let me know if there's anything else you'd like to dig into.", None)
 
     if intent == "help":
-        return {
-            "type": "text",
-            "reply": "Here's what I'm good at — try things like: 'tell me about <advisor>', 'how is <team> doing', 'top 5 by revenue', 'give me target achievement', 'who was late today', 'compare <team> with <team>', 'advisors from <company> who were late but still hit 80% of target'.",
-            "data": None,
-        }
+        return respond("text", "Here's what I'm good at — try things like: 'tell me about <advisor>', 'how is <team> doing', 'top 5 by revenue', 'give me target achievement', 'who was late today', 'compare <team> with <team>', 'advisors from <company> who were late but still hit 80% of target'.", None)
 
     if intent == "attendance_check":
         rows = attendance_service.get_attendance_issues(db, entities.get("team"))
         audit.record_formatter("format_attendance_reply",
                                "shortcut intent 'attendance_check' — answered without the "
                                "planner, so no metric/entity beyond team was consulted")
-        return {"type": "attendance", "reply": format_attendance_reply(rows), "data": rows}
+        return respond("attendance", format_attendance_reply(rows), rows)
 
     audit.record_formatter("(none — canned text)",
                            f"shortcut intent {intent!r} matched no shortcut handler")
-    return {"type": "unknown", "reply": "Hmm, I'm not quite sure how to answer that one yet — could you rephrase it?", "data": None}
+    return respond("no_data", "Hmm, I'm not quite sure how to answer that one yet — could you rephrase it?", None)
 
 
 def _log_interaction(

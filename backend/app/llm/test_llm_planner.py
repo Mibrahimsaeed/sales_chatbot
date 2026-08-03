@@ -295,13 +295,21 @@ def test_structurally_invalid_response_falls_back(planner_db, monkeypatch):
 # point of recording it rather than forcing agreement is that a silent
 # behaviour change is what makes an A/B rollout unsafe.
 KNOWN_DIVERGENCES = {
-    # The rule-based planner has no leaderboard candidate without a named
-    # metric, so the roster reading wins and the "top 5" RANKING INTENT IS
-    # SILENTLY DROPPED — it returns every advisor in Graana. The LLM
-    # planner infers the conventional metric and honours the ranking.
-    # This is the gap the planner audit recorded as "best advisors in X
-    # -> roster", and it is an improvement, not a regression.
-    "Top 5 advisors in Graana": ("leaderboard", "roster"),
+    # RESOLVED — "Top 5 advisors in Graana" is no longer a divergence.
+    #
+    # It used to be ("leaderboard", "roster"): the rule planner had no
+    # leaderboard candidate without a named metric, so the roster reading
+    # won and the "top 5" RANKING INTENT WAS SILENTLY DROPPED — it
+    # returned every advisor in Graana. The scored-intent work gave the
+    # rule planner a default metric on an explicit ranking word, so it
+    # now reads the ranking and agrees with the LLM planner.
+    #
+    # Deliberately left as a comment rather than deleted: this entry was
+    # the record of a known rule-planner weakness, and "the weakness is
+    # gone" is worth more here than a silently shorter dict. The
+    # agreement itself is now pinned by
+    # test_both_planners_agree_except_where_documented, which asserts
+    # every query NOT in this dict reaches the same action on both paths.
 
     # "Attendance of Agency21" — NEITHER planner is clearly right, and the
     # divergence exposes a real capability gap rather than a planner bug:
@@ -346,12 +354,25 @@ def test_both_planners_agree_except_where_documented(planner_db, monkeypatch):
 
 
 def test_the_documented_divergence_is_the_llm_planner_being_more_correct(planner_db, monkeypatch):
-    """"Top 5 advisors in Graana" asks for a RANKING. The rule-based
-    planner returns every advisor in Graana, dropping "top 5" entirely."""
+    """"Top 5 advisors in Graana" asks for a RANKING, and BOTH planners
+    now honour it.
+
+    INVERTED. This test used to assert the rule planner returned "roster"
+    — dropping "top 5" entirely and listing every advisor in Graana — and
+    documented that as the LLM planner being more correct. The
+    scored-intent work closed that gap: an explicit ranking word now
+    supplies a default metric, so the rule planner reads the ranking too.
+
+    The assertion is kept rather than deleted because the ranking must
+    not be silently dropped again by either path, and that is easiest to
+    state where the regression was first recorded.
+    """
     from app.llm.query_planner import build_query_plan
 
     entities = entity_extractor.extract_entities("top 5 advisors in graana", planner_db)
-    assert build_query_plan("top 5 advisors in graana", entities).action == "roster"
+    rule_based = build_query_plan("top 5 advisors in graana", entities)
+    assert rule_based.action == "leaderboard"
+    assert rule_based.limit == 5
 
     _mock_llm(monkeypatch, _plan(
         intent="leaderboard", entities=[_entity("company", "Graana")],

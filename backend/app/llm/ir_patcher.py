@@ -158,13 +158,60 @@ _RULES = [
 ]
 
 
-def try_patch(prior: QueryIR, text: str, entities: dict, plan_action: str) -> QueryIR | None:
+# The modifier patterns that carry no question of their own. Each one
+# changes a property of an existing result set — how many rows, which
+# order, which filters — and means nothing without a previous result to
+# apply it to. Kept in step with _RULES below.
+_MODIFIER_PATTERNS = (_TOP_N_RE, _SORT_DIR_RE, _REMOVE_FILTER_RE)
+
+
+def _is_bare_modifier(text: str, entities: dict, spec=None) -> bool:
+    """Does this message modify a previous result rather than ask its own
+    question?
+
+    The ellipsis judgement itself belongs to conversation_context — this
+    asks it rather than re-deciding, so the patcher and the merge can
+    never disagree about whether a turn stands alone. What stays here is
+    the narrower question the PATCHER needs: is this message a pure
+    modifier, i.e. elliptical AND matching a rule that changes a property
+    of an existing result set?
+
+    `plan_action` is not consulted for any of it. That value is the
+    planner's verdict on what it WOULD DO with the message, not on what
+    the message CONTAINS: "top 5" carries a ranking word, so the planner
+    supplies a default metric and returns action="leaderboard", and
+    reading that as "self-standing query" sent a pure limit change
+    through a full parse and dropped the prior turn's filters.
+    """
+    from app.llm import conversation_context
+
+    if spec is None:
+        spec = conversation_context.specified(text, entities)
+    if spec.stands_alone:
+        return False
+    # A modifier changes a property of a result set; it never names its
+    # own measure or subject.
+    if spec.metric or spec.subject:
+        return False
+    return any(pattern.search(text) for pattern in _MODIFIER_PATTERNS)
+
+
+def try_patch(prior: QueryIR, text: str, entities: dict, plan_action: str,
+              spec=None) -> QueryIR | None:
     """A patched copy of `prior`, or None when this message should go
     through the full parse path instead. `plan_action` is the rule
     planner's verdict on the message standing alone — anything it
     resolved as its own query ("leaderboard", "lookup", ...) is treated
-    as a new question, not a modifier."""
-    stripped = text.strip()
+    as a new question, not a modifier, UNLESS the message is a bare
+    modifier that names no measure and no subject."""
+    from app.llm import conversation_context
+
+    # Leading discourse connectives are stripped once, here, so the gate
+    # and every patch rule see the same text. "now only IMARAT" reached
+    # this function unstripped and failed _ONLY_RE (anchored at the
+    # start), so it became a standalone summary and the previous scope
+    # was lost.
+    stripped = conversation_context.strip_openers(text)
     # "summary"/"breakdown" is what the rule planner says for a BARE entity
     # mention ("graana", "unit head john") — that's a legitimate new
     # question. But with an explicit modifier prefix ("only graana") it's
@@ -172,7 +219,7 @@ def try_patch(prior: QueryIR, text: str, entities: dict, plan_action: str) -> Qu
     if plan_action in ("summary", "breakdown"):
         if not _ONLY_RE.match(stripped):
             return None
-    elif plan_action != "unresolved":
+    elif plan_action != "unresolved" and not _is_bare_modifier(stripped, entities, spec):
         return None
     if len(re.findall(r"\S+", stripped)) > _MAX_TOKENS:
         return None
