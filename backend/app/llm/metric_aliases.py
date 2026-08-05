@@ -145,6 +145,30 @@ ALIASES: dict[str, tuple[str, ...]] = {
         "late count", "how many late", "number of late",
         "late arrival", "late arrivals", "lates", "tardiness", "late",
     ),
+    # Working-day scaled rates. These three lived in UNAVAILABLE until
+    # working_days.py gave `workingDays` a source; the phrases are
+    # carried over unchanged so every wording that used to get the
+    # refusal now gets the number.
+    "cr_rate": (
+        "cr %", "cr percentage", "cr rate", "client registration rate",
+        "client registration %", "client registration percentage",
+        "registration rate", "cr ratio",
+    ),
+    "ytd_cr_rate": (
+        "ytd cr %", "ytd cr rate", "year to date cr %", "year to date cr rate",
+        "ytd client registration rate",
+    ),
+    "answered_calls_rate": (
+        "answered call %", "answered calls %", "answered call rate",
+        "answered-call rate", "answered calls rate", "answered %",
+        "answered call percentage", "connect rate", "connect %",
+        "connect percentage", "connect percent",
+    ),
+    "meeting_rate": (
+        "meeting rate", "meetings rate", "meeting %", "meeting percentage",
+        "meetings percentage", "meetings %",
+    ),
+
     "attendance_rate": (
         "attendance rate", "attendance percentage", "attendance %", "attendance",
         "on time rate", "on-time percentage", "punctuality",
@@ -237,48 +261,6 @@ class Unavailable:
 # separate piece of work with its own business rules (holidays, partial
 # months, per-region calendars).
 UNAVAILABLE: tuple[Unavailable, ...] = (
-    Unavailable(
-        key="answered_calls_rate",
-        phrases=(
-            # Singular AND plural: "answered call %" was missing, so it
-            # fell through to the count while its plural refused.
-            "answered call %", "answered calls %",
-            "answered call rate", "answered-call rate", "answered calls rate",
-            "answered %", "connect rate", "connect %",
-        ),
-        reason=(
-            "the answered-call rate is calls against a working-day target "
-            "(calls / (team size x 10 per day x working days)), and I don't have "
-            "a working-day calendar yet"
-        ),
-        instead="answered_calls",
-    ),
-    Unavailable(
-        key="cr_rate",
-        phrases=(
-            "cr %", "cr percentage", "cr rate", "client registration rate",
-            "client registration %", "registration rate",
-        ),
-        reason=(
-            "the CR rate is client registrations against a working-day target "
-            "(CR / (team size x 2 per day x working days)), and I don't have a "
-            "working-day calendar yet"
-        ),
-        instead="client_registrations",
-    ),
-    Unavailable(
-        key="meeting_rate",
-        phrases=(
-            "meeting rate", "meetings rate", "meeting %", "meeting percentage",
-            "meetings percentage",
-        ),
-        reason=(
-            "the meeting rate is meetings against a working-day target "
-            "(meetings / (team size x 0.6 per day x working days)), and I don't "
-            "have a working-day calendar yet"
-        ),
-        instead="total_meetings",
-    ),
     Unavailable(
         key="portfolio_rate",
         phrases=("portfolio %", "portfolio rate", "portfolio percentage of target"),

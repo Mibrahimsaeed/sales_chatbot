@@ -284,16 +284,32 @@ def test_the_rollup_rule_is_declared_on_the_metric_not_in_code():
 
 
 def test_every_ratio_metric_declares_its_components():
-    """A metric declaring RATIO without a numerator/denominator would
-    silently fall back to summing — the wrong answer, quietly. Catch the
-    declaration error instead."""
+    """A metric declaring RATIO without the parts its denominator needs
+    would silently fall back to summing — the wrong answer, quietly.
+    Catch the declaration error instead.
+
+    Two shapes of denominator, both checked. An ordinary ratio stores
+    both components as columns. A WORKING-DAY SCALED rate (CR %,
+    Connect %, Meeting %) has no denominator column at all: the spec
+    measures it against `teamSize x perAdvisorPerDay x workingDays`, and
+    workingDays is a query-time fact, so aggregation.value_expression
+    builds it. What such a metric must still declare is the per-day
+    target — without it the denominator is unbuildable and the same
+    silent fall-back to summing applies.
+    """
     for key, metric in METRICS.items():
         if metric.rollup is not Rollup.RATIO:
             continue
         binding = metric.bindings.get("advisor")
         assert binding is not None, key
         assert binding.ratio_numerator is not None, key
-        assert binding.ratio_denominator is not None, key
+        if getattr(binding, "working_day_scaled", False):
+            assert metric.daily_target_rate, (
+                f"{key} is working-day scaled but declares no "
+                "daily_target_rate, so its denominator cannot be built"
+            )
+        else:
+            assert binding.ratio_denominator is not None, key
 
 
 # ---------------------------------------------------------------------

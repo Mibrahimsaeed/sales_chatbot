@@ -35,7 +35,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0011_sheet_audit_import_gaps"
-down_revision = "0010_add_request_trace_to_chat_log"
+down_revision = "0010"
 branch_labels = None
 depends_on = None
 

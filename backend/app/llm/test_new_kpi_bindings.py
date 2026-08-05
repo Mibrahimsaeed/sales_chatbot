@@ -187,7 +187,12 @@ def test_conduction_rate_needs_no_working_days(org):
     counts — so it ships while "Meetings Planned" (a working-day target
     rate) stays blocked."""
     assert _team(org, "meeting_conduction_rate") is not None
-    assert resolve_metric("meeting rate") is None     # still uncomputable
+    # RETIRED REFUSAL: working_days.py made the meeting RATE computable.
+    # The point of this test is that the CONDUCTION rate (planned vs
+    # conducted, both stored) is a different measure that never needed a
+    # working-day calendar — so the two must stay distinct keys.
+    assert resolve_metric("meeting rate") == "meeting_rate"
+    assert resolve_metric("meeting conduction rate") == "meeting_conduction_rate"
 
 
 def test_conduction_rate_is_no_data_when_nothing_was_planned(org):

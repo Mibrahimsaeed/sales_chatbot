@@ -250,7 +250,8 @@ def test_conversation_state_is_written_once_per_request(org, monkeypatch):
     ("How is Blue Area performing?", "team"),
     ("Who does Yasir Ali report to?", "manager"),
     ("Show me the trend of revenue", "unsupported"),
-    ("What is Downtown's CR %?", "clarification"),
+    # portfolio % — the refusal working_days.py did not retire.
+    ("What is Downtown's portfolio %?", "clarification"),
     ("hello there", "text"),
 ])
 def test_the_api_response_types_are_unchanged(org, query, expected):

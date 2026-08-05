@@ -231,6 +231,17 @@ def _direction_for(plan) -> str:
     return "asc" if plan.ascending else "desc"
 
 
+# Fields that name WHO a query is about. On a comparison these are
+# carried by `subjects` instead, and leaving them as filters would
+# intersect the two sides — "Blue Area AND Downtown" matches nobody.
+#
+# DERIVED from the hierarchy rather than listed: a level added there must
+# not need a second edit here to be excluded, which is the drift
+# test_hierarchy_single_source.py exists to catch (and did catch, on the
+# hardcoded first version of this).
+_SUBJECT_FIELDS = frozenset(hierarchy.HIERARCHY_LEVELS) - {"advisor"}
+
+
 def plan_to_ir(plan, entities: dict) -> QueryIR:
     """Fail-soft degrade path (Part 5.1 error handling): wraps the existing
     rule-based query_planner.QueryPlan into a minimal, single-metric,
@@ -256,9 +267,42 @@ def plan_to_ir(plan, entities: dict) -> QueryIR:
     # the order the sentence did ("advisors in Blue Area above 80%").
     filters.extend(_threshold_filters(plan))
 
+    # Phase 5B: a comparison becomes a comparison IR, not a leaderboard.
+    #
+    # Comparison used to execute on the rule-based PLAN path, through
+    # comparison_service — a second pipeline that bypassed QueryIR and
+    # therefore bypassed everything QueryIR owns: _effective_metric (so
+    # "compare … year to date" resolved YTD and executed MTD),
+    # conversation memory (so the next turn lost both subjects),
+    # ir_validator, and the response planner.
+    #
+    # Nothing needed building to fix that. The IR path ALREADY supported
+    # comparison end to end — ir_validator checks for >= 2 subjects,
+    # query_compiler compiles subjects into a scoped query,
+    # response_planner has the comparison mode, and
+    # format_ir_comparison_reply renders it. The rule planner simply
+    # never routed there. This is the whole integration.
+    subjects: list[Subject] = []
+    if plan.action == "comparison" and plan.comparison_targets:
+        subjects = [
+            Subject(type=level, value=value, match_confidence=1.0)
+            for level, value in plan.comparison_targets
+        ]
+
+    if subjects:
+        # A comparison's subjects ARE its scope. Entity filters would
+        # narrow to the intersection of both sides and return nothing.
+        filters = [f for f in filters if f.field not in _SUBJECT_FIELDS]
+
     return QueryIR(
-        intent="leaderboard",
-        subject_level=plan.level or "advisor",
+        intent="comparison" if subjects else "leaderboard",
+        subjects=subjects,
+        # The subjects carry their own levels, so a mixed-level
+        # comparison ("Waqar Haider vs his team") keeps both. This is the
+        # level the ANSWER is grouped at; the first subject's level is
+        # the right default because comparison_targets() orders the
+        # leading subject first.
+        subject_level=(subjects[0].type if subjects else (plan.level or "advisor")),
         metric=MetricRef(key=plan.metric) if plan.metric else None,
         filters=filters,
         # Phase 2: the user's explicit direction wins; when they named

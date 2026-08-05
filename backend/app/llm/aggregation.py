@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, literal
 from sqlalchemy.orm import Session
 
 from app.database.models import (
@@ -57,6 +57,30 @@ def needs_rollup(level: str, binding: ColumnBinding) -> bool:
     return level != LEAF and not binding.team_named
 
 
+def _working_day_denominator(metric_key: str, binding) -> Optional[float]:
+    """`perAdvisorPerDay x workingDays` for one advisor row, or None.
+
+    Both halves are read from their owners — the per-day target from the
+    metric ontology, the working days from working_days.for_period — so
+    this function holds neither number itself. The period comes from the
+    BINDING when it declares one and the metric otherwise, which is the
+    same precedence the rest of the compiler uses for period-specific
+    bindings.
+    """
+    from app.llm import working_days
+    from app.llm.metric_ontology import METRICS, daily_target_rate
+
+    rate = daily_target_rate(metric_key)
+    if not rate:
+        # RATIO plus working_day_scaled but no declared target is a
+        # declaration error, not a runtime state — the caller falls back
+        # to an additive reading rather than emitting a bad denominator.
+        return None
+    metric = METRICS.get(metric_key)
+    period = binding.period or (metric.period if metric else None)
+    return rate * working_days.for_period(period)
+
+
 def value_expression(
     binding: ColumnBinding,
     metric_key: str,
@@ -79,6 +103,34 @@ def value_expression(
     rather than as 0%.
     """
     expr = binding.expr if expr is None else expr
+
+    # Working-day scaled rates (CR %, Connect %, Meeting %). The spec
+    # measures these against a target rather than a stored denominator:
+    #
+    #     value / (teamSize x perAdvisorPerDay x workingDays) x 100
+    #
+    # Expressed here rather than in the ontology because `workingDays`
+    # depends on the PERIOD, which is a query-time fact, while a
+    # ColumnBinding is a static declaration. The two static halves stay
+    # declared: the numerator is the binding's, and the per-day figure is
+    # MetricDef.daily_target_rate.
+    #
+    # The denominator is a per-ADVISOR-ROW constant, so SUM over the
+    # scope's rows yields teamSize x rate x workingDays exactly — the
+    # spec's formula, using the RATIO machinery already here rather than
+    # a second calculation path. teamSize is therefore never computed
+    # separately; it is the row count the SUM already walks.
+    if getattr(binding, "working_day_scaled", False):
+        per_row = _working_day_denominator(metric_key, binding)
+        if per_row is None:
+            return func.sum(expr)
+        numerator = binding.ratio_numerator if numerator is None else numerator
+        if not needs_rollup(level, binding):
+            # One advisor: teamSize is 1, so the denominator is the
+            # per-row constant itself.
+            return numerator / func.nullif(literal(per_row), 0)
+        return func.sum(numerator) / func.nullif(func.sum(literal(per_row)), 0)
+
     if not needs_rollup(level, binding):
         return expr
 

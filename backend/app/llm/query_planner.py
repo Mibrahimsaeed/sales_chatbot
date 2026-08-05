@@ -33,8 +33,8 @@ from dataclasses import dataclass, field as dataclass_field, replace
 from typing import Callable
 
 from app.llm import (
-    comparators, hierarchy, intent_catalog as cat, metric_intent, routing,
-    subject_level, token_match,
+    comparators, hierarchy, intent_catalog as cat, intent_precedence,
+    metric_intent, routing, subject_level, token_match,
 )
 from app.llm.metric_intent import MetricIntent
 from app.llm.metric_ontology import (
@@ -163,13 +163,51 @@ class _Intent:
         targets = self.all_group_entities()
         name = self.entities.get("advisor_name")
         wids = self.entities.get("advisor_wids") or []
+
+        # Phase 5B: SEVERAL named advisors are several sides of the
+        # comparison. The single-advisor branch below requires exactly one
+        # wid, so "compare Yasir Ali and Sana Tariq" — with both people
+        # resolved — produced ZERO targets and fell through to a
+        # leaderboard. Advisor-vs-advisor is the one shape every group
+        # level supported and the advisor level did not.
+        #
+        # Group targets take precedence when both are present: naming two
+        # people to reach two groups ("compare X's team with Y's team")
+        # is a comparison of the groups, which is what the _reference_
+        # sources check below encodes for the single-advisor case.
+        sources_all = self.entities.get("_reference_sources") or []
+        multi = self.entities.get("advisor_multi") or []
+        # A possessive relation makes the named people SOURCES, not
+        # subjects: "compare Waqar Haider's team with Sana Tariq's team"
+        # compares two teams. `_reference_sources` records that only once
+        # relation inference has actually bound the groups, so it is
+        # empty when RELATION_INFERENCE_ENABLED is off — and without this
+        # check the query silently became a comparison of the two PEOPLE,
+        # which is a different question with a confident answer.
+        # reference_parser owns the possessive pattern (Phase 1 used the
+        # same signal for the unresolved-subject gate).
+        from app.llm import reference_parser
+
+        names_a_relation = bool(reference_parser.parse(self.q))
+        if len(multi) >= 2 and not targets and not sources_all and not names_a_relation:
+            # advisor_multi is ordered as the names appear in the text.
+            return [("advisor", person["name"]) for person in multi]
+
+        names = self.entities.get("advisor_names") or []
+        if len(wids) >= 2 and not targets and not sources_all and not names_a_relation:
+            return [("advisor", value) for value in names]
         # A person named only to REACH a group is not one of the things
         # being compared: "compare X's team with Y's team" is about two
         # teams, and adding X would make it a three-way comparison of a
         # person against two groups. Entity extraction records which wids
         # were consumed that way.
         sources = self.entities.get("_reference_sources") or []
-        if name and len(wids) == 1 and wids[0] not in sources and not any(
+        # names_a_relation guards this branch too: with relation
+        # inference disabled, `sources` is empty even though the query
+        # said "X's team", and the person would become a comparison
+        # SUBJECT — turning a question about two teams into a question
+        # about two people, answered confidently.
+        if name and len(wids) == 1 and wids[0] not in sources and not names_a_relation and not any(
             level == "advisor" for level, _value in targets
         ):
             # The person leads: "how does X compare to his team" asks
@@ -322,11 +360,35 @@ def _score_comparison(ctx: _Intent) -> _Candidate | None:
     Outscores the leaderboard even when a metric is named, because
     "compare A and B by revenue" is a two-sided question and a ranking
     answers it with one list that drops the pairing."""
-    if not ctx.is_comparison:
-        return None
     # M6: includes the named advisor, so a person can be compared against
     # a group — see _Intent.comparison_targets().
     targets = ctx.comparison_targets()
+
+    # Phase 7: TWO GROUNDED SUBJECTS PLUS A MEASURE IS A COMPARISON,
+    # however it was phrased. This used to require a comparison PHRASE,
+    # so "Blue Area and Downtown revenue" proposed only a leaderboard,
+    # plan_to_ir kept one entity filter, and the reply answered about
+    # Blue Area with Downtown silently dropped — half the question, with
+    # no signal that half was missing.
+    #
+    # The subjects are the evidence. A phrase is one way to ask for a
+    # comparison; naming two things and a measure is another, and the
+    # audit's rule is that a grounded subject must participate in intent
+    # selection rather than being discarded by whatever else matched.
+    if not ctx.is_comparison:
+        if len(targets) < 2 or not ctx.metric:
+            return None
+        return _Candidate(
+            intent="comparison",
+            score=cat.PRIOR["comparison"] + cat.W_ENTITY,
+            evidence=[f"targets:{len(targets)}", f"metric:{ctx.metric}",
+                      "no_comparison_phrase"],
+            build=lambda: QueryPlan(
+                action="comparison", metric=ctx.metric,
+                comparison_targets=targets,
+                level=targets[0][0], entity_value=targets[0][1],
+            ),
+        )
 
     if len(targets) == 1:
         # A comparison was clearly asked for but only ONE side grounded —
@@ -561,10 +623,21 @@ def _score_advisor_metric(ctx: _Intent) -> _Candidate | None:
     """
     if not ctx.entities.get("advisor_name") or not ctx.metric:
         return None
-    # A ranking, a comparison or a reverse-role question is a different
-    # question that happens to mention a metric — each has its own
-    # intent, and none of them wants one person's single number.
-    if ctx.has_ranking_strong or ctx.is_comparison or ctx.is_reverse or ctx.is_relational:
+    # Phase 7 removed the ranking/comparison suppression here.
+    #
+    # This used to `return None` whenever a ranking word, a comparison
+    # phrase, a reverse role or a relation appeared — a SCORER declining
+    # on a RIVAL intent's evidence. "Top revenue for Omar Farooq" then
+    # produced exactly one candidate, so the ranking was never a contest
+    # and the reply named a different advisor entirely. A candidate that
+    # is never proposed cannot lose, and cannot be explained.
+    #
+    # Proposing is now unconditional on rival evidence;
+    # intent_precedence.PRECEDENCE decides who wins, in one table. The
+    # relation/reverse cases stay excluded THERE (they are genuinely
+    # different questions about a person, not a measure of them), so no
+    # behaviour is conceded — only the place the decision is made moves.
+    if ctx.is_reverse or ctx.is_relational:
         return None
     # A GROUP was named too ("the connects of zonal head Salman Arshad and
     # his team"), so the question is about that group's people, not about
@@ -590,6 +663,57 @@ def _score_advisor_metric(ctx: _Intent) -> _Candidate | None:
     return _Candidate(
         intent="advisor_metric", score=score, evidence=evidence,
         build=lambda: _advisor_plan(ctx.entities, action="advisor_metric", metric=metric),
+    )
+
+
+def _score_group_metric(ctx: _Intent) -> _Candidate | None:
+    """"Blue Area revenue" — one group's own figure for one measure.
+
+    Phase 7 made this a first-class intent. It had none: `advisor_metric`
+    expressed "one measure, one person" and nothing expressed "one
+    measure, one GROUP", so every such query was proposed only as a
+    leaderboard. The ANSWERS were right — Phase 1 gave the group the
+    subject level and Phase 3 rendered one row as a metric value — but
+    they were right by downstream compensation, which means a change to
+    either silently returns the member list the audit found originally.
+
+    Proposes whenever a group and a measure are both present. Whether it
+    WINS is intent_precedence's decision: a ranking word or an explicit
+    inner level word means the query wants what is inside the group, and
+    the table sends those to the leaderboard.
+    """
+    group = ctx.group_entity()
+    if group is None or not ctx.metric:
+        return None
+    if ctx.entities.get("advisor_name"):
+        return None  # a person was named too — not this group's own figure
+
+    level, value = group
+    if not is_answerable(ctx.metric, level):
+        return None
+
+    score = cat.PRIOR["leaderboard"] + cat.W_SPECIFIC_CONSTRAINT + cat.W_ENTITY
+    evidence = [f"group_entity:{level}", f"metric:{ctx.metric}"]
+    metric = ctx.metric
+    return _Candidate(
+        intent="group_metric", score=score, evidence=evidence,
+        # Built as a leaderboard scoped to the group: one row, the
+        # group's own figure. The PLAN shape is deliberately unchanged —
+        # this phase makes the intent explicit, it does not rebuild the
+        # execution path that already produces the right number.
+        build=lambda: QueryPlan(
+            # A first-class ACTION, so "which intent won" is answerable
+            # from the plan rather than inferred from a leaderboard that
+            # happens to return one row. The execution shape is
+            # deliberately identical — plan_to_ir builds the same scoped
+            # QueryIR, and the response planner still renders one row as
+            # a metric value. This phase makes the classification
+            # explicit; it does not rebuild a path that already produces
+            # the right number.
+            action="group_metric", level=level, entity_value=value, metric=metric,
+            limit=ctx.entities.get("limit", 10),
+            ascending=_sort_signal(ctx.q, metric),
+        ),
     )
 
 
@@ -864,6 +988,7 @@ _SCORERS: tuple[Callable[[_Intent], _Candidate | None], ...] = (
     # today (metric evidence always separates them) declaration order
     # would still favour the more specific reading.
     _score_advisor_metric,
+    _score_group_metric,
     _score_advisor_profile,
     _score_entity_summary,
     _score_leaderboard,
@@ -956,11 +1081,53 @@ def build_query_plan(text: str, entities: dict) -> QueryPlan:
     if not candidates:
         return _carry_extracted_constraints(_fallback(ctx), entities)
 
-    winner = candidates[0]
+    # Phase 7: PROPOSE then RANK. The scorers above only propose; which
+    # one wins is intent_precedence's decision, from the evidence the
+    # query actually contains. Score order is what it falls back to when
+    # no precedence rule applies, so every intent the table does not
+    # mention behaves exactly as it did before.
+    ranking = intent_precedence.rank(candidates, _evidence_for(ctx))
+    winner = ranking.winner
+
     plan = winner.build()
     plan.intent_score = round(winner.score, 3)
     plan.intent_evidence = list(winner.evidence)
-    if len(candidates) > 1:
-        runner = candidates[1]
-        plan.runner_up = f"{runner.intent}:{runner.score:.2f}"
+    if ranking.rejected:
+        plan.runner_up = ranking.rejected[0][0]
+    routing.decide("Intent", winner.intent, ranking.trace())
     return _carry_extracted_constraints(plan, entities)
+
+
+def _evidence_for(ctx: _Intent) -> "intent_precedence.Evidence":
+    """The query's facts, read from the components that already own them.
+
+    Nothing is re-derived here: subjects come from entity extraction,
+    the measure from metric_intent, the phrases from intent_catalog. The
+    Phase 6 audit's finding was that these facts existed and were never
+    consulted when choosing an intent — this is the consultation.
+    """
+    group = ctx.group_entity()
+    groups = len(ctx.all_group_entities())
+
+    # AMBIGUITY IS NOT MULTIPLICITY. One reference matching several people
+    # ("Advisor 20" against a roster of "Advisor 1..40") is not the user
+    # naming several subjects — it is one subject we cannot pin down, and
+    # clarify_person owns that. Counting it as a named advisor let a
+    # spurious grounding promote advisor_metric over a legitimate
+    # leaderboard for "top 20 advisors by connects".
+    advisors = len(ctx.entities.get("advisor_multi") or []) or (
+        1 if ctx.entities.get("advisor_name") else 0
+    )
+    return intent_precedence.Evidence(
+        named_advisors=advisors,
+        named_groups=groups,
+        metric=ctx.metric is not None,
+        ranking_phrase=ctx.has_ranking_strong,
+        comparison_phrase=ctx.is_comparison,
+        roster_phrase=ctx.is_roster,
+        relation_phrase=ctx.is_relational,
+        reverse_phrase=ctx.is_reverse,
+        level_word=cat.detect_level(ctx.level_q),
+        group_level=group[0] if group else None,
+        ambiguous_subject=bool(ctx.entities.get("advisor_ambiguous")),
+    )

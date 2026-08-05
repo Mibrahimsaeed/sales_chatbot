@@ -327,6 +327,33 @@ def merge(prior, current, spec: TurnSpec, decision: Ellipsis) -> MergeResult:
              + ", which corrects the previous scope at that level")
         )
 
+    # ---- comparison subjects ----------------------------------------
+    # A comparison's sides live in `subjects`, not in filters. Phase 5B
+    # put comparison on the IR path, and without this a follow-up that
+    # names a new measure ("what about overdue?") inherited the metric
+    # rules above and then dropped both sides, degrading a two-sided
+    # question into a ranking of everything.
+    #
+    # Same ownership rule as every other field: this turn's subjects win
+    # when it named any, otherwise the previous turn's carry.
+    if getattr(current, "subjects", None):
+        result.overridden.append(
+            ("subjects", "this turn named its own subjects to compare")
+        )
+    elif getattr(prior, "subjects", None):
+        current.subjects = [s.model_copy(deep=True) for s in prior.subjects]
+        if current.intent != "comparison":
+            current.intent = prior.intent
+            result.inherited.append(
+                ("intent", "the previous turn was a comparison and this turn "
+                           "named no new subjects, so it stays one")
+            )
+        result.inherited.append(
+            ("subjects",
+             "this turn named no subjects, so the previous comparison's sides ("
+             + ", ".join(s.value for s in prior.subjects) + ") carry forward")
+        )
+
     # ---- limit ------------------------------------------------------
     if spec.limit:
         result.overridden.append(("limit", "this turn stated how many rows it wants"))

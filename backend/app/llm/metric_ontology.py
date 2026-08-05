@@ -103,6 +103,14 @@ class ColumnBinding:
     # multiplies the denominator by the row count. Declaring the join here
     # keeps the requirement with the binding that creates it.
     join_models: tuple = ()
+    # The denominator is `teamSize x daily_target_rate x workingDays`
+    # rather than a stored column (CR %, Connect %, Meeting %). Set here
+    # rather than inferred, because only the binding knows whether its
+    # denominator is data or a target. aggregation.value_expression
+    # builds the scaled denominator; the per-day figure stays declared on
+    # MetricDef.daily_target_rate and the working days come from
+    # working_days.for_period.
+    working_day_scaled: bool = False
 
 
 
@@ -256,6 +264,16 @@ class MetricDef:
     # working-day scaling Phase 5 introduces has a single place to read
     # it from. None means no daily target is defined.
     daily_target_rate: Optional[float] = None
+    # The metric that completes this one's story, when a count and a rate
+    # are two readings of the same question. "How many CRs?" and "what is
+    # the CR rate?" are both about client registrations, and a reply
+    # giving only one of them leaves the obvious follow-up unasked.
+    #
+    # Declared here, on the metric, because which measures pair up is a
+    # property of the BUSINESS, not of the response layer — and computed
+    # by the aggregation engine like any other value, never re-derived by
+    # a formatter. Symmetric by convention: if A names B, B names A.
+    companion: Optional[str] = None
 
 
 _ONE_UNIT_BINDING = ColumnBinding(
@@ -440,6 +458,7 @@ METRICS: dict[str, MetricDef] = {
     # "revenue" and a refusal.
     "client_registrations": MetricDef(
         key="client_registrations",
+        companion="cr_rate",
         # Period family — the YTD sibling below answers the same measure
         # at year-to-date, so resolve_metric_for_period can swap them.
         period_family="client_registrations",
@@ -773,6 +792,153 @@ METRICS: dict[str, MetricDef] = {
         },
     ),
 
+    # ---- WORKING-DAY SCALED RATES ----------------------------------
+    # The spec measures these three against a target rather than against
+    # stored data:
+    #
+    #     CR %      = CR            / (teamSize x 2   x workingDays) x 100
+    #     Connect % = AnsweredCalls / (teamSize x 10  x workingDays) x 100
+    #     Meeting % = Meetings      / (teamSize x 0.6 x workingDays) x 100
+    #
+    # All three shipped in metric_aliases.UNAVAILABLE — declared, refused
+    # with a written reason, and answered with the underlying COUNT —
+    # because `workingDays` had no source. working_days.py is now that
+    # source, so the rates are computable and the refusals are gone.
+    #
+    # Each declares only what it owns: the numerator column, the per-
+    # advisor-per-day target, and the period. teamSize is never named
+    # here — aggregation.value_expression sums a per-row constant, so the
+    # row count IS the team size, and no metric has to know how a group
+    # is counted.
+    "cr_rate": MetricDef(
+        key="cr_rate",
+        label="CR % (MTD)",
+        companion="client_registrations",
+        # A period FAMILY, so query_compiler._effective_metric() can swap
+        # this for its year-to-date sibling. Without one, "CR % year to
+        # date" found no member for YTD and refused — while ytd_cr sat in
+        # the table with the data. The count metric has had a family
+        # since it was written; the rate simply never joined one.
+        period_family="cr_rate",
+        thresholds=DEFAULT_THRESHOLDS,
+        rollup=Rollup.RATIO,
+        daily_target_rate=2.0,
+        entity_levels=["advisor", "team"],
+        primary_level="team",
+        bindings={
+            "advisor": ColumnBinding(
+                model=SalesFunnel,
+                expr=SalesFunnel.mtd_cr * 100.0,
+                ratio_numerator=SalesFunnel.mtd_cr * 100.0,
+                working_day_scaled=True,
+            ),
+            # aggregation.binding_for() rolls the ADVISOR binding up for
+            # any group level, so this exists to satisfy the declared
+            # entity_levels — deliberately the SAME expression, because a
+            # second divergent one is how a percentage came to have two
+            # answers before the engine was unified.
+            "team": ColumnBinding(
+                model=SalesFunnel,
+                expr=SalesFunnel.mtd_cr * 100.0,
+                ratio_numerator=SalesFunnel.mtd_cr * 100.0,
+                working_day_scaled=True,
+            ),
+        },
+    ),
+
+    # The YTD sibling. Declared here rather than in _YTD_SPECS because
+    # that table generates COUNTS — additive columns with no denominator
+    # — and this is a working-day scaled RATE. Same period_family, so
+    # _effective_metric swaps them; same daily target and the same
+    # working_day_scaled flag, so aggregation computes it identically and
+    # working_days.for_period returns the YEAR's working days off this
+    # metric's own declared period.
+    "ytd_cr_rate": MetricDef(
+        key="ytd_cr_rate",
+        label="CR % (YTD)",
+        companion="ytd_client_registrations",
+        thresholds=DEFAULT_THRESHOLDS,
+        rollup=Rollup.RATIO,
+        daily_target_rate=2.0,
+        period=PerformancePeriod.YTD,
+        period_family="cr_rate",
+        entity_levels=["advisor", "team"],
+        primary_level="team",
+        bindings={
+            "advisor": ColumnBinding(
+                model=SalesFunnel,
+                expr=SalesFunnel.ytd_cr * 100.0,
+                ratio_numerator=SalesFunnel.ytd_cr * 100.0,
+                working_day_scaled=True,
+            ),
+            "team": ColumnBinding(
+                model=SalesFunnel,
+                expr=SalesFunnel.ytd_cr * 100.0,
+                ratio_numerator=SalesFunnel.ytd_cr * 100.0,
+                working_day_scaled=True,
+            ),
+        },
+    ),
+
+    "answered_calls_rate": MetricDef(
+        key="answered_calls_rate",
+        label="Answered Calls % (MTD)",
+        thresholds=DEFAULT_THRESHOLDS,
+        rollup=Rollup.RATIO,
+        daily_target_rate=10.0,
+        entity_levels=["advisor", "team"],
+        primary_level="team",
+        bindings={
+            "advisor": ColumnBinding(
+                model=Calls,
+                expr=Calls.answered_calls_mtd * 100.0,
+                ratio_numerator=Calls.answered_calls_mtd * 100.0,
+                working_day_scaled=True,
+            ),
+            # aggregation.binding_for() rolls the ADVISOR binding up for
+            # any group level, so this exists to satisfy the declared
+            # entity_levels — deliberately the SAME expression, because a
+            # second divergent one is how a percentage came to have two
+            # answers before the engine was unified.
+            "team": ColumnBinding(
+                model=Calls,
+                expr=Calls.answered_calls_mtd * 100.0,
+                ratio_numerator=Calls.answered_calls_mtd * 100.0,
+                working_day_scaled=True,
+            ),
+        },
+    ),
+
+    "meeting_rate": MetricDef(
+        key="meeting_rate",
+        label="Meeting % (MTD)",
+        thresholds=DEFAULT_THRESHOLDS,
+        rollup=Rollup.RATIO,
+        daily_target_rate=0.6,
+        entity_levels=["advisor", "team"],
+        primary_level="team",
+        bindings={
+            "advisor": ColumnBinding(
+                model=SalesFunnel,
+                expr=(SalesFunnel.mtd_new_meeting + SalesFunnel.mtd_followup_meeting) * 100.0,
+                ratio_numerator=(
+                    SalesFunnel.mtd_new_meeting + SalesFunnel.mtd_followup_meeting
+                ) * 100.0,
+                working_day_scaled=True,
+            ),
+            # See the note on cr_rate's team binding: same shape, rolled
+            # up by the engine rather than computed differently here.
+            "team": ColumnBinding(
+                model=SalesFunnel,
+                expr=(SalesFunnel.mtd_new_meeting + SalesFunnel.mtd_followup_meeting) * 100.0,
+                ratio_numerator=(
+                    SalesFunnel.mtd_new_meeting + SalesFunnel.mtd_followup_meeting
+                ) * 100.0,
+                working_day_scaled=True,
+            ),
+        },
+    ),
+
     "attendance_rate": MetricDef(
         key="attendance_rate",
         label="Attendance Rate % (MTD)",
@@ -871,6 +1037,18 @@ for _key, _label, _family, _model, _expr, _thresholds, _lower_better in _YTD_SPE
 # field (five modules read `metric.synonyms`) but no longer owns it —
 # which is what let "answered calls %" and "answered calls" sit in
 # separate lists nobody compared.
+# The YTD count is generated by _YTD_SPECS, which carries no companion
+# column — set here rather than widening that table for one entry.
+METRICS["ytd_client_registrations"].companion = "ytd_cr_rate"
+
+# Symmetry is the contract: a one-way pairing renders the companion on
+# one phrasing of a question and not on its mirror.
+for _a, _b in [(k, m.companion) for k, m in METRICS.items() if m.companion]:
+    assert METRICS[_b].companion == _a, (  # pragma: no cover - declaration error
+        f"{_a} names {_b} as its companion but {_b} names "
+        f"{METRICS[_b].companion!r}"
+    )
+
 for _key, _metric in METRICS.items():
     _metric.synonyms = metric_aliases.phrases_for(_key)
 

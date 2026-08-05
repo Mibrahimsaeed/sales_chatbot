@@ -272,7 +272,9 @@ def test_an_unsupported_answer_is_not_a_clarification(org):
 
 
 def test_a_clarification_is_still_a_clarification(org):
-    r = handle_chat_message(org, "What is Downtown's CR %?", session_id=None)
+    # portfolio %: CR % is a computable rate since working_days.py, so
+    # it can no longer stand in for "a clarification".
+    r = handle_chat_message(org, "What is Downtown's portfolio %?", session_id=None)
     assert r["type"] == "clarification"
 
 

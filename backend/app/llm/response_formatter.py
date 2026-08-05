@@ -470,7 +470,8 @@ def format_ir_leaderboard_reply(
 
 
 def format_ir_single_value_reply(
-    ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1, paginated: bool = False
+    ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1,
+    paginated: bool = False, companion: tuple | None = None
 ) -> str:
     """One subject's figure, stated as a sentence.
 
@@ -499,7 +500,39 @@ def format_ir_single_value_reply(
     row = rows[0]
     metric_key = effective_metric(ir)
     value = format_metric_value(metric_key, row.get("value", 0))
-    return f"{row['name']} has {value} {_metric_label(metric_key)}."
+
+    # The narrowing the query applied, stated. Every other IR formatter
+    # includes _filters_summary; this one omitted it, so a follow-up that
+    # narrowed the scope read as if it had been ignored:
+    #
+    #   "Show Downtown pipeline"  -> "Downtown has 6,500 MTD Open Pipeline."
+    #   "Now only Graana"         -> "Downtown has 6,500 MTD Open Pipeline."
+    #
+    # Both filters WERE applied (team=Downtown AND company=Graana, and
+    # Downtown is entirely Graana, so the figure is genuinely unchanged) —
+    # but an identical sentence is indistinguishable from a dropped
+    # filter, which is the failure this reads as. The subject's own scope
+    # filter is skipped: naming it twice ("Downtown has ... filtered by
+    # team = Downtown") is noise, not information.
+    scope = [f for f in ir.filters if f.value != row.get("name")]
+    suffix = ""
+    if scope:
+        suffix = _filters_summary(ir.model_copy(update={"filters": scope}))
+
+    # The paired measure, when the ontology declares one and the caller
+    # fetched it. "How many CRs?" and "what is the CR rate?" are two
+    # readings of one question, and answering only one leaves the obvious
+    # follow-up unasked. The value arrives computed — this renders it.
+    if companion is not None:
+        companion_key, companion_value = companion
+        if companion_value is not None:
+            rendered = format_metric_value(companion_key, companion_value)
+            # No article: the pair renders in both directions, and "a"
+            # reads wrong before a count ("with a 20 Client
+            # Registrations") even though it reads right before a rate.
+            return (f"{row['name']} has {value} {_metric_label(metric_key)}, "
+                    f"with {rendered} {_metric_label(companion_key)}{suffix}.")
+    return f"{row['name']} has {value} {_metric_label(metric_key)}{suffix}."
 
 
 def format_ir_comparison_reply(
@@ -566,7 +599,7 @@ _SHAPE_FORMATTERS = {
 
 def format_ir_reply(
     ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1,
-    paginated: bool = False, plan=None
+    paginated: bool = False, plan=None, companion: tuple | None = None
 ) -> str:
     """Render the response the planner chose.
 
@@ -584,7 +617,11 @@ def format_ir_reply(
         formatter = _FORMATTER_BY_INTENT.get(ir.intent, format_ir_leaderboard_reply)
     else:
         formatter = _SHAPE_FORMATTERS.get(plan.shape, format_ir_leaderboard_reply)
-    return formatter(ir, rows, total_count=total_count, start_index=start_index, paginated=paginated)
+    kwargs = {}
+    if companion is not None and formatter is format_ir_single_value_reply:
+        kwargs["companion"] = companion
+    return formatter(ir, rows, total_count=total_count, start_index=start_index,
+                     paginated=paginated, **kwargs)
 
 
 def format_group_manager_reply(result: dict) -> str:

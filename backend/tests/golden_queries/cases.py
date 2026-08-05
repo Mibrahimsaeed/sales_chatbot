@@ -111,8 +111,9 @@ LEADERBOARDS = [
          {"intent": "leaderboard", "metric": "mtd_cleared", "limit": 5}),
     Case("top advisors by widget velocity",
          {"intent": "clarify_metric", "metric": None}),
+    # RETIRED REFUSAL — working_days.py made the rate computable.
     Case("which team has the highest CR %",
-         {"intent": "clarify_metric", "metric": None}),
+         {"intent": "leaderboard", "metric": "cr_rate"}),
 ]
 
 
@@ -215,12 +216,19 @@ KPI_QUESTIONS = [
     # A CORRECT refusal, not a gap: the answered-call rate needs a
     # working-day calendar. Pinned so it cannot silently become the
     # underlying count again.
+    # RETIRED REFUSALS. These three were pinned as clarifications for
+    # want of a working-day calendar; working_days.py is that calendar.
+    # Still pinned, and for the original reason: a RATE must never
+    # silently become the COUNT inside it.
+    # `intent` here is the IR's, and a group_metric PLAN compiles to a
+    # leaderboard IR scoped to the one group (Phase 7) — one row, which
+    # the response planner then renders as a metric value.
     Case("what is the answered calls percentage for Blue Area",
-         {"intent": "clarify_metric", "metric": None}),
+         {"intent": "leaderboard", "metric": "answered_calls_rate"}),
     Case("what is the CR rate for Downtown",
-         {"intent": "clarify_metric", "metric": None}),
+         {"intent": "leaderboard", "metric": "cr_rate"}),
     Case("what is the meeting rate for Blue Area",
-         {"intent": "clarify_metric", "metric": None}),
+         {"intent": "leaderboard", "metric": "meeting_rate"}),
     # RETIRED REFUSAL — the ETL now imports the "1 Unit" tab, so this
     # answers instead of explaining why it cannot.
     Case("what is the 1 unit ratio",
@@ -557,13 +565,18 @@ KPI_TERMINOLOGY = [
     Case("top advisors by target", {"intent": "leaderboard", "metric": "mtd_target"}),
     Case("top advisors by meetings", {"intent": "leaderboard", "metric": "total_meetings"}),
     # A RATE must never resolve to the COUNT inside it.
-    Case("top advisors by CR %", {"intent": "clarify_metric", "metric": None}, finding="F13"),
-    Case("top advisors by CR%", {"intent": "clarify_metric", "metric": None}, finding="F13"),
+    # RETIRED REFUSALS — computable since working_days.py. F13's point
+    # holds and is still what these assert: the rate, never the count.
+    Case("top advisors by CR %",
+         {"intent": "leaderboard", "metric": "cr_rate"}, finding="F13"),
+    Case("top advisors by CR%",
+         {"intent": "leaderboard", "metric": "cr_rate"}, finding="F13"),
     Case("top advisors by answered calls %",
-         {"intent": "clarify_metric", "metric": None}, finding="F13"),
+         {"intent": "leaderboard", "metric": "answered_calls_rate"}, finding="F13"),
     Case("top advisors by answered call percent",
-         {"intent": "clarify_metric", "metric": None}, finding="F13"),
-    Case("top teams by meeting rate", {"intent": "clarify_metric", "metric": None}),
+         {"intent": "leaderboard", "metric": "answered_calls_rate"}, finding="F13"),
+    Case("top teams by meeting rate",
+         {"intent": "leaderboard", "metric": "meeting_rate"}),
     Case("top teams by 1 unit ratio",
          {"intent": "leaderboard", "metric": "one_unit_ratio", "level": "team"}),
     Case("top advisors by worksapp login",
@@ -661,8 +674,11 @@ NEGATIVE = [
     # F1 — "late" inside unrelated words. attendance_filter scores 0.98
     # and returns before the parser runs, so a collision hijacks the
     # whole query.
+    # RETIRED REFUSAL. F1's point was that a shortcut must not hijack
+    # this phrasing; the measure now resolves, so the metric is what it
+    # names rather than a refusal.
     Case("how is the answered calls percentage calculated",
-         {"intent": "clarify_metric", "metric": None}, finding="F1"),
+         {"intent": "leaderboard", "metric": "answered_calls_rate"}, finding="F1"),
     Case("show me related teams", {"intent": "clarify", "metric": None}, finding="F1"),
     Case("escalate to the manager", {"intent": "clarify", "metric": None}, finding="F1"),
     Case("please translate this reply", {"intent": "clarify", "metric": None}, finding="F1"),

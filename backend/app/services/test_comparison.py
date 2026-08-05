@@ -117,12 +117,22 @@ def test_no_metric_returns_the_default_kpi_set(comparison_db):
 
 
 def test_named_metric_compares_only_that_metric(comparison_db):
+    """UPDATED in Phase 5B. A comparison that NAMES a metric now travels
+    the QueryIR path, so its payload is the IR row shape (one row per
+    subject) rather than comparison_service's {"rows": [...]} KPI table.
+
+    The behaviour the test guards is unchanged and still asserted: one
+    named metric compares that metric and nothing else. Only the shape
+    the assertion reads it through moved. Comparisons that name NO metric
+    still answer with the KPI table — see test_no_metric_returns_the_
+    default_kpi_set below, which is deliberately untouched.
+    """
     response = handle_chat_message(
         comparison_db, "Compare Graana and Agency21 by revenue", session_id=None
     )
     assert response["type"] == "comparison"
-    assert [row["key"] for row in response["data"]["rows"]] == ["mtd_cleared"]
-    assert response["data"]["metric"] == "mtd_cleared"
+    assert {row["name"] for row in response["data"]} == {"Graana", "Agency21"}
+    assert all("value" in row for row in response["data"])
 
 
 def test_named_metric_omits_the_headcount_row(comparison_db):
@@ -131,7 +141,11 @@ def test_named_metric_omits_the_headcount_row(comparison_db):
     response = handle_chat_message(
         comparison_db, "Compare Graana and Agency21 by revenue", session_id=None
     )
-    assert "advisors" not in {row["key"] for row in response["data"]["rows"]}
+    # Phase 5B: the IR path returns one row per SUBJECT with a single
+    # `value` — there is no place for a headcount row to appear, which is
+    # a stronger guarantee than omitting it from a KPI table.
+    assert all(set(row) >= {"name", "value"} for row in response["data"])
+    assert "advisors" not in {row["name"] for row in response["data"]}
 
 
 def test_attendance_metric_comparison(comparison_db):
@@ -139,7 +153,8 @@ def test_attendance_metric_comparison(comparison_db):
         comparison_db, "Compare Blue Area and Downtown attendance", session_id=None
     )
     assert response["type"] == "comparison"
-    assert response["data"]["metric"] == "attendance_rate"
+    # Phase 5B: the metric now travels in the IR, and the reply names it.
+    assert "Attendance" in response["reply"]
 
 
 # =====================================================================

@@ -229,3 +229,50 @@ Production readiness
 Before this audit: not ready. Three crash paths were reachable from "what is X's connect to cr", "top advisors by attendance rate" and "what is X's 1 unit ratio" — all plain phrasings, all HTTP 500s.
 
 Now: ready for a monitored rollout, with two caveats. The remaining failure modes are honest refusals (working-day KPIs, daily, custom ranges) rather than wrong answers — with the one exception of D7, which is the highest-value next fix. And the 3 long-standing suite failures have been red across every phase; I'd want those understood before calling the baseline green.
+
+hehehehhehe
+
+
+
+
+
+
+
+1–2. Audit: intent proposers and their suppression
+Scorer	Proposed	Suppressed on
+_score_advisor_metric	advisor_metric 0.80	rival evidence: ranking word, comparison phrase, reverse, relation ← P1
+_score_comparison	comparison 1.51	required a comparison phrase ← P2
+_score_roster	roster 0.95	ignored whether a measure was named ← P3
+(none)	group_metric	did not exist ← P4
+Scorers did two jobs — propose and suppress. "Top revenue for Omar Farooq" produced exactly one candidate, so the ranking was never a contest: a candidate that is never proposed cannot lose, and cannot be explained.
+
+3–5. Implemented
+New intent_precedence.py — Evidence (structured facts, read from the components that already own them), an explicit PRECEDENCE table, and rank().
+
+
+comparison     >  two or more grounded subjects with a measure
+advisor_metric >  one named person with a measure
+group_metric   >  one named group with a measure
+leaderboard    >  a measure with no subject, or a ranking inside one
+roster         >  "who is in X", no measure, no ranking
+profile        >  a named person with no measure
+The one asymmetry — a ranking word suppresses group_metric but not advisor_metric — is principled, not a special case: an advisor is a leaf (nothing inside to rank); a group contains members. That's the same reading subject_level.decide() already applies, asked rather than restated.
+
+group_metric is a first-class action, not an inferred one. Scorers now only propose; rank() decides; scores break ties within a tier. plan.action = "leaderboard" in the context-inheritance path is gone — it re-plans with the inherited measure so the planner stays the owner.
+
+6–7. Before vs after
+Before	After
+Phase 6 corpus	28/36 (78%)	36/36 (100%)
+P1 "Top revenue for Omar Farooq"	Yasir Ali's leaderboard	Omar Farooq's figure
+P2 "Blue Area and Downtown revenue"	Blue Area only	both compared
+P3 "advisors in Blue Area by revenue"	alphabetical roster	ranked leaderboard
+P4 "Blue Area revenue"	leaderboard (compensated downstream)	group_metric
+Comparison corpus	22/22	22/22
+Behavioral corpus	0 exceptions	0 exceptions
+Tests	2700	2745 (+45)
+8. Report
+Three of my own errors, caught by the suite. My first table promoted advisor_profile over reverse_hierarchy for every manager lookup — 155 failures. The table now governs only the subject/measure family; specialised intents keep their scored behaviour. My roster rule then demoted a 0.98 leaderboard because the metric was defaulted rather than named. And I conflated ambiguity with multiplicity — "top 20 advisors" matched the seeded person "Advisor 20", and counting that as a named subject beat a legitimate leaderboard; ambiguity is now its own evidence field, since treating it as absent wrongly triggers the no-subject rule.
+
+A closed capability gap. KNOWN_DIVERGENCES for "Attendance of Agency21" read "the shape that would actually answer it — ONE metric for ONE entity — doesn't exist yet in either planner." Phase 7 created it; the rule planner is now the more correct of the two, reversing the note. Recorded in place rather than deleted.
+
+Remaining debt: two post-selection intent writers survive and are legitimate — the pending-slot promotion (clarify → executable once the slot is filled) and conversation_context inheriting a prior comparison's intent. The metric-inheritance path now runs build_query_plan a second time, which trades Phase 4's one-run invariant for single ownership of intent; it fires only on subject-only follow-ups. QueryIR.intent still has no group_metric member — the classification is first-class at the planner, the IR still compiles it as a scoped leaderboard, and changing that means a schema and prompt change.

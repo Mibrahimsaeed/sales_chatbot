@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
+from app.llm.query_compiler import effective_metric
 from app.llm.query_ir import QueryIR
 
 # The KIND of answer, not the shape of the question. `empty` and the
@@ -132,6 +133,12 @@ class ResponsePlan:
     rejected: tuple[tuple[str, str], ...] = ()
     # Populated for `unsupported` — the registry's written explanation.
     reason: Optional[str] = None
+    # The metric whose value completes this answer, when the ontology
+    # pairs one (a count with its rate). Only ever set for a single
+    # subject: on a ranking the companion would need a value per row and
+    # the reply is already a list. The VALUE is fetched by the caller
+    # from the aggregation engine — this names it, it does not compute it.
+    companion_metric: Optional[str] = None
 
     def trace(self) -> str:
         parts = [f"{self.mode} ({self.why})"]
@@ -166,6 +173,37 @@ def respond(mode: str, reply, data=None, *, why: str = "", **extra) -> dict:
         )
     routing.decide("Response", mode, why or f"dispatched as {mode}")
     return {"type": DISPATCH_MODES[mode], "reply": reply, "data": data, **extra}
+
+
+def _companion_for(ir: QueryIR) -> Optional[str]:
+    """The paired metric, resolved to THIS query's period.
+
+    Both steps are delegated. The pairing comes from the ontology; the
+    period swap from query_compiler, which already owns "which sibling
+    answers this measure at this period".
+
+    Resolving the period is the whole point. The ontology names the MTD
+    member of each family, so taking it verbatim produced the one state
+    this must never reach: a YTD count reported beside an MTD rate, in a
+    single sentence, with both labelled. `effective_metric` is used for
+    the primary too, so the pair is always read off the metric that was
+    actually EXECUTED rather than the one the IR was built with.
+    """
+    from app.llm.metric_ontology import METRICS, metric_for_period
+
+    primary = effective_metric(ir)
+    metric = METRICS.get(primary) if primary else None
+    if metric is None or not metric.companion:
+        return None
+
+    period = ir.time_range.period if ir.time_range else None
+    if period is None:
+        return metric.companion
+    # None here means the companion has no member for this period — a
+    # YTD-only or DAILY-only gap. Reporting the MTD one anyway is the
+    # mismatch this function exists to prevent, so the companion is
+    # simply omitted and the primary answer stands alone.
+    return metric_for_period(metric.companion, period)
 
 
 def _capability_problem(ir: QueryIR) -> Optional[str]:
@@ -230,6 +268,7 @@ def plan_response(ir: QueryIR, rows: list[dict]) -> ResponsePlan:
         return ResponsePlan(
             shape="single_value", show_insights=False, show_explanation=False,
             mode="metric_value",
+            companion_metric=_companion_for(ir),
             why="the result is one subject's figure, not a ranking",
             rejected=(("leaderboard", "a ranking needs more than one subject to rank"),),
         )

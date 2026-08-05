@@ -57,12 +57,19 @@ def test_longest_span_first_is_preserved():
 
 
 def test_non_name_words_still_survive_as_candidate_spans():
-    """A span is NOT a claim that a person was named. Only "advisor" and
-    the digit are dropped here; "top" and "revenue" are not stopwords and
-    come through as candidates. Nothing is wrong with that — the 0.90
-    PERSON_FLOOR is what rejects them downstream, not this function. Any
-    M1 work reading spans must not mistake a span for a person."""
-    assert extract_name_spans("top 5 advisors by revenue") == ["top", "revenue"]
+    """A span is NOT a claim that a person was named. "top" is not a
+    stopword and comes through as a candidate; the 0.90 PERSON_FLOOR is
+    what rejects it downstream, not this function. Any M1 work reading
+    spans must not mistake a span for a person.
+
+    Phase 5B narrowed this: "revenue" used to survive too, and the
+    original docstring noted that as harmless. It was not entirely — a
+    measure word adjacent to a name glued to it ("sana tariq cleared"),
+    producing a span that resolves to nobody and losing a side of a
+    comparison. Metric words are now dropped, DERIVED from
+    metric_aliases so the list cannot drift from the registry.
+    """
+    assert extract_name_spans("top 5 advisors by revenue") == ["top"]
 
 
 def test_empty_text_yields_no_spans():

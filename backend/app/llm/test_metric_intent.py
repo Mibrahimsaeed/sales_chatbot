@@ -90,8 +90,11 @@ def test_top_advisors_by_cr_resolves_the_cr_metric(org):
     assert intent.key == "client_registrations"
     assert _plan("Top advisors by CR", org).metric == "client_registrations"
 
-    # The percentage form refuses rather than substituting the count.
-    assert _plan("Top advisors by CR%", org).action == "clarify_metric"
+    # The percentage form reaches the RATE. It refused for want of a
+    # working-day calendar until working_days.py supplied one; the
+    # guarantee this line has always carried is unchanged — a percentage
+    # question is never answered with the count inside it.
+    assert _plan("Top advisors by CR%", org).metric == "cr_rate"
 
 
 def test_top_advisors_by_an_unknown_metric_asks_instead_of_answering(org):
@@ -117,8 +120,10 @@ def test_highest_cr_percent_is_no_longer_highest_cleared(org):
     plan = _plan("Which BCM has the highest CR%", org)
     assert plan.metric != DEFAULT_RANKING_METRIC
     assert plan.metric != "client_registrations"
-    assert plan.action == "clarify_metric"
-    assert "working-day" in plan.reason
+    # It clarified, naming the missing working-day calendar, until
+    # working_days.py supplied one. Both exclusions above — not revenue,
+    # not the count — are what the test is named for and both still hold.
+    assert plan.metric == "cr_rate"
 
 
 def test_best_answered_call_rate_is_no_longer_highest_cleared(org):
@@ -128,14 +133,14 @@ def test_best_answered_call_rate_is_no_longer_highest_cleared(org):
     report flagged it explicitly: "Neither is a true rate."
 
     The alias registry supersedes that compromise. "answered-call rate"
-    is now DECLARED uncomputable (it needs a working-day calendar), so it
-    clarifies and names the missing ingredient instead of returning a
-    count under a percentage question."""
+    is now a real metric: it was DECLARED uncomputable for want of a
+    working-day calendar, and working_days.py is that calendar. The
+    phrase reaches the RATE rather than the count it was widened onto."""
     plan = _plan("Which team has best answered-call rate", org)
 
-    assert plan.action == "clarify_metric"
+    assert plan.metric == "answered_calls_rate"
     assert plan.metric != DEFAULT_RANKING_METRIC
-    assert "working-day" in plan.reason
+    assert plan.metric != "answered_calls"
 
 
 # ---------------------------------------------------------------------

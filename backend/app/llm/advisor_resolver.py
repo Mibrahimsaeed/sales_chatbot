@@ -281,10 +281,50 @@ _SPAN_STOPWORDS = frozenset({
     "advisor", "advisors", "agent", "agents", "company", "companies",
     "manager", "lead", "leads", "bm", "zm", "rm", "under", "works", "work",
     "member", "members", "people", "staff", "belongs", "belong",
+    # comparison vocabulary — Phase 5B. "and"/"or" were already here, but
+    # the verb and the connectives were not, so "compare yasir ali and
+    # sana tariq" produced the span "compare yasir ali" (which resolves
+    # to nobody) and "yasir ali vs omar farooq" produced ONE span
+    # spanning both people. A comparison therefore saw one side of a
+    # two-sided question. Like the hierarchy vocabulary above, none of
+    # these can be part of a person's name.
+    "compare", "compares", "compared", "comparing", "comparison",
+    "vs", "versus", "against", "between", "difference", "differences",
+    "more", "less", "fewer", "higher", "lower", "greater", "better",
+    "worse", "best", "worst", "than", "each", "other",
 })
 
 # A person name in this dataset is 1-5 tokens ("Umer Khatab Abbasi Abbasi").
 _MAX_SPAN_TOKENS = 5
+
+_metric_words_cache: frozenset[str] | None = None
+
+
+def _metric_words() -> frozenset[str]:
+    """Single-token metric vocabulary, DERIVED from the alias registry.
+
+    The stopword set above already carries a handful of measure words
+    ("performance", "stats"), but a hand-kept list drifts: "cleared" was
+    absent, so "compare Yasir Ali and Sana Tariq's cleared" produced the
+    span "sana tariq cleared", which resolves to nobody — and the
+    comparison saw one side of a two-sided question.
+
+    Reading metric_aliases means a measure added later is excluded here
+    for free. Only SINGLE tokens are taken: a multi-word alias cannot
+    glue itself to a name the way a bare noun does, and splitting on its
+    words would strip tokens that are fine inside a name ("new", "total").
+    """
+    global _metric_words_cache
+    if _metric_words_cache is None:
+        from app.llm.metric_aliases import ALIASES
+
+        _metric_words_cache = frozenset(
+            phrase.lower()
+            for phrases in ALIASES.values()
+            for phrase in phrases
+            if " " not in phrase and len(phrase) > 2
+        )
+    return _metric_words_cache
 _TOKEN_RE = re.compile(r"[A-Za-z0-9'\-\.]+")
 
 
@@ -308,7 +348,8 @@ def extract_name_spans(text: str) -> list[str]:
         token = raw.lower().rstrip(".")
         if token.endswith("'s"):
             token = token[:-2]
-        if not token or token in _SPAN_STOPWORDS or token.isdigit():
+        if (not token or token in _SPAN_STOPWORDS or token.isdigit()
+                or token in _metric_words()):
             if current:
                 spans.append(current)
                 current = []
@@ -423,6 +464,46 @@ def _person_scorer():
     from rapidfuzz import fuzz
 
     return lambda a, b: max(fuzz.ratio(a, b), fuzz.token_sort_ratio(a, b)) / 100.0
+
+
+def resolve_all_from_text(
+    text: str, db: Session, floor: float = PERSON_FLOOR
+) -> list[AdvisorIdentity]:
+    """EVERY distinct person named in `text`, in the order they appear.
+
+    Phase 5B. resolve_from_text() answers "who is this query ABOUT?" — a
+    single-identity question — and returns on the first unambiguous span
+    (see the RESOLVED short-circuit below). That is right for a lookup
+    and wrong for a comparison: "compare Yasir Ali and Sana Tariq"
+    resolved Sana Tariq, dropped Yasir Ali, and the planner then saw one
+    side of a two-sided question and asked which other name was meant.
+
+    Same two stages and the same tiers, without the short-circuit. Lives
+    here rather than in the planner because identity resolution has one
+    owner, and a second span-matcher would drift from this one's
+    stripping rules the first time either changed.
+
+    Returns [] when fewer than one person resolves; the caller decides
+    what too-few means. Ambiguous spans are deliberately skipped: "which
+    Ali Raza did you mean" is a question the comparison cannot answer for
+    the user, and picking one silently is the failure this whole
+    programme has been removing.
+    """
+    refresh_cache(db)
+    if not text or not _cache["identities"]:
+        return []
+
+    found: list[AdvisorIdentity] = []
+    seen: set[int] = set()
+    for span in extract_name_spans(text):
+        result = resolve_advisor(span, db, floor=floor)
+        if result.status != RESOLVED:
+            continue
+        identity = result.identity
+        if identity is not None and identity.wid not in seen:
+            seen.add(identity.wid)
+            found.append(identity)
+    return found
 
 
 def resolve_from_text(text: str, db: Session, floor: float = PERSON_FLOOR) -> AdvisorResolution:

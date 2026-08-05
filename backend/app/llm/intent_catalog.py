@@ -132,7 +132,28 @@ COMPARISON_RE = re.compile(
     r"|\bwhich\s+(?:of\s+)?(?:\w+\s+){0,3}?(?:one\s+)?(?:is|are)\s+(?:the\s+)?(?:better|worse)\b"
     r"|\bwho\s+(is|are)\s+(doing\s+)?better\b"
     r"|\bhow\s+do(es)?\s+.+\s+(compare|stack\s+up)\b"
-    r"|\b(better|worse)\s+(than|between)\b",
+    r"|\b(better|worse)\s+(than|between)\b"
+    # Phase 5B — the ENUMERATED superlative. "Who has more revenue, Blue
+    # Area or Downtown?" and "Which of BCM X's or BCM Y's groups has more
+    # conversions?" are two-sided questions, and routing them to the
+    # leaderboard answered with ONE subject's figure — whichever the
+    # extractor listed first, never compared against the other. That read
+    # as correct on the fixture only because its gazetteer order happened
+    # to match the metric order; inverting the data returned the loser.
+    #
+    # The distinction from the ranking above is the DISJUNCTION, not the
+    # comparative word. "Which team has the highest CR" ranks every team
+    # and stays a leaderboard; naming the alternatives with "or" is what
+    # makes it a comparison of those alternatives. Grounding is not
+    # checked here — _score_comparison already requires two resolved
+    # targets, so a stray "or" cannot manufacture a comparison.
+    # Either order: "who has MORE revenue, A OR B" and "which of A's OR
+    # B's groups has MORE conversions" are the same question, and spec
+    # query 67 is written the second way.
+    r"|\b(who|which)\b[^?]*\b(more|less|higher|lower|greater|better|worse|"
+    r"most|least|highest|lowest|best)\b[^?]*\bor\b"
+    r"|\b(who|which)\b[^?]*\bor\b[^?]*\b(more|less|higher|lower|greater|"
+    r"better|worse|most|least|highest|lowest|best)\b",
     re.I,
 )
 

@@ -262,9 +262,35 @@ def _apply_entity_filters(query, ir: QueryIR):
     attendance_status are handled by their own dedicated functions below
     and simply aren't in that mapping, so they're a no-op here."""
     for f in ir.filters:
-        column = hierarchy.column_for(f.field)
-        if column is not None:
-            query = query.filter(column.ilike(f"%{f.value}%"))
+        if hierarchy.column_for(f.field) is None:
+            continue
+        # Scope through hierarchy.scope_filter, which its own docstring
+        # calls "THE one definition of 'in scope'... so a query cannot
+        # scope one way in a leaderboard and another in a comparison".
+        # This function was the exception that made that untrue: it built
+        # its own predicate, `column.ilike(f"%{value}%")`, a SUBSTRING
+        # match where every other layer matches the whole name.
+        #
+        # With a team called "Blue Area" and a sibling "Blue Area North",
+        # "Blue Area revenue" compiled to
+        #     WHERE team LIKE '%Blue Area%' GROUP BY team
+        # which partitions into TWO groups. The ranking operators the
+        # group-metric compilation relies on being no-ops then stop being
+        # no-ops: ORDER BY sorts the two, and the reply answered
+        # "Blue Area North has 10,000 ... ranking 1st of 2 teams" for a
+        # question about Blue Area's 2,750.
+        #
+        # The IR says `operator="="`. Compiling an equality as containment
+        # was also a contract break between the IR and the compiler:
+        # _apply_subject_filter, ten lines below, already matches exactly
+        # via column.in_(names), which is why comparisons were unaffected.
+        #
+        # Filter values are canonical: entity extraction grounds them
+        # against the gazetteer before they ever reach a filter, so a
+        # partial name the user typed is already expanded here and needs
+        # no wildcard. scope_filter's ilike keeps the match
+        # case-insensitive.
+        query = query.filter(hierarchy.scope_filter(f.field, f.value))
     return query
 
 

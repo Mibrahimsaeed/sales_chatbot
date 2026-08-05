@@ -93,6 +93,19 @@ def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | N
         return None
 
 
+# Plan actions the rule planner can turn into a complete QueryIR.
+# Phase 5B added "comparison": it used to execute on the plan path
+# through comparison_service, and once that path was removed the fast
+# path below had to recognise it or every comparison degraded to
+# missing=["intent"]. Named once so the four checks that used to spell
+# out "leaderboard" cannot drift apart.
+# Phase 7 added "group_metric": a first-class classification for "one
+# group, one measure" that compiles to the same scoped QueryIR a
+# leaderboard would. Listed here so the fast path recognises it — without
+# this every group-metric query degraded to missing=["intent"].
+_IR_ACTIONS = ("leaderboard", "comparison", "group_metric")
+
+
 def _rule_based_ir(text: str, entities: dict, plan: QueryPlan) -> QueryIR | None:
     """The deterministic degrade target: the rule plan if it resolved to a
     leaderboard, else a widening attempt — fuzzy synonym match first
@@ -100,14 +113,14 @@ def _rule_based_ir(text: str, entities: dict, plan: QueryPlan) -> QueryIR | None
     for genuine paraphrases with no lexical overlap ("who's crushing it"
     for achievement_pct). None if nothing produces something answerable.
     """
-    if plan.action == "leaderboard":
+    if plan.action in _IR_ACTIONS:
         return plan_to_ir(plan, entities)
     if plan.action == "unresolved":
         widened = fuzzy_resolve_metric(text) or semantic_retrieval.retrieve_metric(text)
         if widened:
             widened_entities = {**entities, "metric": widened}
             widened_plan = build_query_plan(text, widened_entities)
-            if widened_plan.action == "leaderboard":
+            if widened_plan.action in _IR_ACTIONS:
                 log.info(f"Fallback reasoning resolved '{text}' via widened metric match: {widened}")
                 return plan_to_ir(widened_plan, widened_entities)
     return None
@@ -158,8 +171,17 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
     # ---- rules_first: pre-inversion behavior, kept as the rollback path ----
     compound = looks_compound(text, entities)
 
-    # 1. rule-based fast path (skips the LLM for the common case)
-    if plan.action == "leaderboard" and not compound:
+    # 1. rule-based fast path (skips the LLM for the common case).
+    #
+    # A comparison is exempt from the compound gate, as it was on the
+    # plan path (nlu_pipeline._COMPOUND_EXEMPT_ACTIONS). looks_compound()
+    # fires on the word "compare" itself AND on two entities at one
+    # level, so EVERY comparison looks compound — the gate exists because
+    # the rule planner once could not express multi-entity queries, which
+    # stopped being true when comparison_targets() started grounding both
+    # sides. Without the exemption every comparison would take an LLM
+    # round trip to arrive at the IR the rule planner already had.
+    if plan.action in _IR_ACTIONS and (plan.action == "comparison" or not compound):
         return _finish(plan_to_ir(plan, entities), db, session_id, used_llm=False)
 
     # 2. widen via fuzzy metric match before reaching for the LLM
@@ -173,7 +195,7 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
 
     # 4. fail-soft degrade
     if ir is None:
-        if plan.action != "leaderboard":
+        if plan.action not in _IR_ACTIONS:
             return ParseOutcome(ir=None, missing=["intent"], used_llm=False)
         ir = plan_to_ir(plan, entities)
 

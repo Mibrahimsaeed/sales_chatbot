@@ -24,7 +24,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app.database.models import Advisor
-from app.llm import advisor_resolver
+from app.llm import advisor_resolver, aggregation
 from app.llm.advisor_resolver import ResolvedAdvisor
 from app.llm.metric_ontology import METRICS
 
@@ -62,7 +62,21 @@ def get_advisor_metric(db: Session, wid: int, metric_key: str) -> float | None:
     if binding is None or binding.team_named:
         return None
 
-    query = db.query(binding.expr).select_from(Advisor)
+    # Through the aggregation engine's expression, not the raw binding
+    # column. For most metrics the two are identical — value_expression
+    # returns `binding.expr` unchanged at the advisor leaf, which is why
+    # reading the column directly worked for years.
+    #
+    # It stops being identical for a WORKING-DAY SCALED rate (CR %,
+    # Connect %, Meeting %). There the binding's `expr` is only the
+    # NUMERATOR: the denominator is `teamSize x perAdvisorPerDay x
+    # workingDays`, built at query time because workingDays is not a
+    # column. Reading `expr` here returned the numerator as if it were
+    # the value — 500 where the engine said 83.3 for the same advisor,
+    # the two-paths-disagree defect the aggregation engine exists to make
+    # impossible. Asking the engine keeps one calculation owner.
+    value_expr = aggregation.value_expression(binding, metric_key, "advisor")
+    query = db.query(value_expr).select_from(Advisor)
     # Advisor is the query root, so "joining" it is a no-op — a metric
     # whose column lives on the advisor row (1-Unit ownership) bound here
     # produced `FROM advisors, advisors` and an ambiguous-column error.

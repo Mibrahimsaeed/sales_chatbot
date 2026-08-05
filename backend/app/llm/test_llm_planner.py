@@ -311,17 +311,23 @@ KNOWN_DIVERGENCES = {
     # test_both_planners_agree_except_where_documented, which asserts
     # every query NOT in this dict reaches the same action on both paths.
 
-    # "Attendance of Agency21" — NEITHER planner is clearly right, and the
-    # divergence exposes a real capability gap rather than a planner bug:
-    #   rule-based -> leaderboard, ranking Agency21's advisors by
-    #                 attendance rate (answers "who has the best
-    #                 attendance", not "what is Agency21's attendance")
-    #   LLM        -> entity_summary, whose fixed KPI set doesn't
-    #                 currently include attendance at all
-    # The shape that would actually answer it — ONE metric for ONE entity
-    # — doesn't exist yet in either planner. Recorded here so the gap is
-    # visible rather than hidden behind whichever planner is enabled.
-    "Attendance of Agency21": ("summary", "leaderboard"),
+    # "Attendance of Agency21" — the capability gap this entry recorded is
+    # now CLOSED on the rule side, and the entry documents that rather
+    # than being deleted.
+    #
+    # It used to read: rule-based -> leaderboard, ranking Agency21's
+    # advisors by attendance rate (answering "who has the best
+    # attendance", not "what is Agency21's attendance"); LLM ->
+    # entity_summary, whose fixed KPI set excludes attendance. The note
+    # ended "the shape that would actually answer it — ONE metric for ONE
+    # entity — doesn't exist yet in either planner."
+    #
+    # Phase 7 created that shape: `group_metric` is a first-class intent,
+    # so the rule planner now answers with Agency21's OWN attendance
+    # figure. The LLM side still returns entity_summary, so the two still
+    # diverge — but the rule side is now the more correct one, which is
+    # the reverse of when this was written.
+    "Attendance of Agency21": ("summary", "group_metric"),
 }
 
 

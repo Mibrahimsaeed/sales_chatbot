@@ -542,6 +542,18 @@ def _source_resolution(reference, text: str, entities: dict, db: Session, named_
     if reference.kind == reference_parser.PRONOUN:
         # Exactly one named person, or the pronoun is ambiguous and we
         # must not choose.
+        #
+        # Phase 5B also consults advisor_multi. `advisor_wids` comes from
+        # single-identity resolution, which returns ONE person when it
+        # can resolve confidently — so "compare Waqar Haider and Sana
+        # Tariq to his team" left advisor_wids at length 1 and this gate
+        # bound "his" to whichever of the two it had picked. The gate was
+        # only ever passing because span extraction used to fail on
+        # "compare <name>"; once that was fixed the accidental protection
+        # went with it. Two named people make a pronoun ambiguous however
+        # many of them identity resolution settled on.
+        if len(entities.get("advisor_multi") or []) > 1:
+            return None
         if len(entities.get("advisor_wids") or []) != 1:
             return None
         return entities.get("advisor_resolution")
@@ -690,6 +702,19 @@ def extract_entities(text: str, db: Session) -> dict:
             entities["advisor_wid"] = resolution.wid
         elif resolution.is_ambiguous:
             entities["advisor_ambiguous"] = True
+
+    # Phase 5B: every DISTINCT person named, for the queries that are
+    # about more than one. `advisor_resolution` above answers "who is
+    # this about?" and collapses to a single identity, which is correct
+    # for a lookup and loses a side of a comparison. Recorded under its
+    # own key rather than widening advisor_wids, so nothing that reads
+    # the single-identity keys changes behaviour.
+    if len(entities.get("advisor_wids") or []) < 2:
+        multi = advisor_resolver.resolve_all_from_text(text, db)
+        if len(multi) > 1:
+            entities["advisor_multi"] = [
+                {"wid": i.wid, "name": i.name} for i in multi
+            ]
 
     ambiguous = _detect_ambiguous_entity(entities)
     if ambiguous:

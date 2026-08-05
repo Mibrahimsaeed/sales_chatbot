@@ -99,14 +99,43 @@ _RULE_BASED_ACTIONS = (
     # "roster" ("all advisors in X") is a plain filtered list off one
     # Advisor column — deterministic, nothing for the LLM to add.
     "roster",
-    # "comparison" is a COMPLETE deterministic parse: two grounded
-    # entities plus an explicit comparison phrase. It is also exempt from
-    # the looks_compound() gate below — that heuristic routes multi-entity
-    # queries to the LLM precisely BECAUSE the rule-based planner used to
-    # have no way to express them, which is no longer true.
+    # Phase 5B: "comparison" is CONDITIONAL — see _is_rule_based() below.
+    # A comparison that names a metric is now an ordinary comparison IR
+    # and inherits everything QueryIR owns. A comparison that names NONE
+    # stays here, because it answers with a multi-metric KPI table that
+    # the single-metric IR cannot express.
     "comparison",
+    # "comparison_incomplete" is a CLARIFICATION ("I could only find one
+    # side"), not a query — there is nothing for the compiler to run.
     "comparison_incomplete",
 )
+
+
+def _is_rule_based(plan: QueryPlan) -> bool:
+    """Does this plan stay on the deterministic plan path?
+
+    Phase 5B split comparison by whether it names a measure:
+
+      metric named  -> the IR path. It inherits _effective_metric (so
+                       "compare … year to date" executes YTD rather than
+                       resolving it and running MTD), conversation memory
+                       (so the next turn keeps both subjects),
+                       ir_validator and the response planner — all four
+                       of which the plan path bypassed.
+
+      no metric     -> comparison_service, which answers with a table of
+                       the default KPI SET. QueryIR carries one metric,
+                       so expressing that would mean multi-metric IR:
+                       a real extension, not a routing change, and out of
+                       scope here. Documented as remaining debt rather
+                       than silently dropped — a no-metric comparison is
+                       a useful answer, and losing it to reach "one
+                       pipeline" would be a regression sold as a
+                       refactor.
+    """
+    if plan.action == "comparison":
+        return plan.metric is None
+    return plan.action in _RULE_BASED_ACTIONS
 
 # Actions complete enough to serve directly even when looks_compound()
 # would otherwise send the query to the LLM.
@@ -591,8 +620,23 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             "this turn named a subject but no measure, and the previous turn "
             "supplies one — answered instead of re-asking",
         )
-        plan.action = "leaderboard"
-        plan.metric = prior_ir.metric.key
+        # Phase 7: RE-PLAN with the inherited measure rather than writing
+        # an action here. This used to set plan.action = "leaderboard"
+        # directly, which made the pipeline a second owner of intent —
+        # and hardcoded the wrong one: "now only IMARAT" after a pipeline
+        # question names ONE group and one (inherited) measure, which is
+        # group_metric, not a ranking. Handing the measure back to the
+        # planner lets the precedence table decide, so this path gets the
+        # same answer a user typing "IMARAT pipeline" would.
+        #
+        # This is the one place a second build_query_plan() runs, on a
+        # path that only fires for a subject-only follow-up. Re-planning
+        # is what keeps intent single-owned; the alternative was keeping
+        # a hardcoded action here forever.
+        plan = _plan(cleaned, {**entities, "metric": prior_ir.metric.key},
+                     db, session_id)
+        if plan.metric is None:
+            plan.metric = prior_ir.metric.key
 
     # A capability this system does not have. Distinct from a
     # clarification (there is nothing the user could add that would make
@@ -692,7 +736,7 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     # lookup/summary/attendance_filter stay on the simple rule-based path,
     # but only when the query doesn't look compound — "summary for Graana
     # AND Downtown" belongs to the semantic parser, not a single-entity plan.
-    if plan.action in _RULE_BASED_ACTIONS and (
+    if _is_rule_based(plan) and (
         plan.action in _COMPOUND_EXEMPT_ACTIONS
         or not semantic_parser.looks_compound(cleaned, entities)
     ):

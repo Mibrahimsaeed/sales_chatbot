@@ -2,7 +2,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.llm import conversation_memory, hierarchy, narrative, routing
+from app.llm import aggregation, conversation_memory, hierarchy, narrative, routing
 from app.llm.ir_validator import confidence_breakdown
 from app.llm.nlu_pipeline import resolve, Resolution
 from app.llm.metric_ontology import metric_for_period
@@ -476,8 +476,22 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
                            f"QueryIR path, intent={ir.intent!r} -> response mode "
                            f"{response_plan.mode!r} — compiled and executed "
                            "through query_compiler")
+    # The paired measure's value, when the planner named one. Fetched
+    # from the AGGREGATION ENGINE — the same owner every other value
+    # comes from — so the formatter renders a number rather than deriving
+    # one. Costs a second aggregate read, and only on a single-subject
+    # answer whose metric declares a companion.
+    companion = None
+    if response_plan.companion_metric and rows:
+        companion = (
+            response_plan.companion_metric,
+            aggregation.metric_value(db, ir.subject_level, rows[0].get("name"),
+                                     response_plan.companion_metric),
+        )
+
     reply = format_ir_reply(ir, rows, total_count=capped_total,
-                            paginated=has_more, plan=response_plan)
+                            paginated=has_more, plan=response_plan,
+                            companion=companion)
     insights: list[str] = []
     if rows:
         # Part 11: evidence-aware explanation — 100% deterministic (every

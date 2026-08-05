@@ -51,6 +51,19 @@ def fuzzy_resolve_metric(text: str, cutoff: float = _FUZZY_CUTOFF) -> str | None
     declared = metric_aliases.resolve(text)
     if declared is not None and not declared.available:
         return None
+    # An EXACT registry hit wins over the synonym scan below, for the
+    # same reason that scan short-circuits on its own exact hits: an
+    # exact match is a strong signal and widening past it can only make
+    # the answer worse.
+    #
+    # This became load-bearing when the working-day rates stopped being
+    # refusals. "cr %" now resolves exactly to cr_rate — but it also
+    # CONTAINS "cr", the client-registration count's synonym, so the scan
+    # would hand back the count for a percentage question: the precise
+    # substitution the refusal above was protecting against, arriving by
+    # a different route the moment the refusal was retired.
+    if declared is not None and declared.metric:
+        return declared.metric
 
     q = text.lower()
     synonym_to_key = {}

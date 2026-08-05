@@ -130,12 +130,37 @@ def test_group_scoped_rate_queries_still_reach_the_metric(org):
 # that resolves and one that does not. The defect was that only the
 # unresolved form produced the explanation — naming the person in full
 # downgraded the answer to a profile card.
+# Three entries left this list when working_days.py made CR %,
+# Connect % and Meeting % computable — a declared refusal is superseded
+# the moment its missing ingredient arrives. Portfolio % remains, and is
+# a DIFFERENT kind of refusal: it has no target to measure against at
+# all, so no data can retire it.
+#
+# P2 is unchanged by that. What it guarantees is that an unavailable
+# measure explains itself however the query is phrased, and the one
+# remaining entry exercises exactly that.
 UNAVAILABLE_QUERIES = [
-    ("connect %", "answered-call rate"),
-    ("CR %", "CR rate"),
-    ("meetings %", "meeting rate"),
     ("portfolio %", "no portfolio target"),
 ]
+
+# The retired refusals, kept as a pinned list: each must now reach its
+# RATE — not the count it used to be redirected to, which was the
+# substitution the refusal existed to prevent.
+RETIRED_REFUSALS = [
+    ("connect %", "answered_calls_rate"),
+    ("CR %", "cr_rate"),
+    ("meetings %", "meeting_rate"),
+]
+
+
+@pytest.mark.parametrize("measure,metric", RETIRED_REFUSALS)
+def test_a_retired_refusal_now_answers_with_its_rate(org, measure, metric):
+    from app.llm.metric_ontology import resolve_metric
+
+    assert resolve_metric(measure) == metric
+    resolution = nlu_pipeline.resolve(f"What is Blue Area's {measure}?", org,
+                                      session_id=None)
+    assert resolution.kind != "clarify"
 
 
 @pytest.mark.parametrize("measure,expected_reason", UNAVAILABLE_QUERIES)
@@ -176,7 +201,11 @@ def test_an_unavailable_measure_never_degrades_to_a_profile_lookup(org):
     """The exact P2 defect: the better-specified query got the worse
     answer, because a resolved person routed to action='lookup' with
     metric=None and the reason was dropped on the floor."""
-    resolution = nlu_pipeline.resolve("What is Ahmed Khan's connect %?", org,
+    # Uses portfolio %, the one refusal working_days.py did not retire.
+    # Connect % is a computable rate now, so it can no longer exercise
+    # "an UNAVAILABLE measure must not become a profile card" — the
+    # invariant this test is named for.
+    resolution = nlu_pipeline.resolve("What is Ahmed Khan's portfolio %?", org,
                                       session_id=None)
 
     assert resolution.kind == "clarify"

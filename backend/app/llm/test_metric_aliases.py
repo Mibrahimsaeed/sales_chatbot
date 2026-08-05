@@ -81,14 +81,17 @@ def _value(db, metric, level="team"):
 
 def test_answered_calls_percentage_does_not_resolve_to_the_count():
     """The headline case. "answered calls %" resolved to answered_calls,
-    a raw count."""
-    assert resolve_metric("answered calls %") != "answered_calls"
-    assert resolve_metric("answered calls %") is None
+    a raw count.
 
-    declared = metric_aliases.resolve("answered calls %")
-    assert declared is not None and not declared.available
-    assert "working-day" in declared.reason
-    assert declared.instead == "answered_calls"
+    RETIRED REFUSAL. This asserted the phrase resolved to NOTHING, with a
+    written reason about a missing working-day calendar.
+    working_days.py supplies that calendar now, so the rate is computable
+    and the phrase resolves to it. The original point — a percentage
+    question must not be answered with a raw count — is unchanged and
+    still asserted on the first line.
+    """
+    assert resolve_metric("answered calls %") != "answered_calls"
+    assert resolve_metric("answered calls %") == "answered_calls_rate"
 
 
 def test_answered_calls_without_a_percent_is_still_the_count():
@@ -99,12 +102,11 @@ def test_answered_calls_without_a_percent_is_still_the_count():
 def test_cr_percent_does_not_resolve_to_the_count():
     """"CR%" was unresolved, then (Step 4) resolved to the client
     registration COUNT. Both are wrong for a percentage question."""
-    assert resolve_metric("cr %") is None
-    assert resolve_metric("cr rate") is None
-
-    declared = metric_aliases.resolve("cr %")
-    assert declared is not None and not declared.available
-    assert declared.instead == "client_registrations"
+    # RETIRED REFUSAL — see the note on answered calls % above. Both
+    # phrases now reach the rate; neither reaches the count.
+    assert resolve_metric("cr %") == "cr_rate"
+    assert resolve_metric("cr rate") == "cr_rate"
+    assert resolve_metric("cr %") != "client_registrations"
 
 
 def test_cr_without_a_percent_is_still_the_count():
@@ -170,13 +172,14 @@ SPEC_KPIS = [
     ("cr to meeting", "cr_to_meeting_rate"),
     ("meeting to conversion", "meeting_to_conversion_rate"),
     ("conversion rate", "meeting_to_conversion_rate"),
-    # Target rates — need a working-day calendar.
-    ("answered calls %", None),
-    ("answered call rate", None),
-    ("connect rate", None),
-    ("cr %", None),
-    ("cr rate", None),
-    ("meeting rate", None),
+    # RETIRED REFUSALS. These six were declared uncomputable for want of
+    # a working-day calendar; working_days.py is that calendar.
+    ("answered calls %", "answered_calls_rate"),
+    ("answered call rate", "answered_calls_rate"),
+    ("connect rate", "answered_calls_rate"),
+    ("cr %", "cr_rate"),
+    ("cr rate", "cr_rate"),
+    ("meeting rate", "meeting_rate"),
     # RETIRED REFUSALS. Both were declared uncomputable ("I don't track
     # which advisors have units yet") until the ETL imported the
     # "1 Unit" tab. A declared refusal is superseded the moment its data
@@ -188,9 +191,9 @@ SPEC_KPIS = [
     ("meetings planned", "meetings_planned"),
     ("meetings conducted", "meetings_conducted"),
     ("meeting conduction rate", "meeting_conduction_rate"),
-    # Still uncomputable — these are working-day target rates.
-    ("meeting rate", None),
-    ("connect rate", None),
+    # Also retired, for the same reason: working_days.py.
+    ("meeting rate", "meeting_rate"),
+    ("connect rate", "answered_calls_rate"),
 ]
 
 
@@ -321,8 +324,14 @@ def test_an_unavailable_phrase_is_not_fuzzy_widened_to_a_neighbour():
     registry exists to stop, sneaking in through the widening tier."""
     from app.llm.fallback_reasoning import fuzzy_resolve_metric
 
-    assert fuzzy_resolve_metric("cr %") is None
-    assert fuzzy_resolve_metric("answered calls %") is None
+    # RETIRED REFUSAL, same guarantee. These resolve EXACTLY to the rate
+    # now, and the exact hit short-circuits before the synonym scan — so
+    # the substitution this test guards against (a percentage question
+    # answered with a count) is still impossible. It nearly returned
+    # through the scan when the refusal was retired: "cr %" contains
+    # "cr", the count's own synonym.
+    assert fuzzy_resolve_metric("cr %") == "cr_rate"
+    assert fuzzy_resolve_metric("answered calls %") == "answered_calls_rate"
     # Widening still works for everything else.
     assert fuzzy_resolve_metric("revnue") == "mtd_cleared"
 
@@ -337,21 +346,37 @@ def _plan(text, db):
 
 
 def test_a_percentage_question_asks_rather_than_returning_a_count(funnel):
+    """INVERTED: it now ANSWERS rather than asking, because the
+    working-day calendar it was waiting for exists. The invariant the
+    name describes is unchanged and still asserted — a percentage
+    question never comes back as the raw count."""
     plan = _plan("Which team has the highest answered calls %", funnel)
 
-    assert plan.action == "clarify_metric"
+    assert plan.action != "clarify_metric"
     assert plan.metric != "answered_calls"
-    assert "working-day" in plan.reason
+    assert plan.metric == "answered_calls_rate"
 
 
 def test_the_refusal_names_the_missing_ingredient_and_an_alternative(funnel):
+    """INVERTED. "Which team has the highest CR %" used to refuse, naming
+    the missing working-day calendar and offering the CR count instead.
+    working_days.py supplies that calendar, so the question is answered
+    rather than deflected — and the refusal it replaced was the whole
+    reason this test existed.
+
+    What is still asserted is that the phrase reaches the RATE, not the
+    count it used to be redirected to: a wrong-measure answer was the
+    failure the refusal was protecting against.
+    """
     from app.llm.nlu_pipeline import resolve
 
     resolution = resolve("Which team has the highest CR %", funnel, session_id=None)
 
-    assert resolution.kind == "clarify"
-    assert "working-day" in resolution.clarify_message
-    assert "Client Registration" in resolution.clarify_message
+    assert resolution.kind != "clarify"
+    plan = getattr(resolution, "plan", None)
+    metric = (resolution.ir.metric.key if resolution.kind == "ir" and resolution.ir.metric
+              else (plan.metric if plan else None))
+    assert metric == "cr_rate"
 
 
 def test_a_computable_rate_question_is_answered(funnel):
@@ -375,9 +400,10 @@ def test_a_count_question_is_still_answered(funnel):
 # reason, never as a silent fall-through to a neighbouring count.
 REQUIRED_VOCABULARY = [
     ("CR", "client_registrations"),
-    ("CR%", None),
+    # Retired refusals: computable since working_days.py.
+    ("CR%", "cr_rate"),
     ("Answered Calls", "answered_calls"),
-    ("Answered Call %", None),
+    ("Answered Call %", "answered_calls_rate"),
     ("Conversion", "conversion"),
     ("Conversion %", "meeting_to_conversion_rate"),
     ("Achievement", "achievement_pct"),
