@@ -1,5 +1,14 @@
 # sales_chatbot
 
+
+
+alembic upgrade head
+python -m etl.sync
+uvicorn app.main:app --reload                  
+
+
+
+
 CREATE TABLE advisors (
     sap_id           TEXT PRIMARY KEY,
     wid              TEXT UNIQUE,

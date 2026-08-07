@@ -42,6 +42,10 @@ WHAT THIS MODULE OWNS
      owner per field, and a record of what was inherited, overridden and
      discarded WITH REASONS.
 
+  4. `carry_into_plan()` — the same inheritance, one step EARLIER: what
+     the previous turn hands to this turn's PLANNER, in the shape entity
+     extraction would have produced it. Phase 10; see its docstring.
+
 DEFINITION OF ELLIPSIS, without matching phrases. A turn stands alone
 when it names a MEASURE and says what to measure it over — a subject, an
 explicit level word, or a ranking. Anything else is incomplete and needs
@@ -63,6 +67,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from app.llm import hierarchy
 from app.llm import intent_catalog as cat
 
 
@@ -342,6 +347,19 @@ def merge(prior, current, spec: TurnSpec, decision: Ellipsis) -> MergeResult:
         )
     elif getattr(prior, "subjects", None):
         current.subjects = [s.model_copy(deep=True) for s in prior.subjects]
+        # A comparison's sides ARE the level its answer is grouped at —
+        # the rule plan_to_ir applies when it builds one. Without it a
+        # narrowing follow-up ("only Graana" over a comparison of two
+        # TEAMS) overrode subject_level to `company` in the block above,
+        # and the compiler then grouped two teams by company: one row,
+        # named after the filter, presented as the comparison.
+        if current.subject_level != prior.subjects[0].type:
+            current.subject_level = prior.subjects[0].type
+            result.inherited.append(
+                ("subject_level",
+                 f"the comparison's sides are at {prior.subjects[0].type!r}, which is "
+                 "the level its answer is grouped at")
+            )
         if current.intent != "comparison":
             current.intent = prior.intent
             result.inherited.append(
@@ -354,6 +372,29 @@ def merge(prior, current, spec: TurnSpec, decision: Ellipsis) -> MergeResult:
              + ", ".join(s.value for s in prior.subjects) + ") carry forward")
         )
 
+    # A comparison's sides ARE its scope at their own level, so a scope
+    # filter inherited at that level intersects the sides instead of
+    # narrowing them — "Blue Area vs Downtown" AND team=Blue Area matches
+    # one side and silently answers half the question.
+    #
+    # Per LEVEL, exactly as the filter block above: a company filter over
+    # a comparison of two TEAMS is a real narrowing ("compare them within
+    # Graana") and must survive. plan_to_ir applies the same rule when it
+    # builds a comparison from scratch; this is where an inherited filter
+    # meets subjects that arrived separately, which is the only other way
+    # the pair can come together.
+    subject_levels = {s.type for s in (getattr(current, "subjects", None) or [])}
+    if subject_levels:
+        intersecting = [f for f in current.filters if f.field in subject_levels]
+        if intersecting:
+            current.filters = [f for f in current.filters if f.field not in subject_levels]
+            result.discarded.append(
+                ("filters",
+                 ", ".join(f"{f.field}={f.value}" for f in intersecting)
+                 + " — this turn compares subjects at that level, and a filter "
+                   "there would intersect the sides rather than narrow them")
+            )
+
     # ---- limit ------------------------------------------------------
     if spec.limit:
         result.overridden.append(("limit", "this turn stated how many rows it wants"))
@@ -363,4 +404,191 @@ def merge(prior, current, spec: TurnSpec, decision: Ellipsis) -> MergeResult:
             ("limit", f"this turn stated no count, so {prior.limit} carries forward")
         )
 
+    return result
+
+
+# ---------------------------------------------------------------------
+# 4. The carry — inheritance one step EARLIER, into the planner
+# ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Carry:
+    """What the previous turn hands to THIS turn's planner.
+
+    `entities` is an overlay on the extracted entity dict, in exactly the
+    shape extraction itself produces, so the planner cannot tell an
+    inherited value from a spoken one — which is the point. `reasons`
+    explains each key for the trace.
+    """
+
+    entities: dict = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.entities)
+
+
+def _prior_scope(prior) -> list[tuple[str, str]]:
+    """The (level, value) pairs the previous turn was scoped to.
+
+    Both places a subject can live: `filters` for an ordinary scoped
+    query, `subjects` for a comparison. Read together because a follow-up
+    does not know or care which shape established the subject.
+    """
+    scope = [
+        (f.field, f.value) for f in prior.filters
+        if f.field in _SCOPE_FIELDS and isinstance(f.value, str)
+    ]
+    scope += [(s.type, s.value) for s in (getattr(prior, "subjects", None) or [])]
+    return scope
+
+
+def carry_into_plan(prior, entities: dict, spec: TurnSpec, decision: Ellipsis,
+                    *, needs_second_subject: bool = False) -> Carry:
+    """What the previous turn supplies to this turn BEFORE it is planned.
+
+    `merge()` above repairs an IR after the fact, which is enough only
+    when the turn reached the IR path at all. A turn that names a subject
+    and no measure does not: the planner sees a bare entity mention and
+    answers it as a standalone entity summary, so "Blue Area revenue" ->
+    "what about Downtown?" replied with a generic Downtown card and the
+    measure the user asked about one message earlier was simply gone.
+
+    Handing the missing piece to the PLANNER instead fixes that at the
+    point the shape of the answer is decided, and — because the planner
+    then re-scores the turn with the full picture — it is the intent
+    precedence table that decides what the turn now is, not this module.
+    This is deliberately the same mechanism the metric-inheritance branch
+    in nlu_pipeline already used for "now only IMARAT", generalised from
+    one plan action to the field-level rule that motivated it.
+
+    TWO FIELDS travel this way, and both follow merge()'s ownership rule
+    — the current turn owns what it named, the previous turn owns the
+    rest:
+
+      metric   when this turn named a subject (or a level word) and no
+               measure. Restricted to subject-bearing turns on purpose: a
+               turn naming NEITHER is a bare modifier ("top 5", "year to
+               date"), which ir_patcher already resolves against the
+               prior IR directly and which would only be confused by
+               being re-planned as a fresh question.
+
+      subject  when this turn asked for a comparison and only one side of
+               it grounded. The other side is the subject the
+               conversation has already established, exactly as
+               merge()'s `subjects` block carries both sides forward once
+               a comparison IS one.
+
+    `needs_second_subject` is passed in rather than derived from a plan
+    action, so this module stays free of planner vocabulary — the
+    ellipsis decision must not become a function of what the planner
+    would DO with the turn (see the module docstring).
+    """
+    if prior is None or not decision.is_elliptical:
+        return Carry()
+
+    carried: dict = {}
+    reasons: list[str] = []
+
+    if (not spec.metric and (spec.subject or spec.level_word)
+            and prior.metric is not None):
+        carried["metric"] = prior.metric.key
+        reasons.append(
+            f"metric={prior.metric.key} — this turn named a subject but no "
+            "measure, so the previous turn's carries forward"
+        )
+
+    if needs_second_subject:
+        added: list[str] = []
+        for level, value in _prior_scope(prior):
+            key = hierarchy.LEVEL_ENTITY_KEYS.get(level, f"{level}s")
+            existing = list(carried.get(key) or entities.get(key) or [])
+            if any(v.lower() == value.lower() for v in existing):
+                continue
+            carried[key] = existing + [value]
+            added.append(f"{level}={value}")
+        if added:
+            reasons.append(
+                ", ".join(added) + " — this turn asked for a comparison and "
+                "grounded only one side; the other is what the conversation "
+                "had already established"
+            )
+
+    return Carry(entities=carried, reasons=reasons)
+
+
+# ---------------------------------------------------------------------
+# 5. Describing a merge the patcher performed
+# ---------------------------------------------------------------------
+
+
+def summarise(ir) -> str:
+    """One line naming the fields that decide what a query returns.
+
+    Used by the trace so `previous_context` and `merged_context` read the
+    same on every path.
+    """
+    if ir is None:
+        return "none"
+    parts = [f"intent={ir.intent}", f"level={ir.subject_level}"]
+    if ir.metric is not None:
+        parts.append(f"metric={ir.metric.key}")
+    parts.append(f"period={ir.time_range.period}")
+    for f in ir.filters:
+        parts.append(f"{f.field}{f.operator}{f.value}")
+    for s in getattr(ir, "subjects", None) or []:
+        parts.append(f"subject:{s.type}={s.value}")
+    parts.append(f"limit={ir.limit}")
+    return " ".join(parts)
+
+
+# The IR fields a patch can change, and how to read the changed value.
+# Listed once so the trace below names every field ir_patcher touches
+# and cannot silently omit one it grows a rule for.
+_PATCHABLE = {
+    "metric": lambda ir: ir.metric.key if ir.metric else None,
+    "period": lambda ir: ir.time_range.period,
+    "limit": lambda ir: ir.limit,
+    "sort": lambda ir: (ir.sort.metric, ir.sort.direction),
+    "filters": lambda ir: sorted(
+        (f.field, str(f.value)) for f in ir.filters
+    ),
+    "subjects": lambda ir: sorted(
+        (s.type, s.value) for s in (getattr(ir, "subjects", None) or [])
+    ),
+}
+
+
+def describe_patch(prior, patched, decision: Ellipsis) -> MergeResult:
+    """The patcher's work, in merge()'s vocabulary.
+
+    ir_patcher performs a merge — it copies the previous IR and changes
+    what this turn asked to change — but it is not this module, so its
+    turns produced no Context step and the most implicit inheritance in
+    the system ("top 5", "year to date") was the least visible in the
+    trace. Rather than move the patching here (it is the cheap
+    deterministic path and belongs where it is) or duplicate the
+    reasoning, this DIFFS the two IRs: every field the patch left alone
+    was inherited, every field it changed was overridden.
+
+    A diff, not a second policy — it reports what the patcher did and
+    cannot disagree with it.
+    """
+    result = MergeResult(ir=patched, decision=decision)
+    for name, read in _PATCHABLE.items():
+        before, after = read(prior), read(patched)
+        if before == after:
+            # An empty field carried forward is not inheritance — saying
+            # "inherited filters" when there were none reads as a scope
+            # that survived, which is the exact confusion this trace
+            # exists to remove.
+            if after not in (None, [], ()):
+                result.inherited.append(
+                    (name, f"this turn did not change it, so {after!r} carries forward")
+                )
+        else:
+            result.overridden.append(
+                (name, f"{before!r} -> {after!r} — this turn's modifier changed it")
+            )
     return result

@@ -79,6 +79,7 @@ def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | N
         get_known_companies(db),
         grounded_entities=entities,
         prior_ir_json=prior_ir.model_dump_json() if prior_ir else None,
+        recent_turns=conversation_memory.recent_turns(session_id),
         known_unit_heads=get_known_unit_heads(db),
         known_zonal_heads=get_known_zonal_heads(db),
         known_bcms=get_known_bcms(db),

@@ -27,6 +27,7 @@ from typing import Any, Optional
 from sqlalchemy import case, func, literal
 
 from app.llm import metric_aliases
+from app.llm.periods import without_period
 from app.database.models import (
     Advisor, SalesFunnel, Pipeline, Performance, PerformancePeriod,
     TeamTarget, Portfolio, Calls, Attendance,
@@ -1198,6 +1199,29 @@ def metric_label(metric_key: str | None) -> str:
     if not metric_key:
         return "value"
     return METRICS[metric_key].label if metric_key in METRICS else metric_key
+
+
+def measure_label(metric_key: str | None) -> str:
+    """What the metric MEASURES, without the window it measures it over.
+
+    metric_label() above names the key, and a key is one measure at one
+    period — so its label says so ("Total MTD Connects"). That is what a
+    reply captioning an answer wants. It is the wrong name in a sentence
+    ABOUT a different period: "I don't have daily figures for Total MTD
+    Connects" reads as two competing windows, and the MTD in it is an
+    implementation detail of which key happened to resolve, not anything
+    the user asked for.
+
+    Derived from the metric's own declared period via
+    periods.without_period, so this cannot drift from the label it comes
+    from and no metric needs a second name maintained by hand.
+    """
+    if not metric_key:
+        return "value"
+    metric = METRICS.get(metric_key)
+    if metric is None:
+        return metric_key
+    return without_period(metric.label, metric.period.value)
 
 
 # Acronyms that must stay upper-case when a label is lowered for prose.

@@ -141,6 +141,18 @@ def _is_rule_based(plan: QueryPlan) -> bool:
 # would otherwise send the query to the LLM.
 _COMPOUND_EXEMPT_ACTIONS = ("comparison", "comparison_incomplete")
 
+# Plan actions that reach the plan path but ANSWER WITH A QUESTION.
+# chat_service._dispatch renders these as kind="clarification", so the
+# conversation's topic has not moved and its context must survive — the
+# opposite of every other plan action, which answers and therefore
+# replaces what the conversation is about.
+#
+# Listed rather than derived because the distinction lives in
+# chat_service's dispatch, which cannot be imported here (it imports this
+# module). Kept to the single action that has it, so a divergence is one
+# line to see.
+_CLARIFYING_ACTIONS = ("comparison_incomplete",)
+
 # Part 8: typed "show more" — the alternative to clicking the button
 # (POST /chat/more, see app/api/chat.py). Only recognized when there's an
 # active pagination cursor for this session (conversation_memory); with
@@ -285,6 +297,76 @@ def _looks_like_person_followup(text: str) -> bool:
     return bool(_PERSON_FOLLOWUP_RE.search(text))
 
 
+def _match_level(text: str, levels: list[str]) -> str | None:
+    """Which offered level this message names, or None.
+
+    Matched against hierarchy.label_for — the same labels the question
+    was PHRASED with — so the vocabulary the user is answering in is the
+    vocabulary they were shown, and no new synonym list appears here.
+    Requires exactly one match: "bcm or advisor" is not a choice.
+    """
+    lowered = text.strip().lower().strip("?.!")
+    hits = [
+        level for level in levels
+        if lowered == level.lower()
+        or lowered == (hierarchy.label_for(level) or "").lower()
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _handle_pending_level(
+    pending, cleaned: str, db: Session, session_id: str | None
+) -> Resolution | None:
+    """Read this message as the answer to "which level did you mean?".
+
+    Returns a Resolution to serve, or None to fall through when the
+    message is plainly a new question. Deliberately the same shape as
+    _handle_pending_person: match, then RE-RUN the original query with
+    the choice applied, rather than making the user retype it.
+    """
+    chosen = _match_level(cleaned, pending.levels)
+
+    if chosen is not None:
+        conversation_memory.clear_pending_level(session_id)
+        routing.decide(
+            "Clarification", f"level={chosen}",
+            f"read {cleaned!r} as the answer to the pending "
+            f"{pending.levels} question about {pending.value!r}; re-running "
+            f"the original query with that level pinned",
+        )
+        return resolve(pending.original_text, db, session_id=session_id,
+                       _depth=1, _pin=(pending.value, chosen))
+
+    # Not a choice, and long enough to stand alone -> the user moved on.
+    if len(re.findall(r"\S+", cleaned)) > 4:
+        conversation_memory.clear_pending_level(session_id)
+        return None
+
+    if pending.attempts >= MAX_CLARIFY_ATTEMPTS:
+        conversation_memory.clear_pending_level(session_id)
+        options = ", ".join(hierarchy.label_for(l) or l for l in pending.levels)
+        return Resolution(
+            kind="clarify", entities={},
+            clarify_message=(
+                f"I still couldn't tell which {pending.value!r} you meant. "
+                f"Try naming it in the question, e.g. "
+                f"'{options.split(', ')[0]} {pending.value}'."
+            ),
+        )
+
+    conversation_memory.set_pending_level(
+        session_id, pending.value, pending.levels, pending.original_text)
+    options = [hierarchy.label_for(l) or l for l in pending.levels]
+    return Resolution(
+        kind="clarify", entities={},
+        clarify_message=(
+            f"'{pending.value}' could mean the {' or the '.join(options)} — "
+            "which did you mean?"
+        ),
+        clarify_options=options,
+    )
+
+
 def _handle_pending_person(
     pending, cleaned: str, db: Session, session_id: str | None
 ) -> Resolution | None:
@@ -370,7 +452,44 @@ def _ir_resolution(ir, entities: dict, **kwargs) -> Resolution:
     return Resolution(kind="ir", ir=ir, entities=entities, **kwargs)
 
 
-def resolve(text: str, db: Session, session_id: str | None = None, _depth: int = 0) -> Resolution:
+def _pin_level(entities: dict, value: str, level: str) -> dict:
+    """Drop the groundings of `value` at every level EXCEPT `level`.
+
+    The ambiguity is that one name grounded at several levels at once;
+    removing the ones the user did not pick leaves exactly the reading
+    they chose, so _detect_ambiguous_entity no longer fires and the
+    planner sees an unambiguous query.
+
+    Only groundings of THIS value are touched — another entity that
+    happens to be in the same message keeps its own.
+    """
+    from app.llm.entity_extractor import _AMBIGUITY_LEVELS
+
+    pinned = dict(entities)
+    pinned.pop("ambiguous_entity", None)
+    lowered = value.lower()
+    for other in _AMBIGUITY_LEVELS:
+        if other == level:
+            continue
+        if other == "advisor":
+            if str(pinned.get("advisor_name", "")).lower() == lowered:
+                for key in ("advisor_name", "advisor_wid", "advisor_wids",
+                            "advisor_names", "advisor_matches",
+                            "advisor_resolution", "advisor_match_score",
+                            "advisor_ambiguous", "advisor_multi"):
+                    pinned.pop(key, None)
+        elif str(pinned.get(other, "")).lower() == lowered:
+            pinned.pop(other, None)
+            plural = f"{other}s"
+            if isinstance(pinned.get(plural), list):
+                pinned[plural] = [v for v in pinned[plural] if v.lower() != lowered]
+                if not pinned[plural]:
+                    pinned.pop(plural, None)
+    return pinned
+
+
+def resolve(text: str, db: Session, session_id: str | None = None, _depth: int = 0,
+            _pin: tuple | None = None) -> Resolution:
     cleaned = normalize(text)
     # One trace per user message. A split sub-query (_depth > 0) keeps
     # appending to its parent's trace rather than starting a new one, so
@@ -415,7 +534,24 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         if served is not None:
             return served
 
+    # An in-flight "the BCM or the Advisor?" takes precedence for the
+    # same reason: "BCM" is a level WORD, it grounds to no entity, and it
+    # only means anything as the answer to that question. Placed here,
+    # before extraction, so the normal path never sees it as a query.
+    pending_level = conversation_memory.get_pending_level(session_id)
+    if pending_level is not None:
+        served = _handle_pending_level(pending_level, cleaned, db, session_id)
+        if served is not None:
+            return served
+
     entities = extract_entities(cleaned, db)
+
+    # A level the user just chose in answer to "the BCM or the Advisor?".
+    # Applied here, immediately after extraction, so every stage below —
+    # ambiguity detection, the planner, the IR — sees the unambiguous
+    # reading rather than re-asking the question that was just answered.
+    if _pin is not None:
+        entities = _pin_level(entities, _pin[0], _pin[1])
 
     # M4: relations of the person the conversation is already about
     # ("how is his team doing"). Runs BEFORE the carry below on purpose —
@@ -583,6 +719,12 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         audit.decision("routing", "clarify:ambiguous_entity",
                        f"{value!r} grounded at more than one hierarchy level {levels} — "
                        "asked which was meant rather than picking one")
+        # Record that a question is OUTSTANDING. Every other
+        # clarification path already does this (set_pending_person for
+        # "which Yasir Ali", set_pending for a missing slot); this one
+        # asked and stored nothing, so the answer arrived next turn as a
+        # bare, contextless "BCM" and resolved to nothing.
+        conversation_memory.set_pending_level(session_id, value, levels, cleaned)
         return Resolution(
             kind="clarify",
             # As with clarify_metric: the plan travels with the refusal so
@@ -609,34 +751,51 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     prior_ir = conversation_memory.get(session_id)
     _context = conversation_context.ellipsis(turn_spec, prior_ir is not None)
 
-    if plan.action == "clarify_metric" and _context.is_elliptical and (
-        prior_ir is not None and prior_ir.metric is not None
-    ):
-        # "now only IMARAT" after "show Downtown pipeline" names a
-        # subject and no measure. Clarifying here would ask which metric
-        # the user meant one turn after they said it.
+    # try_patch's `plan_action` parameter means "the rule planner's
+    # verdict on this message STANDING ALONE", and its gate depends on
+    # that reading: "only Graana" plans as `summary`, which is how the
+    # patcher recognises a narrowing. The carry below re-plans, replacing
+    # that verdict with one made WITH the inherited context, so the
+    # standalone one is kept here for the patcher. Handing it the
+    # re-planned action instead made it decline every narrowing follow-up
+    # and take a full parse — an LLM round trip per turn, and a
+    # comparison that lost its sides on the way through.
+    standalone_action = plan.action
+
+    # Phase 10: the carry. What the previous turn supplies to THIS turn is
+    # decided by conversation_context — the same owner and the same
+    # ownership rule as merge() — and handed to the planner in the shape
+    # extraction would have produced, so the precedence table re-scores
+    # the turn with the full picture and decides what it now is.
+    #
+    # This generalises a branch that used to fire only on
+    # plan.action == "clarify_metric" ("now only IMARAT"). Gating on the
+    # planner's verdict meant the carry reached only the turns where the
+    # planner had FAILED; a turn it resolved confidently but wrongly —
+    # "what about Downtown?" planned as a standalone entity summary —
+    # never got here at all, so the measure named one message earlier was
+    # dropped and the answer was a generic card. The condition now asks
+    # what the TURN specified, which is what the decision was always
+    # about.
+    #
+    # Still the one place a second build_query_plan() runs, and still
+    # only for an incomplete follow-up. Re-planning is what keeps intent
+    # single-owned — the alternative was writing an action here.
+    carry = conversation_context.carry_into_plan(
+        prior_ir, entities, turn_spec, _context,
+        needs_second_subject=(plan.action == "comparison_incomplete"),
+    )
+    if carry:
         routing.decide(
-            "Context", f"inherit metric {prior_ir.metric.key}",
-            "this turn named a subject but no measure, and the previous turn "
-            "supplies one — answered instead of re-asking",
+            "Context", "carry " + ", ".join(sorted(carry.entities)),
+            "the previous turn supplies what this one left unsaid, before "
+            "planning: " + "; ".join(carry.reasons),
         )
-        # Phase 7: RE-PLAN with the inherited measure rather than writing
-        # an action here. This used to set plan.action = "leaderboard"
-        # directly, which made the pipeline a second owner of intent —
-        # and hardcoded the wrong one: "now only IMARAT" after a pipeline
-        # question names ONE group and one (inherited) measure, which is
-        # group_metric, not a ranking. Handing the measure back to the
-        # planner lets the precedence table decide, so this path gets the
-        # same answer a user typing "IMARAT pipeline" would.
-        #
-        # This is the one place a second build_query_plan() runs, on a
-        # path that only fires for a subject-only follow-up. Re-planning
-        # is what keeps intent single-owned; the alternative was keeping
-        # a hardcoded action here forever.
-        plan = _plan(cleaned, {**entities, "metric": prior_ir.metric.key},
-                     db, session_id)
-        if plan.metric is None:
-            plan.metric = prior_ir.metric.key
+        plan = _plan(cleaned, {**entities, **carry.entities}, db, session_id)
+        if plan.metric is None and "metric" in carry.entities:
+            plan.metric = carry.entities["metric"]
+        tracing.record_plan(plan)
+        audit.record_plan(plan)
 
     # A capability this system does not have. Distinct from a
     # clarification (there is nothing the user could add that would make
@@ -687,10 +846,21 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     # patch the previous turn's IR deterministically — no LLM round trip.
     # try_patch declines anything that stands alone as its own query.
     if prior_ir is not None:
-        patched = try_patch(prior_ir, cleaned, entities, plan.action, turn_spec)
+        patched = try_patch(prior_ir, cleaned, entities, standalone_action, turn_spec)
         if patched is not None:
             result = validate_ir(patched, db)
             if result.is_valid:
+                # The patcher performs a merge, so it owes the same
+                # account of it. Without this the turns whose inheritance
+                # is MOST implicit — "top 5", "year to date", which carry
+                # every field of the previous query untouched — were the
+                # only ones with no Context step at all.
+                patch_merge = conversation_context.describe_patch(
+                    prior_ir, result.ir, _context)
+                routing.decide("Context", patch_merge.trace(),
+                               f"previous: {conversation_context.summarise(prior_ir)}\n"
+                               f"{patch_merge.detail()}\n"
+                               f"merged: {conversation_context.summarise(result.ir)}")
                 conversation_memory.set(session_id, result.ir)
                 audit.mark_rule_path(
                     "try_patch() recognised this as a follow-up modifier on the previous "
@@ -750,6 +920,29 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             + " — returned before semantic_parser.parse(), so NO LLM call is made "
             "for this query regardless of NLU_MODE"
         )
+        # Phase 10: this path ANSWERS, and until now it neither read nor
+        # wrote conversation state — the one exit that could leave the
+        # follow-up base describing a turn the user had already moved on
+        # from. An advisor profile, a roster or a hierarchy chain is not a
+        # QueryIR, so there is nothing honest to store; what must not
+        # happen is the PREVIOUS turn's IR staying behind as though this
+        # one never occurred.
+        #
+        # The clarifying actions are exempt because they do not answer —
+        # chat_service._dispatch renders them as a clarification, so the
+        # topic has not moved and the context the user is being asked to
+        # complete must still be there when they do.
+        if plan.action not in _CLARIFYING_ACTIONS:
+            if prior_ir is not None:
+                routing.decide(
+                    "Context", "reset",
+                    f"answered on the rule-based plan path as {plan.action!r}, which "
+                    f"no QueryIR describes — the previous context "
+                    f"({conversation_context.summarise(prior_ir)}) is no longer what "
+                    "the conversation is about, so it is dropped rather than left "
+                    "for the next turn to inherit",
+                )
+            conversation_memory.clear_last_ir(session_id)
         return Resolution(kind="plan", plan=plan, entities=entities)
 
     audit.decision(
@@ -772,7 +965,10 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             prior_ir, outcome.ir, turn_spec,
             conversation_context.ellipsis(turn_spec, prior_ir is not None),
         )
-        routing.decide("Context", merged.trace(), merged.detail())
+        routing.decide("Context", merged.trace(),
+                       f"previous: {conversation_context.summarise(prior_ir)}\n"
+                       f"{merged.detail()}\n"
+                       f"merged: {conversation_context.summarise(merged.ir)}")
         # Phase 4: stored unconditionally, and only here. semantic_parser
         # used to store the pre-merge IR from inside _finish, so the IR
         # that ANSWERED and the IR the next turn INHERITED could differ

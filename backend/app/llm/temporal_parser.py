@@ -81,6 +81,12 @@ _EQUIVALENT_PATTERNS: list[tuple[str, Period]] = [
     (r"\bas of (now|today)\b", "DAILY"),
     (r"\btoday'?s?\b", "DAILY"),
     (r"\bso far today\b", "DAILY"),
+    # The literal period WORD, alongside the ways of naming the day.
+    # "mtd", "ytd" and "quarter" were all here; "daily" was not, so
+    # "daily CR" named no period at all and fell through to the MTD
+    # default — the same silent substitution the DAILY vocabulary exists
+    # to prevent, reached by the most direct phrasing of it.
+    (r"\bdaily\b", "DAILY"),
     # Times of day NAME today. "how are we doing this morning" is a
     # question about today, not about the month — and it used to match
     # nothing at all, so it silently became MTD like every other

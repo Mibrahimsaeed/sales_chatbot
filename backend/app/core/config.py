@@ -107,6 +107,17 @@ class Settings(BaseSettings):
     # working single-person lookup into a group query, so it ships dark
     # and is enabled deliberately.
     relation_inference_enabled: bool = Field(default=False, alias="RELATION_INFERENCE_ENABLED")
+    # Conversation window: how many recent TURNS (one turn = the user
+    # message plus the assistant reply) are shown to the LLM alongside the
+    # structured prior IR, and the character ceiling on that block.
+    #
+    # Two limits rather than one because they guard different failures. The
+    # turn count keeps stale topics out — six messages back is usually a
+    # different question. The character cap keeps a single huge reply (a
+    # 15-row leaderboard) from crowding out the schema and the gazetteer
+    # that the prompt actually needs to parse against.
+    conversation_window_turns: int = Field(default=3, alias="CONVERSATION_WINDOW_TURNS")
+    conversation_window_chars: int = Field(default=1200, alias="CONVERSATION_WINDOW_CHARS")
     # Comma-separated target levels the inference is allowed to act on.
     # Per-relation granularity (not one master switch) so a rollback can
     # be surgical — disabling "company" need not disable "team". M1 ships

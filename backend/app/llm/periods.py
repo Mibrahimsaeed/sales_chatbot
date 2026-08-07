@@ -51,3 +51,51 @@ def label_for(period: str | None) -> str:
     if period is None:
         return "unspecified"
     return PERIOD_LABELS.get(period, period)
+
+
+# How each period is SPELLED INSIDE A METRIC LABEL, longest first.
+#
+# Distinct from PERIOD_LABELS above, which is the prose wording for a
+# sentence ("month-to-date"); this is the shorthand the ontology's own
+# labels are written with ("Total MTD Connects", "CR % (MTD)",
+# "3-Month Revenue Cleared"). Declared here rather than in
+# metric_ontology because it is a fact about the period vocabulary, and
+# because this module is the one place a new period can be added — a
+# period whose spelling were declared elsewhere could arrive without one.
+PERIOD_TOKENS: dict[str, tuple[str, ...]] = {
+    "DAILY": ("Daily",),
+    "MTD": ("MTD",),
+    "YTD": ("YTD",),
+    "3M": ("3-Month", "3M"),
+}
+
+
+def without_period(label: str, period: str | None) -> str:
+    """`label` with its own period's wording removed.
+
+    A metric key encodes ONE period, so its label names that period:
+    `total_connects` is "Total MTD Connects". That is right when the
+    label captions an answer — the reply says which window it computed.
+    It is wrong when the sentence is about a DIFFERENT window, which is
+    exactly the unavailable-period message: "I don't have daily figures
+    for Total MTD Connects" names two periods and asks the reader to
+    work out that only one of them is the question.
+
+    Derived from the metric's declared period rather than declared a
+    second time per metric, so a label and its neutral form cannot drift
+    — and a new metric gets one without a second edit. The tidy-up
+    handles the three shapes the ontology actually uses (prefix, infix,
+    parenthesised suffix) with plain string operations; the exhaustive
+    test over METRICS is what keeps that claim true.
+
+    Returns the label unchanged when removal would leave nothing, so a
+    metric named only for its period stays visible rather than blank.
+    """
+    stripped = label
+    for token in PERIOD_TOKENS.get(period or "", ()):
+        stripped = stripped.replace(token, "")
+    stripped = stripped.replace("()", "")
+    while "  " in stripped:
+        stripped = stripped.replace("  ", " ")
+    stripped = stripped.strip().strip("-–—").strip()
+    return stripped or label

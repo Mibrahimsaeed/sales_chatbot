@@ -178,6 +178,7 @@ def build_ir_prompt(
     known_companies: list[str],
     grounded_entities: dict,
     prior_ir_json: str | None = None,
+    recent_turns: list | None = None,
     known_unit_heads: list[str] | None = None,
     known_zonal_heads: list[str] | None = None,
     known_bcms: list[str] | None = None,
@@ -215,6 +216,23 @@ def build_ir_prompt(
         context_lines.append(
             "Previous turn's resolved query (for follow-ups like 'what about last month' or "
             f"'same for Downtown' — treat the new message as a patch on this): {prior_ir_json}"
+        )
+
+    # The conversation as MESSAGES, alongside the structured prior IR
+    # above rather than instead of it. The IR is the authoritative record
+    # of what the last query RESOLVED to and the deterministic layer
+    # patches it directly; this is the wording, which carries the
+    # references that layer cannot see — a name that appeared only in a
+    # reply, or a subject that never grounded to an entity.
+    #
+    # Bounded upstream by conversation_memory.recent_turns(), so this
+    # renders whatever fits the configured turn and character budget.
+    if recent_turns:
+        rendered = "\n".join(f"  {role}: {text}" for role, text in recent_turns)
+        context_lines.append(
+            "Recent conversation (oldest first) — resolve pronouns and "
+            f"ellipsis against it, but prefer the resolved query above when "
+            f"the two disagree:\n{rendered}"
         )
 
     context_lines.append(render_examples())

@@ -5,8 +5,14 @@ from sqlalchemy.orm import Session
 from app.llm import aggregation, conversation_memory, hierarchy, narrative, routing
 from app.llm.ir_validator import confidence_breakdown
 from app.llm.nlu_pipeline import resolve, Resolution
-from app.llm.metric_ontology import metric_for_period
-from app.llm.query_compiler import compile_and_run, count_ir
+from app.llm.periods import label_for as period_label
+# resolve_metric_for_period is THE (metric, period) -> binding authority
+# (see its docstring). Imported from the compiler rather than reaching
+# past it to metric_ontology.metric_for_period, so this module names the
+# authority it is actually a client of — and names it once.
+from app.llm.query_compiler import (
+    compile_and_run, count_ir, resolve_metric_for_period,
+)
 from app.llm.query_ir import QueryIR
 from app.llm.response_planner import plan_response, respond
 from app.llm.response_formatter import (
@@ -80,6 +86,12 @@ def handle_chat_message(
     CHAT_AUDIT_DEBUG is set, and it changes nothing about the answer."""
     with audit.audit_query(message, session_id=session_id):
         with tracing.traced(message, session_id=session_id) as trace:
+            # The user's message joins the window BEFORE resolution, so
+            # the LLM prompt this turn builds can see the turns leading
+            # up to it. The assistant's reply is appended after dispatch,
+            # once there is one.
+            conversation_memory.record_turn(session_id, "user", message)
+
             resolution = resolve(message, db, session_id=session_id)
             log.debug(f"resolved '{message}' -> kind={resolution.kind}")
 
@@ -89,6 +101,8 @@ def handle_chat_message(
             tracing.record_ir(resolution.ir)
 
             response = _dispatch(db, resolution, session_id)
+            conversation_memory.record_turn(session_id, "assistant",
+                                            str(response.get("reply") or ""))
             tracing.record_response(response)
             audit.record_response(response)
             _log_interaction(db, session_id, message, resolution, response, trace)
@@ -325,17 +339,49 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         if not advisor:
             return respond("not_found", f"I couldn't find anyone matching '{plan.entity_value}' — mind double-checking the spelling?", None)
 
-        value = advisor_service.get_advisor_metric(db, advisor["wid"], plan.metric)
+        # The measure the user named AT THE WINDOW they named it for.
+        # This branch used to pass plan.metric straight through, so the
+        # period the planner had already resolved was read by nothing and
+        # the metric answered at its own declared window instead: "CR
+        # today" and "CR this year" both returned the MTD number, under
+        # an "MTD" label, with nothing anywhere reporting a substitution.
+        # The period was never overridden — it was simply never applied.
+        #
+        # resolve_metric_for_period is the same authority the IR path
+        # reaches through _effective_metric, so the two paths cannot give
+        # one question two answers. None means the measure has no data at
+        # that window, and its contract is explicit that callers degrade
+        # rather than substitute — so an explicit DAILY says so instead of
+        # quietly becoming MTD.
+        effective = resolve_metric_for_period(plan.metric, plan.period)
+        if effective is None:
+            audit.decision(
+                "period", f"{plan.metric} has no {plan.period} data",
+                f"the query asked for {period_label(plan.period)} figures and "
+                f"{plan.metric!r} has none — refused rather than answering with "
+                "the window the metric happens to hold",
+            )
+            return respond(
+                "no_data",
+                _unanswerable_text(plan.metric, plan.period, plan.level or "advisor"),
+                None,
+            )
+
+        value = advisor_service.get_advisor_metric(db, advisor["wid"], effective)
         audit.record_formatter(
             "format_advisor_metric_reply",
-            f"plan.action='advisor_metric' metric={plan.metric!r} for wid={advisor['wid']} — "
+            f"plan.action='advisor_metric' metric={plan.metric!r} at period "
+            f"{plan.period!r} -> {effective!r} for wid={advisor['wid']} — "
             "one number, not the profile",
         )
         return respond(
             "advisor_metric",
-            format_advisor_metric_reply(advisor["name"], plan.metric, value),
+            # The RESOLVED key, so the name on the number matches the
+            # number: reading plan.metric here would label a YTD figure
+            # "MTD Client Registrations".
+            format_advisor_metric_reply(advisor["name"], effective, value),
             {"wid": advisor["wid"], "name": advisor["name"],
-             "metric": plan.metric, "value": value},
+             "metric": effective, "value": value},
         )
 
     if plan.action == "lookup":
@@ -410,7 +456,7 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
     return respond("no_data", "Hmm, I'm not quite sure how to answer that one yet — could you rephrase it?", None)
 
 
-def _unanswerable_reply(ir) -> str:
+def _unanswerable_text(named: str | None, period: str | None, level: str) -> str:
     """Why this (measure, period, level) has no answer.
 
     The period is named FIRST when it is the reason, because that is the
@@ -419,23 +465,41 @@ def _unanswerable_reply(ir) -> str:
     blamed the metric in every case and quoted its raw key
     ("mtd_cleared"), which read as though the measure itself were
     unknown.
+
+    Takes the three values rather than an IR so the PLAN path — which
+    never builds one — says the same sentence. "Zainab's CR today" and
+    "top advisors by CR today" fail for exactly the same reason, and two
+    wordings for one reason is how they would stop agreeing.
     """
-    from app.llm.metric_ontology import metric_label, supported_periods
+    # The measure WITHOUT its key's own period. This sentence is about a
+    # window the measure does not have, so naming the window it does have
+    # inside the measure's name puts two periods in one sentence: "I
+    # don't have daily figures for Total MTD Connects" reads as though
+    # MTD were part of what was asked for. It is not — it is which key
+    # the alias table happened to resolve, and the sentence goes on to
+    # list the available windows anyway.
+    from app.llm.metric_ontology import measure_label, supported_periods
 
-    named = ir.sort.metric or (ir.metric.key if ir.metric else None)
-    label = metric_label(named) if named else "that metric"
-    period = getattr(ir.time_range, "period", None)
+    label = measure_label(named) if named else "that metric"
 
-    if named and period and metric_for_period(named, period) is None:
+    if named and period and resolve_metric_for_period(named, period) is None:
         available = ", ".join(p.value for p in supported_periods(named)) or "no period"
-        window = {"DAILY": "daily", "MTD": "month-to-date",
-                  "YTD": "year-to-date", "3M": "3-month"}.get(period, period)
+        window = period_label(period)
         return (
             f"I don't have {window} figures for {label} yet — I hold "
             f"{available} totals for it. Ask for one of those and I can answer."
         )
 
-    return f"I don't have a way to answer that for {label} at the {ir.subject_level} level yet."
+    return f"I don't have a way to answer that for {label} at the {level} level yet."
+
+
+def _unanswerable_reply(ir) -> str:
+    """The IR-shaped caller of _unanswerable_text above."""
+    return _unanswerable_text(
+        ir.sort.metric or (ir.metric.key if ir.metric else None),
+        getattr(ir.time_range, "period", None),
+        ir.subject_level,
+    )
 
 
 def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
