@@ -284,6 +284,87 @@ def _wid(v):
         return None
 
 
+# The header spellings the WID column actually appears under, in priority
+# order. "WID" is the documented one; the rest are what the live tabs
+# carry today — "Answered Calls" heads its id column with a single space,
+# "P1 & Overdue" with a lowercase "x". Both are unlabelled id columns as
+# far as the sheet author is concerned.
+#
+# Listed rather than sniffed positionally: a positional rule silently
+# picks up whatever ends up in column A when someone inserts one, which
+# is the same class of silent-wrong-data failure this replaces. An
+# unrecognised spelling is caught loudly by _check_identity_columns
+# below instead of being guessed at.
+_WID_HEADERS: tuple[str, ...] = ("WID", "Wid", "wid", " ", "", "x")
+
+# Likewise for the name column.
+_NAME_HEADERS: tuple[str, ...] = ("Advisor Name", "Name", "name")
+
+
+def _identity(row: dict) -> tuple:
+    """(wid_raw, name) for a WID-keyed source row.
+
+    Every WID-keyed loop reads its identity through here, so a tab whose
+    id header is renamed is one edit to _WID_HEADERS rather than one per
+    loop — and so the check below can ask the same question the loops do
+    rather than a lookalike of it.
+    """
+    wid_raw = next((row[key] for key in _WID_HEADERS if key in row), None)
+    name = next((row[key] for key in _NAME_HEADERS if key in row), None)
+    return wid_raw, name
+
+
+# Source tabs keyed by WID, and the loop that consumes each. Tabs keyed by
+# SAP ID (biometric, login_report, one_unit) or by name/team
+# (master_sheet, target_achievement) are deliberately absent — they
+# resolve identity another way and are not what this checks.
+_WID_KEYED_TABS: tuple[str, ...] = (
+    "ccmc_mtd", "connect_session", "p1_overdue", "mtd_perf", "ytd_perf",
+    "three_m_perf", "portfolio", "npr", "answered_calls", "ytd_ccmc",
+    "ytd_p1_overdue",
+)
+
+
+class SourceIdentityError(RuntimeError):
+    """A source tab has rows but none of them yields a WID."""
+
+
+def _check_identity_columns(src: dict) -> None:
+    """Fail loudly when a populated tab can no longer be identified.
+
+    THE FAILURE THIS EXISTS FOR. `ensure_advisor` returns None for a row
+    whose WID does not parse, and every loop then does `continue` — so a
+    renamed id header does not raise, it produces ZERO rows. `_num()`
+    turns the missing columns into 0.0 further down, which means "the tab
+    stopped importing" and "everyone genuinely scored zero" are the same
+    observation downstream.
+
+    That is not hypothetical: "Answered Calls" (667 rows) and "P1 &
+    Overdue" (739 rows) were both importing nothing, because their id
+    headers had become " " and "x". The daily call data was in the sheet
+    and in neither the database's future nor any error log.
+
+    Checked BEFORE the loops run, so a broken source fails the sync
+    instead of emptying a table — load.py's job is to write what
+    transform produced, and "produced nothing" is indistinguishable there
+    from "there is nothing".
+    """
+    broken = [
+        tab for tab in _WID_KEYED_TABS
+        if src.get(tab) and not any(_wid(_identity(row)[0]) is not None for row in src[tab])
+    ]
+    if broken:
+        raise SourceIdentityError(
+            "no WID column found in " + ", ".join(
+                f"{tab!r} ({len(src[tab])} rows, headers "
+                f"{list(src[tab][0].keys())})" for tab in broken
+            )
+            + f" — the id header must be one of {_WID_HEADERS}. Refusing to "
+            "transform: every row would be skipped and the table would be "
+            "emptied rather than left alone."
+        )
+
+
 def _clean(value):
     """Normalize a raw cell value: strip whitespace, treat blank/placeholder as missing."""
     if value is None:
@@ -340,6 +421,10 @@ def transform(src: dict) -> dict:
     """src is the dict returned by etl.extract.extract_all().
     Returns {"advisors": [...], "sales_funnel": [...], ...} ready for load.py.
     """
+    # Before anything is built: a populated tab nobody can identify would
+    # otherwise transform to zero rows and empty its table on load.
+    _check_identity_columns(src)
+
     advisors: dict[int, dict] = {}
     sales_funnel: dict[int, dict] = {}
     pipeline: dict[int, dict] = {}
@@ -391,7 +476,7 @@ def transform(src: dict) -> dict:
 
     # ---- 2. sales_funnel + org columns on advisors (CCMC DATA MTD) ----
     for row in src["ccmc_mtd"]:
-        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, a = res
@@ -407,7 +492,7 @@ def transform(src: dict) -> dict:
 
     # ---- 3. system-verified connect count layered onto sales_funnel (Connect Session) ----
     for row in src.get("connect_session", []):
-        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res
@@ -416,7 +501,7 @@ def transform(src: dict) -> dict:
 
     # ---- 4. pipeline (P1 & Overdue) ----
     for row in src["p1_overdue"]:
-        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res
@@ -431,7 +516,7 @@ def transform(src: dict) -> dict:
     #         Management Lead — capture them as a fallback for advisors who
     #         never appear in MasterSheet or CCMC DATA MTD. ----
     for row in src["biometric"]:
-        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, a = res
@@ -452,7 +537,7 @@ def transform(src: dict) -> dict:
     # ---- 6. attendance: login half (same fallback treatment if Login Report
     #         carries org columns too — harmless no-op via _assign if not) ----
     for row in src["login_report"]:
-        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, a = res
@@ -470,7 +555,7 @@ def transform(src: dict) -> dict:
     # ---- 7. performance: one row per (wid, period) ----
     def perf_rows(rows, period: PerformancePeriod):
         for row in rows:
-            res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+            res = ensure_advisor(*_identity(row))
             if not res:
                 continue
             wid, _ = res
@@ -488,7 +573,7 @@ def transform(src: dict) -> dict:
 
     # ---- 8. portfolio ----
     for row in src["portfolio"]:
-        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res
@@ -501,7 +586,7 @@ def transform(src: dict) -> dict:
 
     # ---- 9. bookings (NPR) ----
     for row in src["npr"]:
-        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res
@@ -514,7 +599,7 @@ def transform(src: dict) -> dict:
 
     # ---- 10. calls (Answered Calls) ----
     for row in src["answered_calls"]:
-        res = ensure_advisor(row.get("WID"), row.get("Advisor Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res
@@ -547,7 +632,7 @@ def transform(src: dict) -> dict:
     #          column names. Written to parallel `ytd_*` fields, never as
     #          period rows — see the SalesFunnel/Pipeline docstrings. ----
     for row in src.get("ytd_ccmc", []):
-        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res
@@ -555,7 +640,7 @@ def transform(src: dict) -> dict:
         sales_funnel[wid].update(_funnel_fields(row, "ytd"))
 
     for row in src.get("ytd_p1_overdue", []):
-        res = ensure_advisor(row.get("WID"), row.get("Name"))
+        res = ensure_advisor(*_identity(row))
         if not res:
             continue
         wid, _ = res

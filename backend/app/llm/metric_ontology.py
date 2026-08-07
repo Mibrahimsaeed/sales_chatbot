@@ -27,7 +27,7 @@ from typing import Any, Optional
 from sqlalchemy import case, func, literal
 
 from app.llm import metric_aliases
-from app.llm.periods import without_period
+from app.llm.periods import PERIODS as PERIOD_ORDER, without_period
 from app.database.models import (
     Advisor, SalesFunnel, Pipeline, Performance, PerformancePeriod,
     TeamTarget, Portfolio, Calls, Attendance,
@@ -376,9 +376,51 @@ METRICS: dict[str, MetricDef] = {
         daily_target_rate=10.0,
         entity_levels=["advisor", "team"],
         primary_level="advisor",
+        # SOURCE: Sales Biometric -> "Answered Calls" -> `Connects MTD`,
+        # landed by the ETL in `calls.connects_mtd`. This read
+        # `SalesFunnel.mtd_new_connect + mtd_followup_connect` — the CCMC
+        # tab — until Phase 17 named the Answered Calls tab the
+        # authoritative source for connects. Both tabs report the measure
+        # and agree for 564 of the 584 advisors carried by both, so this
+        # is a provenance change rather than a numbers change; what it
+        # fixes is that "connects" now comes from the tab that owns it,
+        # at every window the family answers.
+        #
+        # Its DAILY sibling already reads `calls.connects_daily` from the
+        # same tab and the same row, so MTD and DAILY are now like for
+        # like. The YTD sibling still reads SalesFunnel: the Answered
+        # Calls tab has no YTD column, and inventing one would be a
+        # fabricated binding — see the note on ytd_connects below.
         bindings={
-            "advisor": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect),
-            "team": ColumnBinding(model=SalesFunnel, expr=SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect),
+            "advisor": ColumnBinding(model=Calls, expr=Calls.connects_mtd),
+            "team": ColumnBinding(model=Calls, expr=Calls.connects_mtd),
+        },
+    ),
+
+    # The DAILY member of the connects family. Phase 12 verified against
+    # the live source that `Calls.connects_mtd` and the SalesFunnel pair
+    # above are the SAME measure — 36,823 vs 36,796 in total, identical
+    # per advisor for 651 of 667 — so the daily column is genuinely this
+    # measure's daily slice and not a second definition of "connect".
+    # That check is what makes one family legitimate across two tables;
+    # without it, "connects today" vs "connects this month" would compare
+    # two different things and call the difference a trend.
+    #
+    # No alias entry is needed: "connects today" resolves the measure
+    # through metric_aliases as it always did, and the PERIOD half is
+    # resolve_metric_for_period's job, which finds this key through the
+    # family. That is the whole integration.
+    "daily_connects": MetricDef(
+        key="daily_connects",
+        period=PerformancePeriod.DAILY,
+        period_family="connects",
+        label="Total Daily Connects",
+        daily_target_rate=10.0,
+        entity_levels=["advisor", "team"],
+        primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Calls, expr=Calls.connects_daily),
+            "team": ColumnBinding(model=Calls, expr=Calls.connects_daily),
         },
     ),
 
@@ -681,12 +723,34 @@ METRICS: dict[str, MetricDef] = {
 
     "answered_calls": MetricDef(
         key="answered_calls",
+        # Phase 12: this measure gained a real DAILY sibling, so it needs
+        # a family for resolve_metric_for_period to swap through. Without
+        # one, supported_periods() correctly reported MTD only and "calls
+        # today" was refused even once the daily column was bound.
+        period_family="answered_calls",
         label="Answered Calls (MTD)",
         entity_levels=["advisor", "team"],
         primary_level="advisor",
         bindings={
             "advisor": ColumnBinding(model=Calls, expr=Calls.answered_calls_mtd),
             "team": ColumnBinding(model=Calls, expr=Calls.answered_calls_mtd),
+        },
+    ),
+
+    # Same measure, the day's slice of it — "Answered Calls Daily" on the
+    # same sheet row as the MTD column, so the two are like for like by
+    # construction. Verified daily by containment: no row of 667 has
+    # daily > MTD, and the ratio tracks working days elapsed.
+    "daily_answered_calls": MetricDef(
+        key="daily_answered_calls",
+        period=PerformancePeriod.DAILY,
+        period_family="answered_calls",
+        label="Answered Calls (Daily)",
+        entity_levels=["advisor", "team"],
+        primary_level="advisor",
+        bindings={
+            "advisor": ColumnBinding(model=Calls, expr=Calls.answered_calls_daily),
+            "team": ColumnBinding(model=Calls, expr=Calls.answered_calls_daily),
         },
     ),
 
@@ -881,8 +945,46 @@ METRICS: dict[str, MetricDef] = {
         },
     ),
 
+    # The DAILY member of the answered-calls rate family. Nothing about
+    # the CALCULATION is new: the same working_day_scaled binding, the
+    # same daily_target_rate of 10, and aggregation._working_day_
+    # denominator reads working_days.for_period(DAILY), which already
+    # returned 1. So the spec's
+    #
+    #     answered_calls / (teamSize x 10 x workingDays) x 100
+    #
+    # becomes answered_calls_daily / (teamSize x 10) x 100 with no second
+    # formula anywhere — only the numerator column and the declared
+    # period differ from the MTD member below.
+    "daily_answered_calls_rate": MetricDef(
+        key="daily_answered_calls_rate",
+        period=PerformancePeriod.DAILY,
+        period_family="answered_calls_rate",
+        label="Answered Calls % (Daily)",
+        thresholds=DEFAULT_THRESHOLDS,
+        rollup=Rollup.RATIO,
+        daily_target_rate=10.0,
+        entity_levels=["advisor", "team"],
+        primary_level="team",
+        bindings={
+            "advisor": ColumnBinding(
+                model=Calls,
+                expr=Calls.answered_calls_daily * 100.0,
+                ratio_numerator=Calls.answered_calls_daily * 100.0,
+                working_day_scaled=True,
+            ),
+            "team": ColumnBinding(
+                model=Calls,
+                expr=Calls.answered_calls_daily * 100.0,
+                ratio_numerator=Calls.answered_calls_daily * 100.0,
+                working_day_scaled=True,
+            ),
+        },
+    ),
+
     "answered_calls_rate": MetricDef(
         key="answered_calls_rate",
+        period_family="answered_calls_rate",
         label="Answered Calls % (MTD)",
         thresholds=DEFAULT_THRESHOLDS,
         rollup=Rollup.RATIO,
@@ -1082,13 +1184,22 @@ def supported_periods(metric_key: str) -> tuple[PerformancePeriod, ...]:
     with the bindings. A metric with no family answers only its own
     period — which is the truthful answer for anything sourced from a
     fact table that has no period dimension.
+
+    Ordered narrowest to widest (periods.PERIODS), not by declaration
+    order. Callers render this straight into a sentence — "I hold MTD,
+    YTD totals for it" — and once a family could hold three windows,
+    declaration order started producing "MTD, DAILY, YTD", which reads as
+    though the list were arbitrary. The order lives in periods.py with
+    the vocabulary, so a new period is placed once.
     """
     metric = METRICS.get(metric_key)
     if metric is None:
         return ()
     if metric.period_family is None:
         return (metric.period,)
-    return tuple(family_members(metric.period_family))
+    members = family_members(metric.period_family)
+    return tuple(sorted(members, key=lambda p: PERIOD_ORDER.index(p.value)
+                        if p.value in PERIOD_ORDER else len(PERIOD_ORDER)))
 
 
 def metric_for_period(metric_key: str, period: PerformancePeriod | str | None) -> str | None:

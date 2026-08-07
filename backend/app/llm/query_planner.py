@@ -93,6 +93,23 @@ class QueryPlan:
     # comparison action only — [(level, value), ...] preserving each
     # entity's own type, since a comparison can span levels.
     comparison_targets: list = dataclass_field(default_factory=list)
+    # EVERY measure the query named, in the order it named them, with
+    # `metric` above remaining the primary one.
+    #
+    # A plan carries one metric because almost every query names one, and
+    # that stays true — this list holds a single entry for those, so
+    # nothing reading `metric` changes. It exists so "connects and
+    # answered calls" can reach dispatch as the two measures it is
+    # instead of as whichever alias string happened to be longest.
+    #
+    # Deliberately on the PLAN and not on QueryIR: the two shapes that
+    # need it — one person with several measures, and a comparison over
+    # several measures — are both served on the plan path, the second by
+    # comparison_service, which has taken a tuple of KPI keys since it
+    # was written. Widening QueryIR would mean teaching the compiler,
+    # validator, context merge and formatter about metric lists to reach
+    # the same answers.
+    metrics: list[str] = dataclass_field(default_factory=list)
     reason: str = ""
     # How the intent was chosen — recorded in the request trace so a
     # misroute is diagnosable without re-running the planner by hand.
@@ -1052,7 +1069,7 @@ def score_intents(text: str, entities: dict) -> tuple[_Intent, list[_Candidate]]
     return ctx, candidates
 
 
-def _carry_extracted_constraints(plan: QueryPlan, entities: dict) -> QueryPlan:
+def _carry_extracted_constraints(plan: QueryPlan, entities: dict, ctx) -> QueryPlan:
     """Copy the constraints the user stated onto whichever plan won.
 
     Done HERE rather than inside each scorer's build lambda for two
@@ -1068,6 +1085,13 @@ def _carry_extracted_constraints(plan: QueryPlan, entities: dict) -> QueryPlan:
     """
     if plan.period is None:
         plan.period = entities.get("period")
+    if not plan.metrics:
+        # Every measure the query named, from the module that already
+        # decided which one is primary — so the list and `plan.metric`
+        # cannot disagree about what was asked for. Carried here for the
+        # same reason `period` is: one place, so a constraint cannot be
+        # kept by one intent and dropped by another.
+        plan.metrics = list(ctx.metric_intent.keys)
     if not plan.thresholds:
         # Copied, not aliased: a caller mutating plan.thresholds must not
         # reach back into the extractor's dict.
@@ -1079,7 +1103,7 @@ def build_query_plan(text: str, entities: dict) -> QueryPlan:
     ctx, candidates = score_intents(text, entities)
 
     if not candidates:
-        return _carry_extracted_constraints(_fallback(ctx), entities)
+        return _carry_extracted_constraints(_fallback(ctx), entities, ctx)
 
     # Phase 7: PROPOSE then RANK. The scorers above only propose; which
     # one wins is intent_precedence's decision, from the evidence the
@@ -1095,7 +1119,7 @@ def build_query_plan(text: str, entities: dict) -> QueryPlan:
     if ranking.rejected:
         plan.runner_up = ranking.rejected[0][0]
     routing.decide("Intent", winner.intent, ranking.trace())
-    return _carry_extracted_constraints(plan, entities)
+    return _carry_extracted_constraints(plan, entities, ctx)
 
 
 def _evidence_for(ctx: _Intent) -> "intent_precedence.Evidence":

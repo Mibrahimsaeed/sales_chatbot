@@ -239,11 +239,15 @@ def test_the_group_path_still_answers_the_windows_it_has(db):
 # ---------------------------------------------------------------------
 
 
+# Phase 12 moved connects OFF this list: it gained a real daily source,
+# so "Daily Connects" now answers instead of explaining. The label
+# property is pinned here on measures that genuinely have no daily data,
+# and the connects behaviour is pinned in test_daily_metrics.py.
 @pytest.mark.parametrize("text,measure", [
-    ("Daily Connects", "Total Connects"),
-    ("Connects today", "Total Connects"),
     ("Daily CR", "Client Registrations"),
     ("CR today", "Client Registrations"),
+    ("Daily conversions", "Conversions"),
+    ("Conversions today", "Conversions"),
 ])
 def test_an_unavailable_reply_names_the_measure_period_neutrally(db, text, measure):
     """"Total MTD Connects" put a window in the measure's name that the
@@ -256,17 +260,17 @@ def test_an_unavailable_reply_names_the_measure_period_neutrally(db, text, measu
     assert "MTD Client Registrations" not in reply
 
 
-@pytest.mark.parametrize("text,window", [
-    ("Daily Connects", "daily"),
-    ("Daily CR", "daily"),
-    ("Connects this quarter", "3-month"),
+@pytest.mark.parametrize("text,window,available", [
+    ("Daily CR", "daily", "MTD, YTD"),
+    ("Daily conversions", "daily", "MTD, YTD"),
+    ("Connects this quarter", "3-month", "DAILY, MTD, YTD"),
 ])
-def test_the_requested_window_survives_the_neutral_label(db, text, window):
+def test_the_requested_window_survives_the_neutral_label(db, text, window, available):
     """The label going neutral must not make the SENTENCE vague — which
     window was asked for is the part the user can act on."""
     reply = _reply(db, text)["reply"]
     assert f"I don't have {window} figures" in reply
-    assert "I hold MTD, YTD totals" in reply
+    assert f"I hold {available} totals" in reply
 
 
 def test_an_available_window_still_captions_its_answer_with_that_window(db):

@@ -253,8 +253,20 @@ def test_three_month_is_still_refused(mtd_key, _y, _m, _v):
 
 @pytest.mark.parametrize("mtd_key,ytd_key,_m,_y", YTD_PAIRS)
 def test_both_periods_are_reported_as_supported(mtd_key, ytd_key, _m, _y):
+    """The YTD import's guarantee, unchanged: every one of these measures
+    reports BOTH of its periods.
+
+    Asserted as a subset since Phase 12, because connects also gained a
+    real DAILY sibling (calls.connects_daily) and an equality check would
+    now fail for having MORE data than it did. The guarantee this test
+    exists for is that neither MTD nor YTD goes missing; DAILY is pinned
+    separately, per measure, in test_daily_metrics.py — a blanket
+    equality here would silently accept a daily binding appearing on a
+    measure that has no daily source.
+    """
     periods = {p.value for p in supported_periods(mtd_key)}
-    assert periods == {"MTD", "YTD"}, mtd_key
+    assert {"MTD", "YTD"} <= periods, mtd_key
+    assert periods <= {"MTD", "YTD", "DAILY"}, mtd_key
 
 
 def test_a_ytd_query_returns_ytd_numbers_end_to_end(org):

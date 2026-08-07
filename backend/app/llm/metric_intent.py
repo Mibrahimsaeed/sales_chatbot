@@ -42,7 +42,7 @@ the right way round.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import Optional
 
 from app.llm import hierarchy, metric_aliases, token_match
@@ -111,6 +111,24 @@ class MetricIntent:
     None for a phrase nothing recognises. The two deserve different
     replies: one can name the missing ingredient and offer the closest
     available measure, the other can only list what exists."""
+
+    keys: list[str] = dataclass_field(default_factory=list)
+    """EVERY measure the query named, in the order it named them.
+
+    `key` above stays the primary one and every existing reader keeps
+    using it, so single-measure behaviour is untouched. This exists
+    because "connects and answered calls" names two and the pipeline had
+    nowhere to say so — the second was discarded here, at detection,
+    before the planner or the IR could have represented it.
+
+    Holds one entry for a single-measure query, so a caller can read it
+    uniformly, and is EMPTY only when nothing resolved.
+    """
+
+    @property
+    def is_multi(self) -> bool:
+        """Did the query name more than one measure?"""
+        return len(self.keys) > 1
 
     @property
     def resolved(self) -> bool:
@@ -188,6 +206,26 @@ def _widen(residue: str) -> Optional[str]:
         return None
 
 
+def _all_named(text: str, primary: str) -> list[str]:
+    """Every measure `text` names, with `primary` guaranteed present.
+
+    `primary` is whatever this module already resolved, and it stays
+    authoritative: it may come from `entities["metric"]` (a filled
+    clarification slot, an ir_patcher carry) or from a fuzzy/embedding
+    widening, neither of which the alias scan can see. When the scan and
+    the primary disagree about what was named, the scan is the one that
+    is wrong about this query, so the list collapses to the primary
+    alone — a single-measure answer, exactly as before.
+
+    That guard is what keeps this additive: a caller reading `keys` can
+    never be routed somewhere `key` would not have gone.
+    """
+    named = [match.metric for match in metric_aliases.resolve_all(text) if match.metric]
+    if primary not in named:
+        return [primary]
+    return named
+
+
 def detect(text: str, entities: dict) -> MetricIntent:
     """The measure this query asks for, and whether asking was possible.
 
@@ -197,7 +235,7 @@ def detect(text: str, entities: dict) -> MetricIntent:
     """
     key = entities.get("metric") or resolve_metric(text)
     if key:
-        return MetricIntent(key=key, named_text=None)
+        return MetricIntent(key=key, named_text=None, keys=_all_named(text, key))
 
     # A measure the registry KNOWS and cannot compute. Checked before any
     # widening: fuzzy matching would otherwise resolve "cr %" back to the
@@ -230,7 +268,12 @@ def detect(text: str, entities: dict) -> MetricIntent:
         # wrong outcome for another.
         widened = _widen(residue)
         if widened:
-            return MetricIntent(key=widened, named_text=None)
+            # A widened match came from a typo or a paraphrase, which the
+            # alias scan by definition did not see — so _all_named
+            # collapses to this one key. Passed through it anyway so
+            # `keys` is never empty for a resolved intent.
+            return MetricIntent(key=widened, named_text=None,
+                                keys=_all_named(text, widened))
         return MetricIntent(key=None, named_text=residue)
 
     return MetricIntent(key=None, named_text=None)

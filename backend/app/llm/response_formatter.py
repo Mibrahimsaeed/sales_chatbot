@@ -259,9 +259,14 @@ def format_comparison_reply(comparison: dict) -> str:
         return "I need two things to compare."
 
     names = [e["value"] for e in entities]
+    # "on <measure>" only when the comparison is ABOUT one measure. With
+    # several, every row is already labelled with its own, and naming
+    # them again in the header would either repeat the table or — as it
+    # did before this guard — render the raw key list into the sentence.
     metric_note = ""
-    if comparison.get("metric"):
-        label = next((r["label"] for r in rows if r["key"] == comparison["metric"]), comparison["metric"])
+    chosen = comparison.get("metric")
+    if isinstance(chosen, str) and chosen:
+        label = next((r["label"] for r in rows if r["key"] == chosen), chosen)
         metric_note = f" on {label}"
 
     # Column width must account for the widest VALUE as well as the
@@ -307,25 +312,80 @@ def format_comparison_reply(comparison: dict) -> str:
     return "\n".join(lines)
 
 
-def format_advisor_metric_reply(name: str, metric_key: str, value) -> str:
-    """ONE metric for one person: "Shehryar Abbasi has 2 MTD connects."
+def _bare_metric_clause(metric_key: str, value) -> str:
+    """One measure WITHOUT the person's name — the second and later
+    clauses of a multi-measure sentence, which already named them."""
+    phrase = metric_phrase(metric_key)
+    if value is None:
+        return f"no {phrase} on file"
+    if is_percentage_metric(metric_key):
+        return f"{value:,.0f}% {phrase.replace('%', '').strip()}"
+    return f"{_metric_number(value)} {phrase}"
 
-    Deliberately a single sentence with nothing else in it. The full
-    profile already answers this question in the sense of containing the
-    number — the reason this exists is that containing it is not the same
-    as answering it, so adding team, manager or targets "for context"
-    would undo the point.
 
-    `None` means the person has no row in that metric's fact table, which
-    is said plainly rather than rendered as a zero — zero is a real value
-    and claiming it would be a wrong answer.
-    """
+def _one_metric_clause(name: str, metric_key: str, value) -> str:
+    """One measure as a whole sentence, exactly as it always read."""
     phrase = metric_phrase(metric_key)
     if value is None:
         return f"I don't have {phrase} on file for {name}."
     if is_percentage_metric(metric_key):
         return f"{name} is at {value:,.0f}% {phrase.replace('%', '').strip()}."
     return f"{name} has {_metric_number(value)} {phrase}."
+
+
+def format_advisor_metric_reply(name, answered, unavailable=None, period=None) -> str:
+    """The measures one person was asked for.
+
+    Deliberately still a sentence with nothing else in it. The full
+    profile already answers this question in the sense of containing the
+    numbers — the reason this exists is that containing them is not the
+    same as answering them, so adding team, manager or targets "for
+    context" would undo the point.
+
+    `None` for a value means the person has no row in that metric's fact
+    table, which is said plainly rather than rendered as a zero — zero is
+    a real value and claiming it would be a wrong answer.
+
+    `answered` is [(metric_key, value), ...]. A single pair produces
+    byte-identical output to the one-metric version this replaces, which
+    is the whole compatibility contract; several are joined into one
+    sentence rather than listed, because "has 500 MTD connects and 200
+    answered calls" is how the question was asked.
+
+    `unavailable` names the measures that were REQUESTED and could not be
+    served at the requested window. It is appended rather than dropped:
+    silently returning the metrics that happened to work makes a partial
+    answer indistinguishable from a complete one, which is the failure
+    this signature exists to make impossible.
+    """
+    # The pre-Phase-13B call shape, kept working so nothing had to be
+    # updated in step with this: format_advisor_metric_reply(name, key, value).
+    if isinstance(answered, str):
+        answered = [(answered, unavailable)]
+        unavailable = None
+
+    if len(answered) == 1:
+        reply = _one_metric_clause(name, answered[0][0], answered[0][1])
+    else:
+        # Only the first clause names the person; the rest are bare
+        # "N <measure>" so the whole thing reads as one answer rather than
+        # as several replies about the same person.
+        head = _one_metric_clause(name, answered[0][0], answered[0][1]).rstrip(".")
+        tail = [_bare_metric_clause(key, value) for key, value in answered[1:]]
+        parts = [head] + tail
+        reply = f"{', '.join(parts[:-1])} and {parts[-1]}."
+
+    if unavailable:
+        from app.llm.metric_ontology import measure_label, supported_periods
+        from app.llm.periods import label_for as period_label
+
+        for key in unavailable:
+            held = ", ".join(p.value for p in supported_periods(key)) or "no period"
+            reply += (
+                f" I don't have {period_label(period)} figures for "
+                f"{measure_label(key)} — I hold {held} totals for it."
+            )
+    return reply
 
 
 def _metric_number(value: float) -> str:

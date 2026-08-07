@@ -80,9 +80,17 @@ def _metric_value(db: Session, level: str, value: str, metric_key: str) -> float
 
 
 def get_comparison(
-    db: Session, targets: list[tuple[str, str]], metric: str | None = None
+    db: Session, targets: list[tuple[str, str]], metric=None
 ) -> dict:
     """Compare `targets` — a list of (level, value) — side by side.
+
+    `metric` is one key, several keys, or None for the default KPI set.
+    Several is not a new capability: this function has walked a TUPLE of
+    keys since it was written, because the no-metric case renders the
+    whole default set. Accepting a list here is what finally lets a user
+    choose that set — "compare X and Y on connects and answered calls"
+    was reaching this function with one of its two measures already
+    discarded upstream.
 
     Raises NotFoundError when a named entity has no advisors at all: a
     comparison against an entity that doesn't exist would render as a
@@ -91,7 +99,14 @@ def get_comparison(
     if len(targets) < 2:
         raise ValueError("a comparison needs at least two targets")
 
-    kpi_keys = (metric,) if metric else DEFAULT_KPIS
+    if metric is None:
+        kpi_keys = DEFAULT_KPIS
+    elif isinstance(metric, str):
+        kpi_keys = (metric,)
+    else:
+        # Order preserved (it is the order the user named them in) and
+        # duplicates dropped, so a measure named twice renders one column.
+        kpi_keys = tuple(dict.fromkeys(metric))
     entities: list[dict] = []
 
     for level, value in targets:

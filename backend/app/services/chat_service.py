@@ -241,7 +241,11 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         # unavailable this fell through to the metric-help message.
         try:
             comparison = comparison_service.get_comparison(
-                db, plan.comparison_targets, metric=plan.metric
+                db, plan.comparison_targets,
+                # Every measure named, not just the primary one. One entry
+                # behaves exactly as passing the single key did; None (no
+                # measure named) still renders the default KPI set.
+                metric=(plan.metrics or plan.metric) or None,
             )
         except NotFoundError as e:
             return respond("not_found", str(e.message), None)
@@ -353,35 +357,69 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
         # that window, and its contract is explicit that callers degrade
         # rather than substitute — so an explicit DAILY says so instead of
         # quietly becoming MTD.
-        effective = resolve_metric_for_period(plan.metric, plan.period)
-        if effective is None:
-            audit.decision(
-                "period", f"{plan.metric} has no {plan.period} data",
-                f"the query asked for {period_label(plan.period)} figures and "
-                f"{plan.metric!r} has none — refused rather than answering with "
-                "the window the metric happens to hold",
+        # EVERY measure the query named, each resolved to the requested
+        # window independently. `plan.metrics` holds one entry for the
+        # ordinary single-measure question, so that case walks this loop
+        # once and comes out exactly as it did before.
+        #
+        # Resolving per measure is what makes a mixed request honest:
+        # "connects and answered calls today" can have a daily binding for
+        # one and none for the other, and the two answers are different
+        # kinds of answer. Resolving the pair as a unit would force a
+        # single verdict on both.
+        requested = plan.metrics or ([plan.metric] if plan.metric else [])
+        answered: list[tuple[str, object]] = []
+        unavailable: list[str] = []
+        for key in requested:
+            effective = resolve_metric_for_period(key, plan.period)
+            if effective is None:
+                audit.decision(
+                    "period", f"{key} has no {plan.period} data",
+                    f"the query asked for {period_label(plan.period)} figures and "
+                    f"{key!r} has none — reported as unavailable rather than "
+                    "answered with the window the metric happens to hold",
+                )
+                unavailable.append(key)
+                continue
+            answered.append(
+                (effective, advisor_service.get_advisor_metric(db, advisor["wid"], effective))
             )
+
+        if not answered:
+            # Nothing survived. One measure gives the single-measure
+            # refusal, unchanged; several must name them ALL — refusing a
+            # two-measure question by describing one of them is the same
+            # silent-partial failure as answering one of them.
             return respond(
                 "no_data",
-                _unanswerable_text(plan.metric, plan.period, plan.level or "advisor"),
+                " ".join(
+                    _unanswerable_text(key, plan.period, plan.level or "advisor")
+                    for key in (unavailable or [None])
+                ),
                 None,
             )
 
-        value = advisor_service.get_advisor_metric(db, advisor["wid"], effective)
         audit.record_formatter(
             "format_advisor_metric_reply",
-            f"plan.action='advisor_metric' metric={plan.metric!r} at period "
-            f"{plan.period!r} -> {effective!r} for wid={advisor['wid']} — "
-            "one number, not the profile",
+            f"plan.action='advisor_metric' metrics={requested!r} at period "
+            f"{plan.period!r} -> answered {[k for k, _ in answered]!r}, "
+            f"unavailable {unavailable!r} for wid={advisor['wid']}",
         )
         return respond(
             "advisor_metric",
-            # The RESOLVED key, so the name on the number matches the
+            # The RESOLVED keys, so the name on each number matches the
             # number: reading plan.metric here would label a YTD figure
-            # "MTD Client Registrations".
-            format_advisor_metric_reply(advisor["name"], effective, value),
+            # "MTD Client Registrations". `unavailable` is passed rather
+            # than dropped — a measure the user asked for and did not get
+            # must be said out loud, or a two-metric question comes back
+            # looking like a complete one-metric answer.
+            format_advisor_metric_reply(advisor["name"], answered,
+                                        unavailable=unavailable,
+                                        period=plan.period),
             {"wid": advisor["wid"], "name": advisor["name"],
-             "metric": effective, "value": value},
+             "metric": answered[0][0], "value": answered[0][1],
+             "metrics": [{"metric": k, "value": v} for k, v in answered],
+             "unavailable": unavailable},
         )
 
     if plan.action == "lookup":

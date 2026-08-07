@@ -334,8 +334,16 @@ PERIODS = [
          {"intent": "leaderboard", "period": "DAILY"}, finding="F4"),
     Case("top advisors by revenue right now",
          {"intent": "leaderboard", "period": "DAILY"}),
+    # Phase 12: connects gained a REAL daily source (calls.connects_daily),
+    # so "today" now resolves the daily sibling instead of carrying DAILY
+    # on the MTD key and being refused downstream. The period expectation
+    # is unchanged — what changed is that there is now a binding for it.
     Case("top advisors by connects today",
-         {"intent": "leaderboard", "metric": "total_connects", "period": "DAILY"}),
+         {"intent": "leaderboard", "metric": "daily_connects", "period": "DAILY"}),
+    # ... while a measure with no daily source keeps carrying DAILY on its
+    # own key, so the compiler can refuse honestly rather than answer MTD.
+    Case("top advisors by cr today",
+         {"intent": "leaderboard", "metric": "client_registrations", "period": "DAILY"}),
     Case("top advisors by revenue",
          {"intent": "leaderboard", "period": "MTD"}),
     Case("top advisors by revenue last month",

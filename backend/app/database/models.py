@@ -144,6 +144,20 @@ class Attendance(Base):
 
 
 class PerformancePeriod(str, enum.Enum):
+    # DAILY is a metric-ontology period, not a Performance-table one: no
+    # row of `performance` is ever written with it, because the source
+    # sheets report target/cleared month-to-date and up. It exists here
+    # because MetricDef.period is typed against this enum, and the daily
+    # columns that DO exist (Calls.answered_calls_daily,
+    # Calls.connects_daily) need a period to declare. Without it
+    # metric_for_period() raised ValueError on "DAILY" and returned None
+    # for every measure, so a daily question could only ever be refused.
+    #
+    # Kept in this enum rather than given a parallel one so there stays a
+    # single period vocabulary — see migration 0012 for the matching DB
+    # type change, which exists to keep the Postgres enum from drifting
+    # even though nothing writes the value.
+    DAILY = "DAILY"
     MTD = "MTD"
     YTD = "YTD"
     THREE_M = "3M"

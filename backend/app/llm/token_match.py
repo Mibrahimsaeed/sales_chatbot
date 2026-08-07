@@ -103,10 +103,24 @@ def _pattern(phrase: str) -> Optional[re.Pattern]:
     return re.compile(source, re.IGNORECASE)
 
 
+def find(text: str, phrase: str) -> Optional[re.Match]:
+    """WHERE `text` contains `phrase` as a whole token, or None.
+
+    The positional half of `contains()` below, which is now defined in
+    terms of it so the two can never answer differently. Callers that
+    need only a yes/no keep using `contains`; a caller that must order
+    several matches by where they appear — metric_aliases.resolve_all,
+    reading "connects and answered calls" left to right — needs the
+    offset, and computing it with a second pattern would mean a second
+    idea of what counts as a match.
+    """
+    pattern = _pattern(phrase)
+    return pattern.search(text) if pattern else None
+
+
 def contains(text: str, phrase: str) -> bool:
     """Does `text` contain `phrase` as a whole token?"""
-    pattern = _pattern(phrase)
-    return bool(pattern and pattern.search(text))
+    return find(text, phrase) is not None
 
 
 def contains_any(text: str, phrases: Iterable[str]) -> bool:

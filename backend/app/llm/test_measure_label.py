@@ -117,12 +117,16 @@ def test_metric_label_still_names_the_period(key, expected):
 # ---------------------------------------------------------------------
 
 
+# Phase 12 note: connects gained a real DAILY source, so a connects
+# example must use 3M — the window that family still lacks — for these to
+# be testing an UNAVAILABLE period at all. The label property is
+# unchanged and so is the coverage of it; only the window moved.
 @pytest.mark.parametrize("key,period,measure", [
-    ("total_connects", "DAILY", "Total Connects"),
+    ("total_connects", "3M", "Total Connects"),
+    ("ytd_connects", "3M", "Total Connects"),
     ("client_registrations", "DAILY", "Client Registrations"),
     ("cr_rate", "DAILY", "CR %"),
-    ("total_connects", "3M", "Total Connects"),
-    ("ytd_connects", "DAILY", "Total Connects"),
+    ("conversion", "DAILY", "Conversions"),
 ])
 def test_the_unavailable_reply_names_the_measure_without_a_second_period(
         key, period, measure):
@@ -132,8 +136,8 @@ def test_the_unavailable_reply_names_the_measure_without_a_second_period(
 
 
 @pytest.mark.parametrize("key,period,window", [
-    ("total_connects", "DAILY", "daily"),
     ("client_registrations", "DAILY", "daily"),
+    ("conversion", "DAILY", "daily"),
     ("total_connects", "3M", "3-month"),
 ])
 def test_the_requested_period_is_still_reported_correctly(key, period, window):
@@ -143,21 +147,22 @@ def test_the_requested_period_is_still_reported_correctly(key, period, window):
     assert f"I don't have {window} figures" in reply
 
 
-@pytest.mark.parametrize("key,available", [
-    ("total_connects", "MTD, YTD"),
-    ("client_registrations", "MTD, YTD"),
-    ("mtd_cleared", "MTD, YTD, 3M"),
-    ("meeting_rate", "MTD"),
+@pytest.mark.parametrize("key,period,available", [
+    # narrowest to widest, so the list never reads as arbitrary
+    ("total_connects", "3M", "DAILY, MTD, YTD"),
+    ("client_registrations", "DAILY", "MTD, YTD"),
+    ("mtd_cleared", "DAILY", "MTD, YTD, 3M"),
+    ("meeting_rate", "DAILY", "MTD"),
 ])
-def test_the_reply_still_lists_the_windows_that_do_exist(key, available):
-    reply = _unanswerable_reply(_ir(key, "DAILY"))
+def test_the_reply_still_lists_the_windows_that_do_exist(key, period, available):
+    reply = _unanswerable_reply(_ir(key, period))
     assert f"I hold {available} totals" in reply
 
 
 def test_the_reported_examples_read_exactly_as_specified():
-    assert _unanswerable_reply(_ir("total_connects", "DAILY")) == (
-        "I don't have daily figures for Total Connects yet — I hold "
-        "MTD, YTD totals for it. Ask for one of those and I can answer."
+    assert _unanswerable_reply(_ir("total_connects", "3M")) == (
+        "I don't have 3-month figures for Total Connects yet — I hold "
+        "DAILY, MTD, YTD totals for it. Ask for one of those and I can answer."
     )
     assert _unanswerable_reply(_ir("client_registrations", "DAILY")) == (
         "I don't have daily figures for Client Registrations yet — I hold "

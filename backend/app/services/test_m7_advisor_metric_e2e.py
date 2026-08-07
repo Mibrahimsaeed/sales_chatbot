@@ -117,9 +117,28 @@ def test_possessive_phrasing_works_too(db):
 
 
 def test_the_response_carries_structured_data(db):
+    """The four keys a consumer reads, unchanged.
+
+    Asserted as a SUBSET since Phase 13B, which added `metrics` (the
+    per-measure list, for a reply naming several) and `unavailable` (the
+    measures that were asked for and could not be served). Both are
+    additive — the exact-equality form would fail on any new field
+    regardless of whether an existing one had changed, which is the
+    opposite of what this test is for. The companion test below pins the
+    new fields on their own.
+    """
     r = handle_chat_message(db, "connects of Shehryar Abbasi", session_id=None)
-    assert r["data"] == {"wid": 1, "name": "Shehryar Abbasi",
-                         "metric": "total_connects", "value": 2.0}
+    assert r["data"].items() >= {"wid": 1, "name": "Shehryar Abbasi",
+                                 "metric": "total_connects", "value": 2.0}.items()
+
+
+def test_a_single_metric_response_reports_one_metric_and_nothing_unavailable(db):
+    """The Phase 13B fields on a single-measure question: one entry, and
+    an empty unavailable list. A consumer can therefore read `metrics`
+    uniformly instead of special-casing the single answer."""
+    r = handle_chat_message(db, "connects of Shehryar Abbasi", session_id=None)
+    assert r["data"]["metrics"] == [{"metric": "total_connects", "value": 2.0}]
+    assert r["data"]["unavailable"] == []
 
 
 # ---------------------------------------------------------------------

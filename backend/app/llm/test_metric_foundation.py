@@ -48,7 +48,11 @@ def test_a_metric_with_no_family_supports_only_its_own_period():
     genuinely have one period."""
     assert supported_periods("attendance_rate") == (PerformancePeriod.MTD,)
     assert supported_periods("late_count") == (PerformancePeriod.MTD,)
-    assert supported_periods("answered_calls") == (PerformancePeriod.MTD,)
+    # `answered_calls` was a third example here until Phase 12 gave it a
+    # real DAILY sibling from calls.answered_calls_daily. Replaced rather
+    # than removed — the property needs an example that still holds, and
+    # login_rate has no period siblings of any kind.
+    assert supported_periods("login_rate") == (PerformancePeriod.MTD,)
 
 
 @pytest.mark.parametrize("key,period,expected", [

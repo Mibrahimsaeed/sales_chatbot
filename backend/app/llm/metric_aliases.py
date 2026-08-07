@@ -230,6 +230,34 @@ for _key, _stems in _YTD_STEMS.items():
     ))
 
 
+# DAILY phrasings, for the three measures that have real daily data
+# (Phase 12 — `calls.answered_calls_daily` and `calls.connects_daily`).
+# Same generated-from-stems shape as the YTD block above and for the same
+# reason.
+#
+# THESE ARE NOT A SECOND PERIOD RESOLVER. "connects today" never reaches
+# here as a period at all: temporal_parser reads the window, and
+# resolve_metric_for_period swaps `total_connects` for `daily_connects`
+# through the shared period_family. What this block adds is only that the
+# daily KEY is nameable — which metric_ontology requires of every metric,
+# and which the YTD keys have had all along. The two routes are
+# convergent by construction: both end at the same key.
+_DAILY_STEMS: dict[str, tuple[str, ...]] = {
+    "daily_connects": ("connects", "connections"),
+    "daily_answered_calls": ("answered calls", "calls answered"),
+    "daily_answered_calls_rate": ("answered calls %", "answered call rate",
+                                  "connect %", "connect rate"),
+}
+
+for _key, _stems in _DAILY_STEMS.items():
+    ALIASES[_key] = tuple(dict.fromkeys(
+        phrase
+        for stem in _stems
+        for phrase in (f"daily {stem}", f"today's {stem}", f"{stem} today",
+                       f"{stem} daily")
+    ))
+
+
 # =====================================================================
 # Declared but not computable
 # =====================================================================
@@ -381,6 +409,60 @@ def resolve(text: str) -> Optional[AliasMatch]:
         if token_match.contains(lowered, phrase):
             return match
     return None
+
+
+def resolve_all(text: str) -> list[AliasMatch]:
+    """EVERY measure this text names, in the order it names them.
+
+    `resolve()` above returns the first hit in an index sorted
+    longest-phrase-first, which for "connects and answered calls" is
+    `answered_calls` — so the other measure was discarded before anything
+    downstream could know it had been asked for. Order was not even the
+    tie-break: "answered calls and connects" resolved to `answered_calls`
+    too, because the winner is whichever ALIAS STRING is longer.
+
+    Same index, same matcher, same longest-first precedence — the only
+    additions are that the scan continues after a hit and that each hit
+    MASKS its own span before the next phrase is tried. Masking is what
+    makes the matches non-overlapping: without it "answered calls" would
+    be found, and then "calls" would be found again inside the text it
+    had already claimed, reporting two measures where the user named one.
+    token_match.mask is the same helper the ranking scan already uses to
+    keep a comparator phrase from contributing the word inside it.
+
+    Ordering is by POSITION IN THE TEXT, not by alias length, so the list
+    reads the way the sentence does. Deduplicated by metric key, so two
+    phrasings of one measure ("connects", "total connects") count once.
+
+    Unavailable entries are returned too, with `metric=None` — a caller
+    asking "what did they name?" needs to hear about a measure this
+    system knows and cannot compute, or that half of the request would
+    vanish exactly as the second metric used to.
+
+    `resolve()` is untouched and every existing caller keeps its
+    behaviour, including the longest-alias winner.
+    """
+    from app.llm import token_match
+
+    lowered = text.lower()
+    masked = lowered
+    hits: list[tuple[int, AliasMatch]] = []
+    seen: set = set()
+
+    for phrase, match in _INDEX:
+        found = token_match.find(masked, phrase)
+        if found is None:
+            continue
+        masked = token_match.mask(masked, [phrase])
+        # Key on the metric for available measures and on the phrase for
+        # unavailable ones, which have no key to collide on.
+        identity = match.metric or f"unavailable:{match.phrase}"
+        if identity in seen:
+            continue
+        seen.add(identity)
+        hits.append((found.start(), match))
+
+    return [match for _, match in sorted(hits, key=lambda pair: pair[0])]
 
 
 def phrases_for(metric_key: str) -> list[str]:

@@ -35,8 +35,8 @@ import re
 
 from app.llm import (
     advisor_resolver, conversation_context, conversation_memory,
-    cross_turn_resolver, hierarchy, llm_planner, metric_intent, multi_intent,
-    routing, semantic_parser,
+    cross_turn_resolver, hierarchy, llm_planner, metric_intent, metric_ontology,
+    multi_intent, routing, semantic_parser,
 )
 from app.llm.conversation_memory import MAX_CLARIFY_ATTEMPTS, PendingClarification
 from app.llm.entity_extractor import extract_entities, PROVENANCE_KEY
@@ -134,7 +134,18 @@ def _is_rule_based(plan: QueryPlan) -> bool:
                        refactor.
     """
     if plan.action == "comparison":
-        return plan.metric is None
+        # Phase 13B extends the same rule to a comparison naming SEVERAL
+        # measures, for the reason the no-metric case is here: QueryIR
+        # carries one metric, and comparison_service carries a tuple. A
+        # two-measure comparison sent down the IR path arrives with one
+        # of them already gone — which is what "compare X and Y on
+        # connects and answered calls" did, answering only on whichever
+        # alias string was longer.
+        #
+        # One measure still takes the IR path and keeps everything that
+        # depends on it: _effective_metric, conversation memory,
+        # ir_validator and the response planner.
+        return plan.metric is None or len(plan.metrics) > 1
     return plan.action in _RULE_BASED_ACTIONS
 
 # Actions complete enough to serve directly even when looks_compound()
@@ -282,6 +293,46 @@ def _handle_pending(
         kind="clarify", ir=pending.partial_ir, entities=entities,
         clarify_message=message, clarify_options=options,
     )
+
+
+# A possessive attaches what follows it to whoever precedes it. Counting
+# them is how this module tells "one subject, several measures" from
+# "several subjects, one measure each" — see _distributes_metrics below.
+_POSSESSIVE_RE = re.compile(r"\w's\b", re.I)
+
+
+def _distributes_metrics(text: str, plan: QueryPlan) -> bool:
+    """Does this turn attach DIFFERENT measures to DIFFERENT subjects?
+
+        "Zainab's connects and answered calls"          one subject   -> False
+        "Zainab's connects and Awais's answered calls"  two subjects  -> True
+
+    Both name two measures, and only the first can be answered as two
+    measures about one person. The second is a (subject, measure) PAIRING,
+    which no structure here can carry: QueryPlan holds one subject and a
+    flat metric list, so answering it means attaching both measures to
+    whichever person resolved — and that is not a partial answer, it is
+    the wrong person's number under the right label.
+
+    WHY POSSESSIVES AND NOT THE ENTITY DICT. Because the entity dict
+    cannot see it: advisor_resolver.resolve_all_from_text finds both
+    people in "Zainab's connects and Awais's connects" and only ONE in
+    "Zainab's connects and Awais's answered calls" — the name span runs
+    into the measure phrase and fails to match. That is a pre-existing
+    extraction limitation, and a safety check that trusted it would be
+    blind in exactly the case it exists to catch.
+
+    So the signal is structural and deliberately over-cautious: two
+    possessives plus two measures means the measures are distributed,
+    and this refuses. It can over-trigger ("Zainab's team's connects and
+    answered calls" reads as distributed and gets a clarification rather
+    than an answer) — which is the right way round, because the failure
+    it prevents is a confident wrong attribution and the failure it
+    causes is one extra question.
+    """
+    if len(plan.metrics) < 2:
+        return False
+    return len(_POSSESSIVE_RE.findall(text)) >= 2
 
 
 # A follow-up that carries a pronoun or a bare possessive is asking about
@@ -796,6 +847,26 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             plan.metric = carry.entities["metric"]
         tracing.record_plan(plan)
         audit.record_plan(plan)
+
+    # A (subject, measure) pairing this system cannot represent. Checked
+    # before the plan is served, because every path below would answer it
+    # by attaching every measure to one subject.
+    if _distributes_metrics(cleaned, plan):
+        labels = " and ".join(metric_ontology.measure_label(k) for k in plan.metrics)
+        routing.decide(
+            "Validation", "refused",
+            f"the turn names {len(plan.metrics)} measures against more than one "
+            "subject; a plan carries one subject and cannot say which measure "
+            "belongs to whom — asked rather than attributing both to one person",
+        )
+        return Resolution(
+            kind="clarify", plan=plan, entities=entities,
+            clarify_message=(
+                f"I can't tell which of {labels} you want for which person in one "
+                "question. Ask me for one person at a time, or compare them on the "
+                f"same measures — e.g. 'compare them on {labels}'."
+            ),
+        )
 
     # A capability this system does not have. Distinct from a
     # clarification (there is nothing the user could add that would make
