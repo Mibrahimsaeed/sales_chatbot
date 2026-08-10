@@ -461,10 +461,33 @@ def transform(src: dict) -> dict:
         wid_ms, a = res
         a["in_master_sheet"] = True
         _assign(a, "company", row.get("Company"))
-        _assign(a, "region", row.get("Regional"))
+        # "Regional" is the UNIT HEAD, not a place. It holds 11 distinct
+        # PEOPLE for all 596 rows, and the level cardinality confirms the
+        # chain it belongs to: 182 management leads -> 88 portfolio leads
+        # -> 11 regionals -> 9 teams, nesting exactly as
+        # advisor -> bcm -> zonal_head -> unit_head -> team.
+        #
+        # It was written to `region`, so `unit_head` fell back to the RM
+        # column on the ACTIVITY tabs — populated for 686 of 3,171 rows
+        # against MasterSheet's 596 of 596. Every Unit Head scope was
+        # therefore built from a partial column: 170 advisors and 10,355
+        # connects went missing across 9 of 11 unit heads, and Chairman's
+        # revenue was under-reported by 216 million. `region`
+        # simultaneously became a list of people's names, which is what
+        # put "Region" in the disambiguation prompt for a person.
+        #
+        # MasterSheet runs FIRST, so this now WINS and the activity RM
+        # below fills only the advisors MasterSheet does not list — the
+        # fallback ordering _assign already provides, and the same
+        # arrangement portfolio_lead and management_lead have always had.
+        _assign(a, "rm", row.get("Regional"))
         _assign(a, "team", row.get("Teams"))
         _assign(a, "portfolio_lead", row.get("Portfolio Lead"))
         _assign(a, "management_lead", row.get("Management Lead"))
+        # `region` is deliberately NOT written here. MasterSheet's own
+        # "Region" column is empty for all 596 rows, and CCMC DATA MTD
+        # carries the real geography (North/Center/South) — which this
+        # line used to shadow with a person's name.
         # MasterSheet carries the IBD meeting figures too. Verified equal
         # to the "P/C Meeting" tab on all 608 shared WIDs, and this tab is
         # already fetched — so it is the source, per the audit.

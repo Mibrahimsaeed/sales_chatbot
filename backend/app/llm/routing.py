@@ -229,7 +229,18 @@ def shortcut_allowed(text: str, entities: dict) -> tuple[bool, str]:
 # CR". Deliberately narrow — this decides whether to ask a clarifying
 # question, and asking one when the user named nobody would be worse than
 # the defect it fixes.
-_POSSESSIVE = re.compile(r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z/]+)*)'s\b")
+# A capitalised possessive: "Waqar Haider's", "Central Region's".
+#
+# The trailing group also accepts a PARENTHESISED qualifier, because real
+# master-sheet names carry them — "Omer Sandhu (Virtual)". Without it the
+# capture stopped at the bracket, matched nothing, and the whole
+# unresolved-subject refusal was skipped for every such person: their
+# queries fell through to a global ranking instead of "I couldn't find
+# anyone called that". Kept to a bracketed word rather than arbitrary
+# punctuation so the pattern still ends at a sentence boundary.
+_POSSESSIVE = re.compile(
+    r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z/]+)*(?:\s+\([A-Za-z][A-Za-z\s]*\))?)'s\b"
+)
 
 
 def _trim_span(value: str) -> str:
@@ -279,6 +290,30 @@ _SENTENCE_OPENERS = frozenset({
     "compare", "show", "list", "give", "tell", "what", "who", "which",
     "how", "find", "get", "display", "is", "are", "was", "were",
 })
+
+
+def _any_subject_grounded(entities: dict) -> bool:
+    """Did extraction ground ANY entity this query could be about?
+
+    Read from the hierarchy registry rather than a fixed key list, so a
+    level added later counts here for free — the same derivation
+    _known_non_person below already uses, and for the same reason.
+
+    Deliberately generous: one grounded entity of any kind is enough. The
+    question this answers is not "is the traversal correct" but "does the
+    traversal have a source at all", and a stricter test would start
+    refusing the possessive queries that work today.
+    """
+    from app.llm import hierarchy
+
+    if entities.get("advisor_wids"):
+        return True
+    for level in hierarchy.HIERARCHY_LEVELS:
+        if entities.get(level):
+            return True
+        if entities.get(hierarchy.LEVEL_ENTITY_KEYS.get(level, f"{level}s")):
+            return True
+    return False
 
 
 def _known_non_person(value: str, entities: dict) -> bool:
@@ -366,8 +401,22 @@ def unresolved_subject(text: str, entities: dict) -> Optional[str]:
     if metric_aliases.resolve(text) is None:
         return None  # no measure named — the primary_level defect can't fire
 
-    if reference_parser.parse(text):
-        return None  # a relation traversal, grounded downstream
+    # A relation traversal ("X's team") is grounded downstream, by the
+    # planner, against the manager columns — but ONLY if its source
+    # grounded to something. When it did not, there is no downstream: the
+    # person silently disappears, the word "team" is still in the text,
+    # and the planner builds a perfectly valid UNFILTERED team
+    # leaderboard. "Omer Sandhu (Virtual)'s team pipeline" answered with
+    # a ranking of all nine teams, confidently, having dropped the only
+    # subject the question had.
+    #
+    # So the escape now asks whether the traversal has anything to
+    # traverse FROM. Nothing grounded means the possessive names someone
+    # this system cannot find, which is exactly the case the rest of this
+    # function exists to refuse — and refusing it here is the same answer
+    # the non-possessive phrasing already gives.
+    if reference_parser.parse(text) and _any_subject_grounded(entities):
+        return None
 
     for raw in _POSSESSIVE.findall(text):
         candidate = _trim_span(raw)

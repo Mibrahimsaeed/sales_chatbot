@@ -465,14 +465,67 @@ def _score_roster(ctx: _Intent) -> _Candidate | None:
     )
 
 
+def _names_a_measure_here(ctx: _Intent) -> bool:
+    """Did THIS turn's words name a measure?
+
+    `ctx.metric` is not the same question: conversation context writes an
+    inherited measure into `entities["metric"]`, which metric_intent
+    honours first. Reading it here turned "tell me about Downtown's
+    advisors" — a roster request — into a revenue query, purely because
+    the previous turn had been about revenue.
+
+    Asked of metric_aliases, the registry that already owns "does this
+    text name a measure", so no second vocabulary decides it.
+    """
+    from app.llm import metric_aliases
+
+    match = metric_aliases.resolve(ctx.text)
+    return bool(match and match.metric)
+
+
 def _score_hierarchy(ctx: _Intent) -> _Candidate | None:
     """"X's team" / "who reports to X" — the group under someone."""
     if not ctx.is_relational:
         return None
 
+    # A measure this TURN named turns "who is under X" into "what is X's
+    # group's <measure>". An inherited one must not: see
+    # _names_a_measure_here.
+    asked_for_a_measure = _names_a_measure_here(ctx) and not ctx.is_roster
+
     group = ctx.group_entity()
     if group and group[0] in hierarchy.NEW_GROUP_LEVELS:
         level, value = group
+        # A MEASURE turns "who is under X" into "what is X's group's <measure>".
+        #
+        # The scope was already right — `level`/`value` name the manager
+        # and every metric path filters on exactly that pair — but the
+        # plan dropped the measure, so "X's team pipeline" and "X's
+        # team's connects" both produced the same canned breakdown card
+        # (advisor count, connects, cleared) and neither answered what
+        # was asked. The relationship was understood and the question was
+        # not.
+        #
+        # Built as `group_metric`, the existing "one group, one measure"
+        # action, rather than a new one: that action already carries a
+        # level+entity+metric and compiles to the scoped query this
+        # needs, so the fix is to reach it rather than to teach breakdown
+        # about metrics. `is_answerable` guards the pair exactly as
+        # _score_group_metric does — a measure with no binding at this
+        # level falls back to the breakdown instead of refusing.
+        if asked_for_a_measure and ctx.metric and is_answerable(ctx.metric, level):
+            metric = ctx.metric
+            return _Candidate(
+                intent="group_metric",
+                score=cat.PRIOR["hierarchy"] + cat.W_EXPLICIT_PHRASE + cat.W_ENTITY,
+                evidence=["relational_phrase", f"group_entity:{level}",
+                          f"metric:{metric}"],
+                build=lambda: QueryPlan(
+                    action="group_metric", level=level, entity_value=value,
+                    metric=metric, limit=ctx.entities.get("limit", 10),
+                    ascending=_sort_signal(ctx.q, metric),
+                ),
+            )
         return _Candidate(
             intent="hierarchy",
             score=cat.PRIOR["hierarchy"] + cat.W_EXPLICIT_PHRASE + cat.W_ENTITY,
@@ -483,6 +536,22 @@ def _score_hierarchy(ctx: _Intent) -> _Candidate | None:
         )
     if ctx.entities.get("team"):
         team = ctx.entities["team"]
+        # Same rule as the manager branch above: a named measure makes
+        # this a metric question about the team, not a request for its
+        # summary card. "Alpha's team pipeline" asked for pipeline and
+        # got the canned advisors+connects summary.
+        if asked_for_a_measure and ctx.metric and is_answerable(ctx.metric, "team"):
+            metric = ctx.metric
+            return _Candidate(
+                intent="group_metric",
+                score=cat.PRIOR["hierarchy"] + cat.W_EXPLICIT_PHRASE + cat.W_ENTITY,
+                evidence=["relational_phrase", "group_entity:team", f"metric:{metric}"],
+                build=lambda: QueryPlan(
+                    action="group_metric", level="team", entity_value=team,
+                    metric=metric, limit=ctx.entities.get("limit", 10),
+                    ascending=_sort_signal(ctx.q, metric),
+                ),
+            )
         return _Candidate(
             intent="hierarchy",
             score=cat.PRIOR["hierarchy"] + cat.W_EXPLICIT_PHRASE + cat.W_ENTITY,
@@ -1036,6 +1105,24 @@ def score_intents(text: str, entities: dict) -> tuple[_Intent, list[_Candidate]]
     # _Intent.level_q.
     evidence = resolve_metric_evidence(text)
     level_q = token_match.mask(q, [evidence[1]]) if evidence else q
+    # A level word consumed by a POSSESSIVE RELATION is not a choice of
+    # grouping level — it is the relation's target. "Umar Unit's team
+    # pipeline" says which people to aggregate, not to group the answer
+    # by team; subject_level.decide() ranks an explicit level word above
+    # the grounded subject, so leaving "team" visible here made the
+    # manager a mere filter and split his figure across the teams his
+    # people happen to sit in — one row per team and no total.
+    #
+    # Masked for exactly the reason the metric phrase above is: a phrase
+    # that means something else must not be read as a level. Same helper,
+    # same idea, and reference_parser already owns the possessive
+    # pattern, so nothing new decides what counts as a relation.
+    from app.llm import reference_parser
+
+    relation_spans = [ref.matched_text for ref in reference_parser.parse(text)
+                      if ref.kind == reference_parser.NAMED and ref.matched_text]
+    if relation_spans:
+        level_q = token_match.mask(level_q, relation_spans)
     ctx = _Intent(
         text=text,
         q=q,

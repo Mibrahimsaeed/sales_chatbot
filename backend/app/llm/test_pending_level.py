@@ -8,8 +8,8 @@ contextless "BCM", grounded to nothing, and fell through to "I'm not
 tracking that one".
 
 The fixture makes the two readings return DIFFERENT numbers on purpose.
-As a BCM the name means the group reporting to him (30); as an advisor it
-means his own row (77). A fixture where both were 30 would pass whether
+As a BCM the name means the group reporting to him (30); as a TEAM it
+means the advisor sitting on the team of that name (77). A fixture where both were 30 would pass whether
 or not the chosen level was actually applied.
 """
 
@@ -30,7 +30,7 @@ from app.services.chat_service import handle_chat_message
 
 NAME = "Khurram Ishaq Quraishi"
 AS_BCM = 30      # 10 + 20, the two advisors reporting to him
-AS_ADVISOR = 77  # his own row
+AS_TEAM = 77     # the one advisor on the team named after him
 
 
 @pytest.fixture(autouse=True)
@@ -50,11 +50,20 @@ def org(monkeypatch):
                            poolclass=StaticPool)
     Base.metadata.create_all(engine)
     s = sessionmaker(bind=engine)()
-    # wids 1-2 report to him; wid 3 IS him, as an advisor in his own right.
-    for wid, name, bcm, cr in ((1, "Yasir Ali", NAME, 10),
-                               (2, "Waqar Haider", NAME, 20),
-                               (3, NAME, "Usman Ghani", AS_ADVISOR)):
-        s.add(Advisor(wid=wid, name=name, team="Blue Area", company="Graana",
+    # wids 1-2 report to him as BCM; wid 3 sits on a TEAM named after him.
+    #
+    # The ambiguity is deliberately BCM vs TEAM rather than BCM vs
+    # ADVISOR since Phase 22. A name that is also an advisor no longer
+    # reaches this question for a bare metric query — "CR of X" means X's
+    # own CR now, which is the whole point of that phase — so a fixture
+    # built on BCM-vs-advisor would be asking about a question the system
+    # is right not to ask. Two levels that are BOTH groups still ask, and
+    # every guarantee this file exists for is unchanged: the question is
+    # stored, the answer is matched, and the original query is re-run.
+    for wid, name, bcm, team, cr in ((1, "Yasir Ali", NAME, "Blue Area", 10),
+                                     (2, "Waqar Haider", NAME, "Blue Area", 20),
+                                     (3, "Sana Tariq", "Usman Ghani", NAME, AS_TEAM)):
+        s.add(Advisor(wid=wid, name=name, team=team, company="Graana",
                       management_lead=bcm, rm="Tariq Mehmood",
                       portfolio_lead="Fawad Hafeez", office="Beverly Center",
                       region="North/KPK", unit="A", in_master_sheet=True))
@@ -100,7 +109,7 @@ def _ask(org, session="s"):
 def test_the_question_is_asked(org):
     response = _ask(org)
     assert response["type"] == "clarification"
-    assert response["options"] == ["BCM", "Advisor"]
+    assert response["options"] == ["Team", "BCM"]
 
 
 def test_the_outstanding_question_is_stored(org):
@@ -111,7 +120,7 @@ def test_the_outstanding_question_is_stored(org):
 
     assert pending is not None
     assert pending.value == NAME
-    assert pending.levels == ["bcm", "advisor"]
+    assert pending.levels == ["team", "bcm"]
     assert pending.original_text == f"CR of {NAME}"
 
 
@@ -140,15 +149,15 @@ def test_answering_bcm_reads_the_name_as_the_bcm(org):
 
     assert response["type"] != "clarification"
     assert str(AS_BCM) in response["reply"]
-    assert str(AS_ADVISOR) not in response["reply"]
+    assert str(AS_TEAM) not in response["reply"]
 
 
-def test_answering_advisor_reads_the_name_as_the_advisor(org):
+def test_answering_team_reads_the_name_as_the_team(org):
     _ask(org)
-    response = handle_chat_message(org, "Advisor", session_id="s")
+    response = handle_chat_message(org, "Team", session_id="s")
 
     assert response["type"] != "clarification"
-    assert str(AS_ADVISOR) in response["reply"]
+    assert str(AS_TEAM) in response["reply"]
 
 
 def test_the_two_answers_give_different_numbers(org):
@@ -156,10 +165,10 @@ def test_the_two_answers_give_different_numbers(org):
     _ask(org, session="b")
     as_bcm = handle_chat_message(org, "BCM", session_id="b")["reply"]
     _ask(org, session="a")
-    as_advisor = handle_chat_message(org, "Advisor", session_id="a")["reply"]
+    as_advisor = handle_chat_message(org, "Team", session_id="a")["reply"]
 
     assert str(AS_BCM) in as_bcm
-    assert str(AS_ADVISOR) in as_advisor
+    assert str(AS_TEAM) in as_advisor
     assert as_bcm != as_advisor
 
 
@@ -177,7 +186,7 @@ def test_answering_clears_the_pending_question(org):
     assert conversation_memory.get_pending_level("s") is None
 
 
-@pytest.mark.parametrize("answer", ["BCM", "bcm", "Advisor", "advisor"])
+@pytest.mark.parametrize("answer", ["BCM", "bcm", "Team", "team"])
 def test_the_answer_is_case_insensitive(org, answer):
     _ask(org)
     assert handle_chat_message(org, answer, session_id="s")["type"] != "clarification"
@@ -280,6 +289,10 @@ def test_pinning_removes_only_the_losing_groundings(org):
 def test_pinning_leaves_an_unrelated_entity_alone(org):
     from app.llm.entity_extractor import extract_entities
 
-    entities = extract_entities(f"CR of {NAME} in Blue Area", org)
+    # "Sana Tariq" is an advisor and nothing else, so pinning NAME to one
+    # of ITS levels must leave her grounding untouched. (Blue Area is no
+    # longer a safe bystander: since Phase 22 this fixture makes NAME a
+    # team too, so pinning NAME's team level legitimately touches it.)
+    entities = extract_entities(f"CR of {NAME} and Sana Tariq", org)
     pinned = nlu_pipeline._pin_level(entities, NAME, "bcm")
-    assert pinned.get("team") == "Blue Area"
+    assert pinned.get("advisor_name") == "Sana Tariq"

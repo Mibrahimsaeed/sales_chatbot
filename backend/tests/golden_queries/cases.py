@@ -652,8 +652,15 @@ AMBIGUOUS = [
          {"intent": "clarify_person", "entity": "Ali Raza"}),
     Case("who is Ali Raza's bcm",
          {"intent": "clarify_person", "entity": "Ali Raza"}),
+    # Phase 22: a bare measure question about a name that is ALSO a person
+    # answers about the PERSON. Every manager is an advisor with their own
+    # figures, and being a BCM must not turn "what is X's revenue" into a
+    # question about the people under X — there was no phrasing left that
+    # reached the individual. The two cases above still ask, because they
+    # name no measure and so have no person reading to prefer.
     Case("what is Kamran Shah's revenue",
-         {"intent": "clarify_ambiguous", "metric": None}),
+         {"intent": "advisor_metric", "level": "advisor", "entity": "Kamran Shah",
+          "metric": "mtd_cleared"}),
     Case("all advisors under Kamran Shah",
          {"intent": "advisor_profile", "level": "advisor", "entity": "Kamran Shah"},
          known_gap="Should be a roster of BCM Kamran Shah's advisors, or a "

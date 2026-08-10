@@ -263,10 +263,55 @@ def check_near_duplicate_names(db: Session) -> list[Finding]:
     return findings
 
 
-def validate_database(db: Session) -> ValidationReport:
+def check_stale_master_sheet_flags(db: Session, master_sheet_wids) -> Finding | None:
+    """Advisors still flagged `in_master_sheet` that the sheet no longer lists.
+
+    Zero after a clean sync, because load.reconcile_master_sheet clears
+    them. A non-zero count therefore means reconciliation did not run —
+    the payload fell below its coverage floor — and the roster is
+    carrying people who have left, inflating every headcount and every
+    per-advisor average until the next complete fetch.
+
+    Needs the payload, so it is skipped when called without one (the
+    health endpoint has no sheet in hand). Warning, not error: the data
+    that IS there remains correct, which is the same standard every other
+    check here applies.
+    """
+    if not master_sheet_wids:
+        return None
+
+    stale = [
+        w for (w,) in db.query(Advisor.wid).filter(Advisor.in_master_sheet.is_(True))
+        if w not in master_sheet_wids
+    ]
+    if not stale:
+        return None
+    return Finding(
+        check="stale_master_sheet_flag",
+        severity=SEVERITY_WARNING,
+        message=(
+            f"{len(stale)} advisor(s) are marked in_master_sheet but are absent "
+            "from the current MasterSheet — they still count toward team sizes "
+            "and rosters. Reconciliation was skipped, most likely because the "
+            "payload was below its coverage floor."
+        ),
+        count=len(stale),
+        sample=_sample(stale),
+    )
+
+
+def validate_database(db: Session, master_sheet_wids=None) -> ValidationReport:
     """Runs every check and returns the combined report. Pure read-only —
-    safe to call from a sync run, a health endpoint, or a test."""
+    safe to call from a sync run, a health endpoint, or a test.
+
+    `master_sheet_wids` is the current MasterSheet payload's WID set, when
+    the caller has one. The lifecycle check below is the only check that
+    needs it and is skipped without it."""
     report = ValidationReport()
+
+    stale_flags = check_stale_master_sheet_flags(db, master_sheet_wids)
+    if stale_flags:
+        report.add(stale_flags)
 
     missing_targets = check_missing_team_targets(db)
     if missing_targets:

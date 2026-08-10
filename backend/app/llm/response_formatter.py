@@ -396,6 +396,46 @@ def _metric_number(value: float) -> str:
     return f"{value:,.1f}"
 
 
+def format_metric_bundle(subject: str, entries) -> str:
+    """The measures that answer together, as one block.
+
+    Phase 29. Connects means little without the answered calls behind it
+    and the rate between them, and a meetings count means little without
+    its rate — so a question about either now shows the whole bundle
+    rather than the one number the user happened to name.
+
+    THIS RENDERS, IT DOES NOT COMPUTE. `entries` arrives as
+    [(metric_key, value), ...] already fetched by the caller from the
+    owner that serves that scope — advisor_service for a person,
+    aggregation.metric_value for a group — so there is no second path to
+    a number here and no way for this block to disagree with the headline
+    it sits under.
+
+    Names come from measure_label, the same period-neutral label owner
+    the unavailable-data sentence uses. The block carries NO window of
+    its own precisely because it is always appended under a sentence that
+    states one — "Fawad Hafeez has 55 daily connects." — so repeating it
+    per line, or worse stating a second one, is how the two halves of one
+    answer would come to disagree.
+
+    A None value is dropped rather than shown as zero: zero is a real
+    figure, and the measure the user actually asked for is stated above
+    regardless.
+    """
+    from app.llm.metric_ontology import measure_label
+
+    lines = [subject]
+    for key, value in entries:
+        if value is None:
+            continue
+        lines.append(f"• {measure_label(key)}: {format_metric_value(key, value)}")
+    # Only the header survived — every companion was missing, so there is
+    # no bundle to show and the caller's own answer stands alone.
+    if len(lines) < 2:
+        return ""
+    return "\n".join(lines)
+
+
 def format_manager_reply(result: dict) -> str:
     """Reverse hierarchy answer — "who is X's BM/zonal head"."""
     return (
@@ -655,6 +695,49 @@ _SHAPE_FORMATTERS = {
     "comparison_table": format_ir_comparison_reply,
     "filtered_table": format_ir_filtered_list_reply,
 }
+
+
+_MEMBER_LIMIT = 15
+
+
+def format_team_member_breakdown(ir: QueryIR, members: list[dict],
+                                 group_rows: list[dict] | None = None) -> str:
+    """The advisors behind a manager-level total, each with their value.
+
+    A group figure with no members is unactionable: "9,635 Total MTD
+    Connects" says nothing about who is carrying it or who is at zero.
+    This lists them, highest first, and repeats the total so the two are
+    read together.
+
+    The TOTAL comes from the group row the aggregation engine already
+    produced — not from summing this list. The list is capped (a Unit
+    Head can have 140 advisors), so deriving the total from it would
+    understate the moment it is truncated, which is exactly the kind of
+    formatter-side arithmetic the response layer is not allowed to do.
+    """
+    metric_key = effective_metric(ir) or (ir.metric.key if ir.metric else None)
+    subject = (group_rows or [{}])[0].get("name") or "this group"
+    percentage = is_percentage_metric(metric_key)
+
+    def _value(row):
+        raw = row.get("value")
+        if raw is None:
+            return "n/a"
+        return f"{raw:,.0f}%" if percentage else _metric_number(raw)
+
+    ranked = sorted(members, key=lambda r: (r.get("value") is None, -(r.get("value") or 0)))
+    shown = ranked[:_MEMBER_LIMIT]
+
+    lines = [f"👥 {subject}'s team — {len(members)} advisor(s)"]
+    lines += [f"  • {row.get('name')} — {_value(row)}" for row in shown]
+    if len(ranked) > len(shown):
+        lines.append(f"  … and {len(ranked) - len(shown)} more")
+
+    if group_rows and group_rows[0].get("value") is not None:
+        total = group_rows[0]["value"]
+        rendered = f"{total:,.0f}%" if percentage else _metric_number(total)
+        lines.append(f"  Total — {rendered} {metric_phrase(metric_key)}")
+    return "\n".join(lines)
 
 
 def format_ir_reply(

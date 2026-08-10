@@ -11,7 +11,7 @@ from app.llm.periods import label_for as period_label
 # past it to metric_ontology.metric_for_period, so this module names the
 # authority it is actually a client of — and names it once.
 from app.llm.query_compiler import (
-    compile_and_run, count_ir, resolve_metric_for_period,
+    compile_and_run, count_ir, effective_metric, resolve_metric_for_period,
 )
 from app.llm.query_ir import QueryIR
 from app.llm.response_planner import plan_response, respond
@@ -30,6 +30,8 @@ from app.llm.response_formatter import (
     format_ancestry_reply,
     format_roster_reply,
     format_comparison_reply,
+    format_team_member_breakdown,
+    format_metric_bundle,
 )
 from app.services import (
     advisor_service,
@@ -405,6 +407,22 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
             f"{plan.period!r} -> answered {[k for k, _ in answered]!r}, "
             f"unavailable {unavailable!r} for wid={advisor['wid']}",
         )
+        reply = format_advisor_metric_reply(advisor["name"], answered,
+                                            unavailable=unavailable,
+                                            period=plan.period)
+        # Phase 29: the measures that complete this one. Same person, same
+        # window, same value owner as the headline above — this adds a
+        # read, not a calculation. Appended so the sentence the user asked
+        # for stays exactly as it was and stays first.
+        bundle = _metric_bundle_values(
+            db, answered, requested,
+            lambda key: advisor_service.get_advisor_metric(db, advisor["wid"], key),
+            plan.period,
+        )
+        if bundle:
+            block = format_metric_bundle(advisor["name"], bundle)
+            if block:
+                reply += "\n\n" + block
         return respond(
             "advisor_metric",
             # The RESOLVED keys, so the name on each number matches the
@@ -413,13 +431,16 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
             # than dropped — a measure the user asked for and did not get
             # must be said out loud, or a two-metric question comes back
             # looking like a complete one-metric answer.
-            format_advisor_metric_reply(advisor["name"], answered,
-                                        unavailable=unavailable,
-                                        period=plan.period),
+            reply,
+            # `metrics` stays the measures the user ASKED for (Phase 13B's
+            # contract) and `metric`/`value` stay the primary — a bundle
+            # is context, not a request, so it rides in its own key rather
+            # than swelling either of those.
             {"wid": advisor["wid"], "name": advisor["name"],
              "metric": answered[0][0], "value": answered[0][1],
              "metrics": [{"metric": k, "value": v} for k, v in answered],
-             "unavailable": unavailable},
+             "unavailable": unavailable,
+             "bundle": [{"metric": k, "value": v} for k, v in bundle]},
         )
 
     if plan.action == "lookup":
@@ -540,6 +561,73 @@ def _unanswerable_reply(ir) -> str:
     )
 
 
+def _metric_bundle_values(db: Session, answered, requested, fetch, period):
+    """The bundled measures for one subject, as [(key, value), ...].
+
+    Phase 29. The ontology says WHICH measures answer together
+    (metric_ontology.bundle_for) and `fetch` says how to value one for
+    THIS scope — advisor_service for a person, aggregation.metric_value
+    for a group. Neither is new: both are the owners the surrounding
+    answer already reads from, which is what keeps the bundle from
+    becoming a second definition of any of these numbers.
+
+    Empty for anything not bundled, which is every other measure. Also
+    empty when the turn named MORE than one measure: that reply already
+    lists what was asked for, and a bundle underneath it would restate
+    the same numbers under different headings.
+
+    The primary's value is reused rather than re-read — it was fetched to
+    build the headline, and fetching it twice is how two renderings of
+    one answer start to disagree.
+    """
+    from app.llm.metric_ontology import bundle_for
+
+    if len(answered) != 1 or len(requested) != 1:
+        return []
+    primary_key, primary_value = answered[0]
+    keys = bundle_for(primary_key, period)
+    if len(keys) < 2:
+        return []
+
+    known = {primary_key: primary_value}
+    return [(key, known[key] if key in known else fetch(key)) for key in keys]
+
+
+def _team_member_rows(db: Session, ir) -> list | None:
+    """The advisors behind a manager-level total, each with their own value.
+
+    "connects of Haseeb Arslan's team" answered `9,635 Total MTD Connects`
+    and stopped — a number with no way to see who is in it or who is
+    carrying it. The people were never missing from the QUERY, only from
+    the reply: the scope is a filter on one manager column, so the same
+    IR at advisor level enumerates exactly the same population.
+
+    That is what this does — `ir` with `subject_level` dropped to advisor,
+    run through the SAME compiler. No new scope, no second definition of
+    "who is under X", and no traversal: the hierarchy columns are
+    denormalised, so the manager filter already reaches every advisor
+    beneath them however many levels down they sit. The rows therefore
+    sum to the total by construction rather than by coincidence.
+
+    Returns None when this is not a manager-level answer — a named team
+    ("Blue Area connects") or a person's own figure has no subordinates
+    to list, and a leaderboard already shows its own rows.
+    """
+    from app.llm import hierarchy
+
+    manager_levels = {"bcm", "zonal_head", "unit_head"}
+    if ir.subject_level not in manager_levels:
+        return None
+    if not any(f.field == ir.subject_level for f in ir.filters):
+        return None
+
+    members = ir.model_copy(deep=True)
+    members.subject_level = "advisor"
+    members.limit = None
+    rows = compile_and_run(db, members)
+    return rows or None
+
+
 def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = None) -> dict:
     """New path (Part 4/5.5): any query the generic compiler can answer —
     leaderboards, comparisons, and filtered/thresholded/boolean-combined
@@ -594,7 +682,45 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
     reply = format_ir_reply(ir, rows, total_count=capped_total,
                             paginated=has_more, plan=response_plan,
                             companion=companion)
+
+    # Phase 29: the measures that complete this one, for a group exactly
+    # as for a person. Same seam, same ontology declaration; only the
+    # value owner differs, because a group's figure is an aggregate and a
+    # person's is a row. `metric_value` is the engine every comparison
+    # and summary already reads, so the bundle cannot disagree with the
+    # headline it sits under, and the SAME (level, name) the answer was
+    # built from is what it is asked for — the scope is not re-decided.
+    bundle: list = []
+    if response_plan.shape == "single_value" and rows and not has_more:
+        subject = rows[0].get("name")
+        primary = effective_metric(ir)
+        period = getattr(ir.time_range, "period", None)
+        bundle = _metric_bundle_values(
+            db, [(primary, rows[0].get("value"))], [primary],
+            lambda key: aggregation.metric_value(db, ir.subject_level, subject, key),
+            period,
+        )
+        if bundle:
+            block = format_metric_bundle(subject, bundle)
+            if block:
+                reply += "\n\n" + block
+
+    # A manager-level answer names one number for a whole group. Appended
+    # rather than substituted: the total is what was asked for and stays
+    # the headline (and stays byte-identical for every caller that pins
+    # it), while the members say who it is made of.
+    members = _team_member_rows(db, ir)
+    if members:
+        reply += "\n\n" + format_team_member_breakdown(ir, members, rows)
+
     insights: list[str] = []
+    # `members` carries EVERY subordinate, while the reply lists the top
+    # few — a Unit Head can have 140. A consumer that needs the full
+    # breakdown (or wants to verify it sums to the total) reads it here
+    # rather than parsing prose.
+    extra_payload = {"members": members} if members else {}
+    if bundle:
+        extra_payload["bundle"] = [{"metric": k, "value": v} for k, v in bundle]
     if rows:
         # Part 11: evidence-aware explanation — 100% deterministic (every
         # number traced to `rows`), prepended ahead of the raw templated
@@ -628,6 +754,7 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
         total_count=capped_total,
         shown_count=len(rows),
         has_more=has_more,
+        **extra_payload,
     )
 
 

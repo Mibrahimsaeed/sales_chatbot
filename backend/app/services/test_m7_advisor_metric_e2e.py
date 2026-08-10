@@ -55,6 +55,23 @@ def db(db_session, monkeypatch):
     advisor_resolver._reset_for_tests()
 
 
+def _answer(response) -> str:
+    """The metric sentence itself.
+
+    Phase 29 appends a BUNDLE block to connects and meetings answers —
+    the answered calls behind a connects figure, the rate beside a
+    meetings count — because those measures were judged to answer
+    together. It is appended, never substituted, so the sentence this
+    file was written to pin is still the whole first line and still
+    byte-identical; splitting on the blank line is what lets these
+    assertions stay exact rather than being loosened to `in`.
+
+    Every unbundled measure still produces this and nothing else, which
+    test_an_unbundled_measure_is_still_one_sentence_alone pins.
+    """
+    return str(response["reply"]).split("\n\n")[0]
+
+
 # ---------------------------------------------------------------------
 # The four specified cases
 # ---------------------------------------------------------------------
@@ -62,7 +79,7 @@ def db(db_session, monkeypatch):
 def test_1_connects_returns_only_connects(db):
     r = handle_chat_message(db, "connects of Shehryar Abbasi", session_id=None)
     assert r["type"] == "advisor_metric"
-    assert r["reply"] == "Shehryar Abbasi has 2 MTD connects."
+    assert _answer(r) == "Shehryar Abbasi has 2 MTD connects."
 
 
 def test_2_tell_me_about_returns_the_full_profile(db):
@@ -75,7 +92,7 @@ def test_2_tell_me_about_returns_the_full_profile(db):
 def test_3_meetings_of_another_advisor(db):
     r = handle_chat_message(db, "meetings of Ahmed Khan", session_id=None)
     assert r["type"] == "advisor_metric"
-    assert r["reply"] == "Ahmed Khan has 6 MTD meetings."
+    assert _answer(r) == "Ahmed Khan has 6 MTD meetings."
 
 
 def test_4_show_profile_returns_the_full_profile(db):
@@ -98,17 +115,36 @@ def test_4_show_profile_returns_the_full_profile(db):
 ])
 def test_each_specified_metric(db, query, expected):
     r = handle_chat_message(db, query, session_id=None)
-    assert r["reply"] == expected
+    assert _answer(r) == expected
+
+
+@pytest.mark.parametrize("query", [
+    "pipeline of Shehryar Abbasi", "target of Shehryar Abbasi",
+    "cleared of Shehryar Abbasi", "cr booked of Shehryar Abbasi",
+])
+def test_an_unbundled_measure_is_still_one_sentence_alone(db, query):
+    """Phase 29 bundles TWO measures. Every other one answers exactly as
+    it did — this is what stops the bundle from spreading by default."""
+    reply = handle_chat_message(db, query, session_id=None)["reply"]
+    assert "\n" not in reply
+    assert "•" not in reply
 
 
 def test_the_reply_excludes_every_profile_field(db):
     """The explicit requirement: no company/team, no reports-to, no
-    CR booked, no targets, no other metric."""
+    CR booked, no targets, no other metric.
+
+    Still the requirement after Phase 29. A bundle is not a profile: it
+    adds the measures that complete the one asked for (answered calls and
+    the rate behind a connects figure) and nothing about who the person
+    reports to or what they cleared, so every name below stays forbidden.
+    """
     reply = handle_chat_message(db, "connects of Shehryar Abbasi", session_id=None)["reply"]
     for forbidden in ("Blue Area", "Graana", "Kaleem Ullah", "target", "cleared",
                       "booking", "pipeline", "overdue"):
         assert forbidden.lower() not in reply.lower(), forbidden
-    assert reply.count(".") == 1
+    assert _answer(handle_chat_message(db, "connects of Shehryar Abbasi",
+                                      session_id=None)).count(".") == 1
 
 
 def test_possessive_phrasing_works_too(db):

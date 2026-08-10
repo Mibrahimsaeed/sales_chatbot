@@ -144,6 +144,17 @@ def run_sync(trigger: str = "manual") -> dict:
     history_rows = write_snapshot_safe(data)
     log.info(f"AdvisorHistory snapshot: {history_rows} rows")
 
+    # Advisor lifecycle: how many people the MasterSheet stopped listing
+    # this run. Logged beside the row counts because a deactivation
+    # changes every headcount and roster, and a silent one is the reason
+    # 107 departed advisors sat in the roster unnoticed.
+    deactivated = counts.get("advisors_deactivated", 0)
+    if deactivated:
+        log.info(
+            f"Advisor reconciliation: {deactivated} advisor(s) no longer on the "
+            "MasterSheet were deactivated (rows and history kept)"
+        )
+
     # Validation + join audit are best-effort REPORTING steps: a failure
     # here must not turn an otherwise-successful data load into a failed
     # sync, since the loaded data is already live and correct.
@@ -152,7 +163,11 @@ def run_sync(trigger: str = "manual") -> dict:
     db = SessionLocal()
     try:
         try:
-            report = validate_database(db)
+            # The payload's MasterSheet WID set, so the lifecycle check
+            # can tell "absent from the sheet" from "absent from the DB".
+            report = validate_database(db, master_sheet_wids={
+                a["wid"] for a in data.get("advisors", []) if a.get("in_master_sheet")
+            })
             validation_dict = report.to_dict()
             level = "warning" if not report.ok or report.warning_count else "info"
             getattr(log, level)(

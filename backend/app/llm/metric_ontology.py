@@ -1152,6 +1152,71 @@ for _a, _b in [(k, m.companion) for k, m in METRICS.items() if m.companion]:
         f"{METRICS[_b].companion!r}"
     )
 
+# =====================================================================
+# BUNDLES — measures that answer TOGETHER.
+#
+# `companion` above pairs exactly two metrics and renders them in one
+# sentence. Connects needs three (the count, the answered calls behind
+# it, and the rate between them) and meetings two, which a symmetric
+# one-to-one pairing cannot express — so the grouping is declared here
+# instead of widening `companion` and breaking its symmetry contract.
+#
+# THIS ADDS NO CALCULATION. Every key below is an existing metric with
+# its own binding; a bundle only says which of them belong in one answer,
+# and the values are read from the same owners every other number comes
+# from (advisor_service for a person, aggregation.metric_value for a
+# group). Nothing here can change what a metric means or what it sums.
+#
+# Keyed by PERIOD FAMILY, not by key, so the daily and YTD members of a
+# family find the same bundle without a second table. The members are
+# named at their MTD key and resolved to the asked-for period by
+# bundle_for(), which drops any that has no member at that window — a
+# daily connects answer must not carry an MTD rate beside it.
+#
+# Ordered as the answer should read: the count first, then what it is
+# made of, then the rate.
+# =====================================================================
+BUNDLES: dict[str, tuple[str, ...]] = {
+    "connects": ("total_connects", "answered_calls", "answered_calls_rate"),
+    "meetings": ("total_meetings", "meeting_rate"),
+}
+
+
+def bundle_for(metric_key: str | None,
+               period: PerformancePeriod | str | None = None) -> list[str]:
+    """The measures that answer alongside `metric_key`, at `period`.
+
+    Empty for a metric in no bundle — the ordinary case, and the reason
+    every other answer is unaffected. The first entry is always the
+    bundled measure's own key at that period, so a caller can render the
+    whole block from this list alone.
+
+    Period resolution is delegated to metric_for_period, the same
+    authority `_companion_for` uses, so a bundle can no more mix windows
+    than a companion pair can.
+    """
+    metric = METRICS.get(metric_key) if metric_key else None
+    if metric is None:
+        return []
+    family = metric.period_family
+    members = BUNDLES.get(family) if family else None
+    if not members:
+        return []
+    resolved = [metric_for_period(key, period) for key in members]
+    return [key for key in resolved if key is not None]
+
+
+# A bundle naming a metric that does not exist is a declaration error,
+# caught at import rather than as a missing line in one reply.
+for _family, _members in BUNDLES.items():
+    for _member in _members:
+        assert _member in METRICS, (  # pragma: no cover - declaration error
+            f"bundle {_family!r} names unknown metric {_member!r}"
+        )
+    assert METRICS[_members[0]].period_family == _family, (  # pragma: no cover
+        f"bundle {_family!r} must lead with a metric of that family"
+    )
+
 for _key, _metric in METRICS.items():
     _metric.synonyms = metric_aliases.phrases_for(_key)
 

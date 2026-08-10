@@ -539,6 +539,144 @@ def _pin_level(entities: dict, value: str, level: str) -> dict:
     return pinned
 
 
+def _asks_about_the_person(text: str, entities: dict, ambiguous: dict) -> bool:
+    """Is this a bare question about the NAMED PERSON's own figures?
+
+    True only when the name really is a person (it grounded at `advisor`
+    too), the turn names a measure, and nothing in it asks for a group:
+
+      "connects of Fawad Hafeez"          -> True   his own 54
+      "Fawad Hafeez's team connects"      -> False  the zone's 949
+      "Zonal Head Fawad Hafeez connects"  -> False  pinned already
+      "top advisors under Fawad Hafeez"   -> False  a ranking wants members
+
+    Each exclusion is a signal that already exists and is already owned
+    elsewhere — the relation by reference_parser, the level word by
+    intent_catalog, the ranking by TurnSpec — so this decides nothing on
+    its own, it only reads them together.
+    """
+    from app.llm import intent_catalog as cat, reference_parser
+
+    spec = conversation_context.specified(text, entities)
+    if "advisor" not in (ambiguous.get("levels") or []):
+        return False
+    if not (spec and spec.metric):
+        return False          # no measure named — a profile/roster question
+    if reference_parser.parse(text):
+        return False          # "X's team" asks for the group
+    if cat.detect_level(text) is not None:
+        return False          # an explicit level was stated
+    if spec.ranking:
+        return False          # a ranking enumerates members
+    return True
+
+
+# The levels at which a name means A PERSON HOLDING A ROLE. Derived from
+# the chain by dropping `team`, the one chain level whose values are group
+# names rather than people — so the priority below IS hierarchy.CHAIN's
+# order (unit_head > zonal_head > bcm > advisor) and cannot drift from it.
+_ROLE_LEVELS = tuple(lvl for lvl in hierarchy.CHAIN if lvl != "team")
+
+
+def _highest_role(levels) -> str | None:
+    """The senior-most role among the levels a name grounded at.
+
+    Grounding IS the hierarchy relationship: a name reaches `unit_head`
+    only because some advisor's `rm` column names them, `zonal_head` only
+    via `portfolio_lead`, `bcm` only via `management_lead`. So the levels
+    already in hand say which roles the person holds, and choosing the
+    highest is a read of CHAIN — no traversal, no second resolver, and
+    nothing here to keep in sync when the chain is rebound.
+
+    None when the name is not purely a person: a value that is also a
+    TEAM or COMPANY name is a different entity that happens to share the
+    spelling, and no role ordering can settle which was meant.
+    """
+    levels = list(levels or [])
+    # `region` mixes places with people (hierarchy.AMBIGUOUS_LEVELS): the
+    # master-sheet rows still carry a regional head's NAME, which is why
+    # every Unit Head here also grounds at `region`. It is the same person
+    # under a stale column, not a fifth role, so it neither blocks the
+    # decision nor wins it.
+    ranked = [lvl for lvl in levels if lvl != "region"]
+    if not ranked or any(lvl not in _ROLE_LEVELS for lvl in ranked):
+        return None
+    for level in _ROLE_LEVELS:          # CHAIN order: senior first
+        if level in ranked:
+            return level
+    return None
+
+
+def _asks_for_the_group(text: str, entities: dict) -> bool:
+    """Does this turn ask about the people UNDER the named person?
+
+    Reads the signals that already own the question — a relation
+    ("X's team", "under X") by reference_parser, a ranking by TurnSpec —
+    rather than adding a third opinion. It is the complement of
+    _asks_about_the_person above, and deliberately not its negation: a
+    turn that is neither still means the person themselves.
+    """
+    from app.llm import reference_parser
+
+    if reference_parser.parse(text):
+        return True
+    spec = conversation_context.specified(text, entities)
+    return bool(spec and spec.ranking)
+
+
+def _pin_stated_level(text: str, entities: dict) -> dict:
+    """Narrow an ambiguous name to the level the QUERY ITSELF names.
+
+    "connects of Zonal Head Faisal Hussain Naqvi" says which Faisal is
+    meant. The level word was already detected — and then ignored for the
+    purpose of choosing the entity: the name stayed grounded at
+    zonal_head, bcm, region and advisor simultaneously, and
+    _Intent.group_entity() picked whichever came first in
+    GROUP_LEVEL_ORDER, which is `bcm`. The user's own words were
+    outranked by an ordering constant, so the query answered with the
+    BCM's four reports (227) instead of the Zonal Head's eleven (763).
+
+    The narrowing itself is _pin_level, unchanged — the same function the
+    clarification answer uses. That is the point: stating the level in
+    the sentence and choosing it from the offered list are the same
+    request, and they now go through the same code, so they cannot give
+    different scopes.
+
+    Deliberately narrow. It fires only when the text names a level AND
+    the ambiguous value is actually grounded at that level, so a level
+    word belonging to something else — a team called "Beverly Center", a
+    metric containing "unit" — cannot pin anything.
+    """
+    from app.llm import intent_catalog as cat
+
+    ambiguous = entities.get("ambiguous_entity")
+    if not ambiguous:
+        return entities
+
+    stated = cat.detect_level(text)
+    if stated is None or stated not in (ambiguous.get("levels") or []):
+        return entities
+
+    # A level word consumed by a POSSESSIVE names the ANSWER, not the
+    # subject: "Ali Murtaza's unit head" asks who his unit head IS, and
+    # pinning Ali to unit_head turns that into a query about the group
+    # under him. reference_parser already owns which level a possessive
+    # points at, so it is asked rather than re-detected here.
+    from app.llm import reference_parser
+
+    if any(ref.target_level == stated
+           for ref in reference_parser.parse(text)):
+        return entities
+
+    routing.decide(
+        "Level", f"pinned {stated}",
+        f"the query names {stated!r} explicitly, which settles which "
+        f"{ambiguous.get('value')!r} was meant — the same narrowing the "
+        "clarification answer applies, so both reach the same scope",
+    )
+    return _pin_level(entities, ambiguous["value"], stated)
+
+
 def resolve(text: str, db: Session, session_id: str | None = None, _depth: int = 0,
             _pin: tuple | None = None) -> Resolution:
     cleaned = normalize(text)
@@ -603,6 +741,8 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     # reading rather than re-asking the question that was just answered.
     if _pin is not None:
         entities = _pin_level(entities, _pin[0], _pin[1])
+    else:
+        entities = _pin_stated_level(cleaned, entities)
 
     # M4: relations of the person the conversation is already about
     # ("how is his team doing"). Runs BEFORE the carry below on purpose —
@@ -766,6 +906,52 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         ambiguous = plan.ambiguous or {}
         value = ambiguous.get("value", "")
         levels = ambiguous.get("levels", [])
+
+        # THE PERSON IS THE DEFAULT. "connects of X" asks about X, and
+        # every manager is also an advisor with their own figures. Being a
+        # BCM must not turn a question about someone into a question about
+        # the people under them: Fawad Hafeez's own 54 connects came back
+        # as his zone's 949, and there was no phrasing that reached the
+        # 54 — the person reading was unreachable once the name grounded
+        # at a manager level.
+        #
+        # Only a bare metric question takes this default. A relation
+        # ("X's team"), an explicit level ("Zonal Head X", already pinned
+        # above) or a ranking all say the group is wanted, and each is
+        # excluded here rather than being re-decided later.
+        if _asks_about_the_person(cleaned, entities, ambiguous):
+            routing.decide(
+                "Level", "pinned advisor",
+                f"{value!r} names a person and the turn asks for their own "
+                "measure — a manager's own record, not the people under them",
+            )
+            return resolve(cleaned, db, session_id=session_id, _depth=_depth or 1,
+                           _pin=(value, "advisor"))
+
+        # THE HIGHEST ROLE IS THE DEFAULT FOR THE GROUP. Asking "which
+        # Haseeb Arslan?" of a name that is ONE person wearing four hats
+        # is a question with no answer — he is the Unit Head, and being a
+        # Unit Head is also why he grounds at zonal_head and bcm (his
+        # reports' columns name him at every level beneath). The offered
+        # options were four readings of one man, so no choice was wrong
+        # and none could be made confidently.
+        #
+        # Only a turn that asks for the GROUP takes this default, and it
+        # takes the senior role because that is the scope the person
+        # actually leads. A question about the person is left to the
+        # branch above, so RULE 1 (a bare person query answers with their
+        # OWN figure) is untouched.
+        role = _highest_role(levels) if _asks_for_the_group(cleaned, entities) else None
+        if role is not None and role != "advisor":
+            routing.decide(
+                "Level", f"pinned {role}",
+                f"{value!r} holds {levels} because subordinates name them at "
+                f"each — one person, so the senior role {role!r} is the team "
+                "they lead, and there is nothing to ask",
+            )
+            return resolve(cleaned, db, session_id=session_id, _depth=_depth or 1,
+                           _pin=(value, role))
+
         options = [hierarchy.label_for(lvl) for lvl in levels]
         audit.decision("routing", "clarify:ambiguous_entity",
                        f"{value!r} grounded at more than one hierarchy level {levels} — "

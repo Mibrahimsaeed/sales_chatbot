@@ -285,3 +285,19 @@ Three of my own errors, caught by the suite. My first table promoted advisor_pro
 A closed capability gap. KNOWN_DIVERGENCES for "Attendance of Agency21" read "the shape that would actually answer it — ONE metric for ONE entity — doesn't exist yet in either planner." Phase 7 created it; the rule planner is now the more correct of the two, reversing the note. Recorded in place rather than deleted.
 
 Remaining debt: two post-selection intent writers survive and are legitimate — the pending-slot promotion (clarify → executable once the slot is filled) and conversation_context inheriting a prior comparison's intent. The metric-inheritance path now runs build_query_plan a second time, which trades Phase 4's one-run invariant for single ownership of intent; it fires only on subject-only follow-ups. QueryIR.intent still has no group_metric member — the classification is first-class at the planner, the IR still compiles it as a scoped leaderboard, and changing that means a schema and prompt change.
+
+
+
+
+
+
+
+
+
+ab ye krna hai k jb kisi ka puchy tou options nh dey wo, agr tou herarichy mn jo evel hoga usi k mutabiq woi ans dega hirarechy smjhani hai usko phly mtlb ik bnda jo zonal hai tou wo advispr bhi hoga tou uska puchna nh hai okay 
+
+
+secondly, if asked about the connects if team of oerson A it fails
+
+
+thirst, to give answered calls, connects and ans called% all 3 things collectively
