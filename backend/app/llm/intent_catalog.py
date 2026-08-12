@@ -90,6 +90,23 @@ LIMIT_RANKING_WORDS = (*BEST_RELATIVE, *WORST_RELATIVE, "highest", "lowest")
 
 FLAT_KEYWORDS = ("flat", "list all", "as a list", "not nested", "without teams", "ungrouped")
 
+# ENUMERATE — "connects of ALL BCMs": every member, not the leaders.
+#
+# "top advisors by connects" and "connects of all BCMs" both produce a
+# ranked list, and both were capped at the same default of 10 — so a
+# question that says ALL answered with a tenth of the answer and reported
+# it as the whole thing. The two are different requests: one asks who is
+# ahead, the other asks for the roll. Only this one lifts the cap;
+# pagination then shows a page at a time.
+#
+# Deliberately narrow. It requires an explicit "all"/"every"/"each" —
+# a bare "BCM connects" is not an enumeration, and neither is "most" or
+# "top", which carry their own meaning about how many are wanted. An
+# explicit "top 5" still wins over this, because a stated number is the
+# most specific thing the user can say about size.
+ENUMERATE_WORDS = ("all", "every", "each", "entire", "complete", "full list")
+
+
 # ROSTER — "who is IN this group": the answer is a list of PEOPLE.
 # Requires a word for people ("advisors"/"employees"/...) or an explicit
 # "who works in". A bare "who is in X's team" is deliberately NOT a

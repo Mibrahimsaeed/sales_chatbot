@@ -277,12 +277,27 @@ def test_person_and_team_remain_different_scopes(db):
     assert TAHIR_UNIT in team
 
 
-def test_an_explicitly_stated_level_still_wins(db):
-    """The user's own words outrank the default. Naming the junior role
-    must reach the junior scope, or the senior default becomes a ceiling."""
+def test_a_stated_role_selects_the_person_not_a_smaller_scope(db):
+    """Phase 31 replaced this file's original expectation here, and the
+    reversal is deliberate.
+
+    It read: naming the junior role must reach the junior scope, or the
+    senior default becomes a ceiling. That treated "BCM" as a claim about
+    WHICH JOB the question is about. It is not — it is a way of pointing
+    at a person, and Tahir Malik is one man. His BCM grounding exists
+    only because the two advisors directly under him name him in
+    `management_lead`; answering 18 for a man who leads 48 is a true
+    statement about a scope of two that reads as a false statement about
+    him.
+
+    So a stated role SELECTS the person and their own hierarchy decides
+    the scope. The junior reading is not a ceiling being lifted — it was
+    never a separate subject. Full coverage lives in
+    test_authoritative_role.py.
+    """
     reply = _ask(db, "connects of BCM Tahir Malik")["reply"]
-    assert TAHIR_CENTRE in _numbers(reply)
-    assert TAHIR_UNIT not in _numbers(reply)
+    assert TAHIR_UNIT in _numbers(reply)
+    assert TAHIR_CENTRE not in _numbers(reply)
 
 
 def test_an_advisor_with_no_role_leads_nobody(db):

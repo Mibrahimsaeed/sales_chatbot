@@ -172,6 +172,14 @@ _CLARIFYING_ACTIONS = ("comparison_incomplete",)
 # phrases, so this can't misfire and steal a real query).
 _SHOW_MORE_RE = re.compile(r"^(show more|more|next|next page|load more)$", re.I)
 
+# The level `_pin_stated_level` settled on when it OVERRULED the word in
+# the text — see _authoritative_role. Written only in that case, so a
+# query whose level word was taken at face value carries nothing here and
+# the planner reads the text exactly as it always has. Underscore-
+# prefixed because it is meta rather than an entity: consumers that
+# serialise the entity dict already skip these keys.
+PINNED_LEVEL_KEY = "_pinned_level"
+
 
 @dataclass
 class Resolution:
@@ -607,6 +615,51 @@ def _highest_role(levels) -> str | None:
     return None
 
 
+def _authoritative_role(stated: str, levels) -> str:
+    """The role a ROLE-SPECIFIC query about this person actually addresses.
+
+    A named role is a way of pointing at someone, not a claim about which
+    of their jobs the question is about. Haseeb Arslan is a Unit Head over
+    75 advisors and, because those directly under him also name him in
+    `management_lead`, he grounds at `bcm` over exactly one. "BCM Haseeb
+    Arslan connects" therefore answered 0 — a true statement about a
+    scope of one that reads as a false statement about him. There is one
+    Haseeb Arslan and he leads 12,004 connects.
+
+    So the stated role SELECTS the person, and the person's own hierarchy
+    decides which scope that is: the senior-most role they hold. Same
+    rule Phase 28 applies when no role is stated, from the same ranking
+    (_highest_role over hierarchy.CHAIN), so naming the role and omitting
+    it cannot reach different scopes for the same person.
+
+    TWO CASES ARE LEFT ALONE, both deliberately:
+
+    `advisor` is not promoted. "Advisor X" asks for the person as a leaf
+    — their own figure — and promoting it would make a manager's own
+    record unreachable, which is exactly the defect Phase 22 fixed.
+
+    A role that is ALREADY the person's highest passes through unchanged,
+    as does a role held by someone with nothing above it: Person C, a BCM
+    and nothing more, stays a BCM. Promotion only ever moves UP the chain
+    the codebase already declares, never down and never sideways.
+    """
+    if stated == "advisor":
+        return stated
+    authoritative = _highest_role(levels)
+    if authoritative is None or authoritative == stated:
+        return stated
+    if _ROLE_LEVELS.index(authoritative) >= _ROLE_LEVELS.index(stated):
+        return stated          # nothing senior to promote to
+    routing.decide(
+        "Level", f"read {authoritative!r} not {stated!r}",
+        f"the query names {stated!r}, but this person's own hierarchy puts "
+        f"them at {authoritative!r} — the senior role is who they are, and "
+        f"the {stated!r} reading is a scope of a different size for the "
+        "same name",
+    )
+    return authoritative
+
+
 def _asks_for_the_group(text: str, entities: dict) -> bool:
     """Does this turn ask about the people UNDER the named person?
 
@@ -622,6 +675,60 @@ def _asks_for_the_group(text: str, entities: dict) -> bool:
         return True
     spec = conversation_context.specified(text, entities)
     return bool(spec and spec.ranking)
+
+
+def _subject_level_word(text: str, ambiguous_levels) -> str | None:
+    """The level word that says WHO THE SUBJECT IS, not what to return.
+
+    A roster question names two levels and means different things by
+    them:
+
+        "show all ADVISORS under UNIT HEAD Kaleem Satti"
+                   ^ what to return      ^ who Kaleem is
+
+    detect_level returns the first entry in LEVEL_KEYWORDS order, which
+    is `advisor` — so the OUTPUT noun outranked the qualifier purely by
+    table position, and _pin_stated_level then pinned Kaleem Satti to
+    `advisor` and deleted his unit_head grounding. With no group entity
+    left the roster candidate scored nothing, `lookup` won, and the
+    question about 137 people was answered with one man's profile. The
+    roster service was correct throughout and was never called.
+
+    Same shape as the possessive guard below — a level word that belongs
+    to something other than the subject must not choose the subject — and
+    resolved from the same tables rather than a second vocabulary:
+    ROSTER_RE already says this is a roster phrasing, and LEVEL_KEYWORDS
+    already says which levels the sentence names.
+
+    Only `advisor` can be an output noun (it is the only level whose
+    keywords — advisor/advisors/agent/agents — are also words for the
+    people a roster lists), so nothing else is second-guessed. And the
+    replacement must be UNAMBIGUOUS: exactly one other named level, which
+    the value is actually grounded at. Two qualifiers, or one the value
+    does not hold, leaves the question genuinely open and falls through
+    to the clarification instead of guessing.
+    """
+    from app.llm import intent_catalog as cat, token_match
+
+    stated = cat.detect_level(text)
+    if stated != "advisor" or not cat.ROSTER_RE.search(text):
+        return stated
+
+    others = [
+        level for level, keywords in cat.LEVEL_KEYWORDS.items()
+        if level != "advisor"
+        and level in ambiguous_levels
+        and token_match.contains_any(text, keywords)
+    ]
+    if len(others) != 1:
+        return None
+    routing.decide(
+        "Level", f"read {others[0]!r} not 'advisor'",
+        "'advisors' names what the roster should RETURN while "
+        f"{others[0]!r} names who the subject is — the output noun only "
+        "won before because it comes first in LEVEL_KEYWORDS",
+    )
+    return others[0]
 
 
 def _pin_stated_level(text: str, entities: dict) -> dict:
@@ -653,7 +760,7 @@ def _pin_stated_level(text: str, entities: dict) -> dict:
     if not ambiguous:
         return entities
 
-    stated = cat.detect_level(text)
+    stated = _subject_level_word(text, ambiguous.get("levels") or [])
     if stated is None or stated not in (ambiguous.get("levels") or []):
         return entities
 
@@ -668,13 +775,25 @@ def _pin_stated_level(text: str, entities: dict) -> dict:
            for ref in reference_parser.parse(text)):
         return entities
 
+    promoted = _authoritative_role(stated, ambiguous.get("levels") or [])
+
     routing.decide(
-        "Level", f"pinned {stated}",
+        "Level", f"pinned {promoted}",
         f"the query names {stated!r} explicitly, which settles which "
         f"{ambiguous.get('value')!r} was meant — the same narrowing the "
         "clarification answer applies, so both reach the same scope",
     )
-    return _pin_level(entities, ambiguous["value"], stated)
+    pinned = _pin_level(entities, ambiguous["value"], promoted)
+    if promoted != stated:
+        # The planner reads the level word from the TEXT again, and the
+        # text still says "BCM". Left alone it would scope the answer to
+        # the promoted subject while shaping it as a list of BCMs — one
+        # question resolved two ways. Recorded only when a promotion
+        # actually overruled the text, so every other query keeps
+        # detect_level's answer untouched. Meta, hence the underscore:
+        # consumers that serialise entities skip these keys.
+        pinned[PINNED_LEVEL_KEY] = promoted
+    return pinned
 
 
 def resolve(text: str, db: Session, session_id: str | None = None, _depth: int = 0,

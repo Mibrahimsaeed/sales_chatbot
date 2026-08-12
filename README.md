@@ -12,7 +12,7 @@ uvicorn app.main:app --reload
 CREATE TABLE advisors (
     sap_id           TEXT PRIMARY KEY,
     wid              TEXT UNIQUE,
-    advisor_name     TEXT,
+    
     team             TEXT,
     company           TEXT,
     region           TEXT,
@@ -301,3 +301,14 @@ secondly, if asked about the connects if team of oerson A it fails
 
 
 thirst, to give answered calls, connects and ans called% all 3 things collectively
+
+
+
+
+
+
+3 things
+connects as whole w ans call and %
+complex querys
+bcm who have 0 team size
+etc

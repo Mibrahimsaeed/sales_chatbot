@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import operator as op
 
-from sqlalchemy import asc, desc, func
+from sqlalchemy import asc, desc, func, select
 from sqlalchemy.orm import Session, aliased
 
 from app.database.models import Advisor, Attendance, PerformancePeriod
@@ -65,6 +65,79 @@ def _apply_comparator(column, operator: str, value):
 
 def _order(column, direction: str):
     return asc(column) if direction == "asc" else desc(column)
+
+
+# The person-holding levels, senior first — hierarchy.CHAIN without
+# `team`, whose values are group names rather than people. Same
+# derivation as nlu_pipeline._ROLE_LEVELS, so there is still exactly one
+# statement of the ranking in the codebase.
+_ROLE_LEVELS = [lvl for lvl in hierarchy.CHAIN if lvl != "team"]
+
+
+def _exclude_more_senior_roles(query, level: str):
+    """Keep only the people whose HIGHEST role is this one.
+
+    A role level is a column of names, and one person appears in several
+    of them: a Unit Head is named in `rm` by his 75 advisors and in
+    `management_lead` by the handful directly beneath him. So "all BCMs"
+    listed 181 people of whom 87 are really Zonal Heads or Unit Heads,
+    and the same person was counted at two levels of the same answer.
+
+    The rule is the hierarchy's own: someone belongs at the senior-most
+    level they hold. Expressed here as "not named in any column above
+    this one", which is the same statement read from the columns rather
+    than from a per-person lookup — no traversal, no second ranking, and
+    nothing to keep in sync when CHAIN is rebound.
+
+    ADVISOR IS DEDUCED, NOT FILTERED. Excluding every manager from
+    `advisor` would silently drop 181 people from "all advisors" and from
+    every advisor leaderboard — the metric answers this must not disturb.
+    An advisor row is a PERSON rather than a role column, so the leaf
+    level keeps everyone and only the manager levels dedupe.
+    """
+    if level not in _ROLE_LEVELS or level == "advisor":
+        return query
+    seniors = _ROLE_LEVELS[:_ROLE_LEVELS.index(level)]
+    column = _LEVEL_GROUP_COLUMN.get(level)
+    if column is None or not seniors:
+        return query
+
+    for senior in seniors:
+        senior_column = _LEVEL_GROUP_COLUMN.get(senior)
+        if senior_column is None:
+            continue
+        holders = (
+            select(senior_column)
+            .where(senior_column.isnot(None),
+                   Advisor.in_master_sheet.is_(True))
+        )
+        query = query.filter(~column.in_(holders))
+    return query
+
+
+def _tiebreak(ir: QueryIR):
+    """A deterministic second sort key, so paging can't repeat or skip.
+
+    `ORDER BY value DESC` alone leaves rows with EQUAL values in whatever
+    order the database happens to produce, and it is free to choose
+    differently per query. 136 advisors here tie at 0 connects, so a
+    LIMIT/OFFSET walk across that block returned some people twice and
+    others never: 573 rows came back carrying only 570 distinct people.
+
+    Invisible while every answer was one capped page — nobody paged past
+    the first 10. It became reachable the moment "connects of all BCMs"
+    started paging through the whole list, and a list that silently drops
+    people is not the list that was asked for.
+
+    The key is the group's own identity — the advisor row at advisor
+    level, the grouping column above it — which is unique per output row
+    by construction, so it totally orders every tie without changing
+    which rows come back or how they rank.
+    """
+    level = ir.subject_level
+    if level == "advisor":
+        return Advisor.wid
+    return _LEVEL_GROUP_COLUMN.get(level)
 
 
 def resolve_metric_for_period(metric_key: str, period=None) -> str | None:
@@ -245,7 +318,9 @@ def _run_team_named(db, ir: QueryIR, binding: ColumnBinding, offset: int = 0) ->
     metrics' fact tables against."""
     query, value_col = _build_team_named_query(db, ir, binding)
 
-    query = query.order_by(_order(value_col, ir.sort.direction))
+    # Same tie-determinism as the advisor-rooted path below; the team
+    # name is this row's identity here.
+    query = query.order_by(_order(value_col, ir.sort.direction), binding.model.team)
     if ir.limit:
         query = query.limit(ir.limit)
     if offset:
@@ -497,6 +572,8 @@ def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
     query = _apply_attendance_filter(query, ir, joined)
     query = _apply_metric_filters(query, ir, level, joined)
 
+    query = _exclude_more_senior_roles(query, level)
+
     if level != "advisor":
         query = query.group_by(_LEVEL_GROUP_COLUMN[level])
 
@@ -510,7 +587,9 @@ def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key
     # value_expr is already the right expression to order by: the raw
     # per-advisor column at advisor level, or the sum()/avg()-wrapped
     # rollup at team/company level (from _value_expr above).
-    query = query.order_by(_order(value_expr, ir.sort.direction))
+    tiebreak = _tiebreak(ir)
+    query = query.order_by(_order(value_expr, ir.sort.direction),
+                           *( [tiebreak] if tiebreak is not None else [] ))
     if ir.limit:
         query = query.limit(ir.limit)
     if offset:

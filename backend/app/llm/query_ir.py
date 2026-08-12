@@ -314,7 +314,13 @@ def plan_to_ir(plan, entities: dict) -> QueryIR:
         # user's stated window wins, and the metric's own period is the
         # fallback for when they stated none. See _period_for().
         time_range=TimeRange(period=_period_for(plan)),
-        limit=plan.limit or 10,
+        # `or 10` here re-imposed the cap the planner had just lifted:
+        # a query saying ALL reached this with limit=None and left it
+        # as 10. The plan's own default is 10 (query_planner.
+        # _DEFAULT_LIMIT), so an unset limit already arrives as 10 and
+        # None now means exactly what it says — no cap, page through
+        # the true match count.
+        limit=plan.limit,
         # a deterministic rule-based match is genuinely high-confidence —
         # not 1.0 (an LLM-confirmed shape can still be more certain, e.g.
         # matching an explicit business-phrase gloss), but well clear of

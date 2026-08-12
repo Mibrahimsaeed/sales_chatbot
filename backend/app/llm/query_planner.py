@@ -30,7 +30,7 @@ route here, and what came second?" is answerable from a log line.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field, replace
-from typing import Callable
+from typing import Callable, Optional
 
 from app.llm import (
     comparators, hierarchy, intent_catalog as cat, intent_precedence,
@@ -52,6 +52,13 @@ REVERSE_RE = cat.REVERSE_RE
 ROSTER_RE = cat.ROSTER_RE
 COMPARISON_RE = cat.COMPARISON_RE
 
+# How many rows a query gets when it says nothing about size. A ranking
+# ("top advisors by connects") wants the leaders, so this is the right
+# answer for it. `None` — set by _result_limit when the query says ALL —
+# means "no cap", and chat_service then pages through the true match
+# count instead.
+_DEFAULT_LIMIT = 10
+
 
 @dataclass
 class QueryPlan:
@@ -60,7 +67,7 @@ class QueryPlan:
     entity_value: str | None = None
     entity_wid: int | None = None
     metric: str | None = None
-    limit: int = 10
+    limit: Optional[int] = _DEFAULT_LIMIT
     # None = the user named no direction, so the metric's own polarity
     # decides (see query_compiler.default_direction). True/False mean the
     # user was explicit.
@@ -465,6 +472,48 @@ def _score_roster(ctx: _Intent) -> _Candidate | None:
     )
 
 
+def _result_limit(ctx: _Intent) -> Optional[int]:
+    """How many rows this query asked for.
+
+    Three answers, most specific first. A STATED number wins outright —
+    "top 5" means five. A query that says ALL gets None, which
+    chat_service reads as "the true match count" and then pages through
+    at PAGE_SIZE with a Show More cursor; that is the fix, since
+    "connects of all BCMs" used to return 10 of 181 and report
+    `total=10`, so nothing on screen or in the payload said the answer
+    had been cut. Everything else keeps the default of 10, which is what
+    "top advisors by connects" and "who has most connects" are asking
+    for — the leaders, not the roll.
+    """
+    stated = ctx.entities.get("limit")
+    if stated:
+        return stated
+    if token_match.contains_any(ctx.q, cat.ENUMERATE_WORDS):
+        return None
+    return _DEFAULT_LIMIT
+
+
+def _stated_level(ctx: _Intent) -> Optional[str]:
+    """The level this query names for its subject.
+
+    Normally `detect_level` on the level-bearing span, exactly as before.
+    The exception is a level word that nlu_pipeline already OVERRULED:
+    "BCM Haseeb Arslan connects" names a role he holds over one advisor
+    while his own hierarchy puts him at Unit Head over 75, so the pin
+    resolved him as the Unit Head. Reading "BCM" again here would scope
+    the answer to the unit and then shape it as a list of BCMs — the same
+    question resolved two ways in two modules.
+
+    The key is written only when a promotion actually happened
+    (nlu_pipeline._authoritative_role), so every other query reaches
+    detect_level untouched and this cannot quietly become a second level
+    resolver.
+    """
+    from app.llm.nlu_pipeline import PINNED_LEVEL_KEY
+
+    return ctx.entities.get(PINNED_LEVEL_KEY) or cat.detect_level(ctx.level_q)
+
+
 def _names_a_measure_here(ctx: _Intent) -> bool:
     """Did THIS turn's words name a measure?
 
@@ -522,7 +571,7 @@ def _score_hierarchy(ctx: _Intent) -> _Candidate | None:
                           f"metric:{metric}"],
                 build=lambda: QueryPlan(
                     action="group_metric", level=level, entity_value=value,
-                    metric=metric, limit=ctx.entities.get("limit", 10),
+                    metric=metric, limit=_result_limit(ctx),
                     ascending=_sort_signal(ctx.q, metric),
                 ),
             )
@@ -548,7 +597,7 @@ def _score_hierarchy(ctx: _Intent) -> _Candidate | None:
                 evidence=["relational_phrase", "group_entity:team", f"metric:{metric}"],
                 build=lambda: QueryPlan(
                     action="group_metric", level="team", entity_value=team,
-                    metric=metric, limit=ctx.entities.get("limit", 10),
+                    metric=metric, limit=_result_limit(ctx),
                     ascending=_sort_signal(ctx.q, metric),
                 ),
             )
@@ -797,7 +846,7 @@ def _score_group_metric(ctx: _Intent) -> _Candidate | None:
             # explicit; it does not rebuild a path that already produces
             # the right number.
             action="group_metric", level=level, entity_value=value, metric=metric,
-            limit=ctx.entities.get("limit", 10),
+            limit=_result_limit(ctx),
             ascending=_sort_signal(ctx.q, metric),
         ),
     )
@@ -1029,7 +1078,7 @@ def _score_leaderboard(ctx: _Intent) -> _Candidate | None:
     # default; the default is reached only when no subject was named.
     entity_level, entity_value = subject_level.entity_level_from(ctx.entities)
     decision = subject_level.decide(
-        level_word=cat.detect_level(ctx.level_q),
+        level_word=_stated_level(ctx),
         entity_level=entity_level,
         entity_value=entity_value,
         metric_default=metric_def.primary_level,
@@ -1052,7 +1101,7 @@ def _score_leaderboard(ctx: _Intent) -> _Candidate | None:
         intent="leaderboard", score=score, evidence=evidence,
         build=lambda: QueryPlan(
             action="leaderboard", level=level, metric=ctx.metric,
-            limit=ctx.entities.get("limit", 10),
+            limit=_result_limit(ctx),
             ascending=_sort_signal(ctx.q, ctx.metric),
         ),
     )
@@ -1238,7 +1287,7 @@ def _evidence_for(ctx: _Intent) -> "intent_precedence.Evidence":
         roster_phrase=ctx.is_roster,
         relation_phrase=ctx.is_relational,
         reverse_phrase=ctx.is_reverse,
-        level_word=cat.detect_level(ctx.level_q),
+        level_word=_stated_level(ctx),
         group_level=group[0] if group else None,
         ambiguous_subject=bool(ctx.entities.get("advisor_ambiguous")),
     )
