@@ -129,9 +129,21 @@ def test_ir_breakdown_intent_not_found_is_graceful(hierarchy_db):
 
 # ---- Phase 2: cross-level ambiguity, end to end through the real pipeline ----
 
-def test_ambiguous_name_asks_for_clarification_instead_of_guessing(hierarchy_db):
-    # "Zeeshan Tariq" is grounded as BOTH a unit head (Advisor.bm, fixture
-    # data) and, once added here, a real advisor name too.
+def test_a_manager_who_is_also_an_advisor_gets_their_own_profile(hierarchy_db):
+    """"Zeeshan Tariq" is grounded as a unit head AND, once added here, as
+    a real advisor name.
+
+    This asserted a clarification — "the Unit Head or the Advisor?" — and
+    that expectation is what changed. Those are not two entities; they are
+    one person and their job. A question that names neither a measure nor
+    their team is about the person, and answering it with their own
+    profile is what a single-role advisor already gets for these words.
+
+    The clarification itself is not gone: a name that is also a TEAM or a
+    COMPANY still asks, because those genuinely are different things
+    sharing a spelling. That case is pinned in the golden corpus
+    ("how is Nashit Raza doing") and in test_person_profile_ambiguity.py.
+    """
     hierarchy_db.add(Advisor(wid=99, name="Zeeshan Tariq", team="Gamma", company="Graana"))
     hierarchy_db.commit()
     from app.llm import entity_extractor
@@ -139,7 +151,5 @@ def test_ambiguous_name_asks_for_clarification_instead_of_guessing(hierarchy_db)
 
     response = handle_chat_message(hierarchy_db, "tell me about Zeeshan Tariq", session_id="h-5")
 
-    assert response["type"] == "clarification"
+    assert response["type"] == "advisor"
     assert "Zeeshan Tariq" in response["reply"]
-    assert "Unit Head" in response["reply"] or "Unit Head" in response["options"]
-    assert "Advisor" in response["reply"] or "Advisor" in response["options"]

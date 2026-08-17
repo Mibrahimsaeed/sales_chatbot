@@ -148,6 +148,10 @@ def _show_more(db: Session, session_id: str | None) -> dict:
 
     page_ir = _page_ir(ir, page_offset, capped_total)
     rows = compile_and_run(db, page_ir, offset=page_offset)
+    # Page 2 onward renders from these rows too, so the extra columns are
+    # attached here as well — otherwise a Show More silently narrowed the
+    # table back to one metric.
+    _attach_bundle_columns(db, ir, rows)
     new_shown = page_offset + len(rows)
     has_more = capped_total > new_shown
 
@@ -561,6 +565,101 @@ def _unanswerable_reply(ir) -> str:
     )
 
 
+BUNDLE_COLUMNS_KEY = "columns"
+
+
+def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
+    """Give each row of a ranked list the measures that complete it.
+
+    "connects of all BCMs" answered with one number per person, and the
+    obvious next question — how many of those calls were answered, and
+    what share — took two more queries per row. Phase 29 already decided
+    WHICH measures belong together (metric_ontology.bundle_for); this
+    puts them on every row of a list rather than only on a single
+    subject's answer.
+
+    ONE VALUE OWNER. Each figure comes from aggregation.metric_value at
+    THIS row's (level, name) — the same call the single-subject bundle
+    makes, and the same one comparisons and summaries read. So a row's
+    three numbers are three reads of one person's scope at one period,
+    and none of them is computed here.
+
+    Applied to the ROWS, not to the reply, because the rows are what both
+    the first page and every Show More page render from — enriching the
+    formatter instead would have left page 2 with a single column.
+
+    EACH CELL CARRIES ITS OWN LABEL AND RENDERED TEXT. The browser shows
+    a leaderboard as a CARD and drops the reply text entirely, so the
+    table built for the reply never reached the screen; the card has to
+    render these columns itself. Letting it format them would mean a
+    second copy of the ontology in JavaScript — one already exists there
+    and is wrong for exactly this case, classifying `answered_calls_rate`
+    as a plain count and, if corrected naively, multiplying an
+    already-scaled 114.7 by a hundred. So the label and the display
+    string are decided here, by the owners that decide them for every
+    other reply, and the card renders what it is given.
+
+    Returns the keys in display order, primary first, or [] when the
+    sorted measure is in no bundle — which is every other ranking,
+    unchanged.
+    """
+    from app.llm.metric_ontology import bundle_for
+    from app.llm.response_formatter import column_heading, format_metric_value
+
+    if not rows:
+        return []
+    primary = effective_metric(ir)
+    period = getattr(ir.time_range, "period", None)
+    keys = bundle_for(primary, period)
+    if len(keys) < 2:
+        return []
+
+    for row in rows:
+        cells = {}
+        for key in keys:
+            # The primary is REUSED, never re-read: it is the ranked
+            # value, and fetching it a second time is how a row's headline
+            # and its own column start to disagree.
+            value = row.get("value") if key == primary else _companion_value(db, ir, row, key)
+            cells[key] = {
+                "value": value,
+                # None is kept rather than dropped, so a row with no
+                # answered-calls record keeps its place and its other
+                # figures instead of vanishing or shifting.
+                "display": _MISSING_CELL if value is None else format_metric_value(key, value),
+                "label": column_heading(key),
+            }
+        row[BUNDLE_COLUMNS_KEY] = cells
+    return keys
+
+
+_MISSING_CELL = "—"
+
+
+def _companion_value(db: Session, ir, row, key: str):
+    """One companion measure for the subject THIS row is about.
+
+    Identity differs by level, and getting it wrong is not cosmetic. A
+    group level is addressed by the value it groups on, which is unique
+    per row by construction. An ADVISOR is addressed by wid: names are
+    not identifiers here (238 duplicate-name groups in production), and
+    reading `connects of all advisors` by name raised MultipleResultsFound
+    on the first shared name — and, where it did not raise, could have
+    quietly shown one person's answered calls beside another's connects.
+
+    Both branches are the existing owner for that shape:
+    advisor_service.get_advisor_metric is the wid-keyed lookup the
+    single-person reply already uses, and aggregation.metric_value is the
+    scope-keyed one comparisons and summaries read.
+    """
+    if ir.subject_level == "advisor":
+        wid = row.get("wid")
+        if wid is None:
+            return None
+        return advisor_service.get_advisor_metric(db, wid, key)
+    return aggregation.metric_value(db, ir.subject_level, row.get("name"), key)
+
+
 def _metric_bundle_values(db: Session, answered, requested, fetch, period):
     """The bundled measures for one subject, as [(key, value), ...].
 
@@ -644,6 +743,7 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
     # dumping hundreds of rows into one reply.
     capped_total = _capped_total(ir, true_total)
     rows = compile_and_run(db, _page_ir(ir, 0, capped_total), offset=0)
+    _attach_bundle_columns(db, ir, rows)
     has_more = capped_total > len(rows)
 
     if has_more:

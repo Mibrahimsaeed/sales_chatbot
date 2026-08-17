@@ -87,6 +87,22 @@ PEOPLE = [
     # on wid rather than name.
     (12, "Ali Raza",      "Blue Area",  "Graana",  "Tariq Mehmood", "Fawad Hafeez", "Usman Ghani", "Beverly Center", "North/KPK"),
     (13, "Ali Raza",      "GCC",        "IMARAT",  "Sadia Rehman",  "Adeel Aslam",  "Bilal Qadir", "Emporium",       "South"),
+    # A TEAM named after a BCM — the clarify_ambiguous case, and now the
+    # only shape that still is. "Nashit Raza" is this advisor's BCM AND
+    # the team they sit on: two different ENTITIES sharing a spelling, so
+    # no role ranking settles which was meant and the question stands.
+    #
+    # The collision name is deliberately new rather than an existing
+    # manager's: making an already-referenced name ambiguous would change
+    # unrelated cases (it turned "who is above Bilal Qadir" into a
+    # clarification), which is the opposite of what a fixture row for one
+    # category should do.
+    #
+    # Kamran Shah (wid 11) used to serve this category. He no longer can:
+    # a name grounded only at ROLE levels is one person wearing several
+    # hats, and the hierarchy answers which hat without asking. That row
+    # stays, now covering the resolved reading.
+    (14, "Rehan Aslam",   "Nashit Raza", "IMARAT", "Sadia Rehman",  "Adeel Aslam",  "Nashit Raza", "Emporium",       "South"),
 ]
 
 # wid -> (mtd_cleared, ytd_cleared, pct, connects, cr, meetings, conversions,
@@ -105,6 +121,10 @@ FACTS = {
     11: (250, 2200, 25.0,  25,  9,  4, 1,  45, 1200, 5, 11000,  9, 11, "On Time"),
     12: (350, 3200, 35.0,  35, 11,  7, 2,  55, 1800, 3, 16000, 11,  9, "Late"),
     13: (450, 4200, 45.0,  45, 13,  9, 3,  65, 2200, 2, 19000, 13,  7, "On Time"),
+    # Deliberately the smallest figures in the org, so the row that exists
+    # to carry a NAME COLLISION never enters a "top N" and cannot change
+    # any ranking case.
+    14: ( 50,  400,  5.0,   5,  1,  1, 0,  10,  200, 0,  4000,  2, 18, "On Time"),
 }
 
 

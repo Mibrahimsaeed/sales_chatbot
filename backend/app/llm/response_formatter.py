@@ -546,6 +546,98 @@ def _shown_through(rows: list[dict], start_index: int) -> int:
     return start_index - 1 + len(rows)
 
 
+_MISSING = "—"
+
+
+def _bundle_table(ir: QueryIR, rows: list[dict], metric_key: str,
+                  header: str, start_index: int) -> str:
+    """A ranked list whose rows carry a bundle, rendered as columns.
+
+    "connects of all BCMs" gave one number per person, and the two
+    measures that make it mean something — the answered calls behind it
+    and the share — were two more questions per row.
+
+    RENDERS WHAT THE ROW CARRIES. Each cell arrives with its label and
+    its display string already decided (chat_service._attach_bundle_
+    columns), so this text table and the browser's card render the same
+    words from the same source rather than formatting the same numbers
+    twice in two languages.
+
+    Widths are measured over THIS page, so the columns line up in a
+    monospace view without a fixed layout that a long name would break.
+    A missing figure arrives as an em dash: the row keeps its place and
+    its other numbers, because a blank cell that shifts the line is how a
+    reader ends up attributing one person's value to another.
+    """
+    cells_of = lambda row: row.get("columns") or {}
+    keys = list(cells_of(rows[0]))
+    headings = [_level_label(ir)] + [cells_of(rows[0])[key]["label"] for key in keys]
+
+    body: list[list[str]] = []
+    for index, row in enumerate(rows, start=start_index):
+        cells = cells_of(row)
+        body.append([f"{index}. {row.get('name', '')}"]
+                    + [cells[key]["display"] for key in keys])
+
+    widths = [max(len(headings[i]), *(len(r[i]) for r in body))
+              for i in range(len(headings))]
+
+    # The subject column reads left-aligned; every figure right-aligned
+    # under its heading, which is what makes a column of numbers
+    # comparable at a glance.
+    def _line(cells):
+        out = [cells[0].ljust(widths[0])]
+        out += [cells[i].rjust(widths[i]) for i in range(1, len(cells))]
+        return "  ".join(out).rstrip()
+
+    lines = [header, "", _line(headings), "  ".join("-" * w for w in widths)]
+    lines += [_line(cells) for cells in body]
+    return "\n".join(lines)
+
+
+def _level_label(ir: QueryIR) -> str:
+    from app.llm import hierarchy
+
+    return hierarchy.label_for(ir.subject_level) or "Subject"
+
+
+def column_heading(metric_key: str | None) -> str:
+    """The measure's name for a column heading.
+
+    Two things happen here. The window is dropped, because the header
+    above states the period once and repeating it per column is what made
+    the table unreadable at three columns.
+
+    And a TARGET-ATTAINMENT rate says so. `answered_calls_rate` is
+    answered calls against a target of 10 per advisor per working day —
+    it is not answered calls over connects. In a sentence that was clear
+    enough; in a table it sat immediately right of Connects and Answered
+    Calls, where three columns in that order read as count, count,
+    ratio-of-the-two. Haider Ali's 1,147 of 3,087 showed as 114.7%, which
+    under that reading is impossible, and 114.7% is CORRECT — his ten
+    advisors beat the target. The arithmetic was never wrong; the
+    heading let the reader compute a different one.
+
+    Which metrics are target-scaled is read from the ontology's own
+    `working_day_scaled` flag — the same declaration the denominator is
+    built from (aggregation._working_day_denominator) — so this cannot
+    name a metric a target rate when the engine does not, and a new one
+    is labelled correctly without being listed here.
+
+    Deliberately confined to column headings: `measure_label` and the
+    ontology's own labels are untouched, so single-value replies and
+    every other caller read exactly as before.
+    """
+    from app.llm.metric_ontology import METRICS, measure_label
+
+    label = measure_label(metric_key)
+    metric = METRICS.get(metric_key)
+    if metric and any(getattr(binding, "working_day_scaled", False)
+                      for binding in (metric.bindings or {}).values()):
+        return f"{label} of Target"
+    return label
+
+
 def format_ir_leaderboard_reply(
     ir: QueryIR, rows: list[dict], total_count: int | None = None, start_index: int = 1, paginated: bool = False
 ) -> str:
@@ -557,6 +649,10 @@ def format_ir_leaderboard_reply(
         header = f"Showing {_shown_through(rows, start_index)} of {total_count} by {label}{_filters_summary(ir)}"
     else:
         header = f"🏆 Top {len(rows)} by {label}{_filters_summary(ir)}"
+    # Only a bundled measure carries columns; every other ranking renders
+    # exactly as it always has, one line per row.
+    if rows[0].get("columns"):
+        return _bundle_table(ir, rows, metric_key, header, start_index)
     lines = [header, ""]
     for i, row in enumerate(rows, start=start_index):
         value = row.get("value", 0)

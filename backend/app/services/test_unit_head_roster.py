@@ -286,8 +286,18 @@ def test_an_ambiguous_qualifier_falls_through_to_the_question():
         ["unit_head", "zonal_head", "bcm", "advisor"]) is None
 
 
-def test_a_qualifier_the_value_does_not_hold_is_not_used():
-    """"advisors under Unit Head X" where X is not a Unit Head must not
-    be forced into a Unit Head reading."""
+def test_a_qualifier_the_value_does_not_hold_falls_back_to_their_own_role():
+    """"advisors under Unit Head X" where X is NOT a Unit Head.
+
+    This asserted `None` — no reading, ask the user — until team-size
+    phrasings showed the same shape from another angle: a question about
+    the group under someone, whose level words describe the OUTPUT and
+    the RELATION rather than the person. A level they do not hold still
+    cannot be forced onto them, but their own hierarchy answers it, and
+    BCM is the senior-most role this value holds.
+    """
     assert nlu_pipeline._subject_level_word(
-        "show all advisors under unit head kaleem satti", ["bcm", "advisor"]) is None
+        "show all advisors under unit head kaleem satti", ["bcm", "advisor"]) == "bcm"
+    # ...and a value with no manager role at all still has no answer here.
+    assert nlu_pipeline._subject_level_word(
+        "show all advisors under unit head kaleem satti", ["advisor"]) is None

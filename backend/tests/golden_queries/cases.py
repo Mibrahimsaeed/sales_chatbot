@@ -633,10 +633,21 @@ CLARIFICATIONS = [
 # =====================================================================
 
 AMBIGUOUS = [
-    # "Kamran Shah" is both a BCM and an advisor in the fixture.
+    # "Kamran Shah" is both a BCM and an advisor in the fixture — and that
+    # is ONE PERSON wearing two hats, not two things sharing a spelling.
+    # These asked "the BCM or the Advisor?" until the hierarchy was
+    # allowed to answer it: a question about someone that names neither a
+    # measure nor their team is about the person, which is exactly what a
+    # single-role advisor already gets for the same words.
     Case("how is Kamran Shah doing",
-         {"intent": "clarify_ambiguous", "metric": None}),
+         {"intent": "advisor_profile", "level": "advisor", "entity": "Kamran Shah"}),
     Case("tell me about Kamran Shah",
+         {"intent": "advisor_profile", "level": "advisor", "entity": "Kamran Shah"}),
+    # A name that is a BCM *and a team* is two different ENTITIES, and no
+    # role ranking settles that — so this one still asks. It is what keeps
+    # the resolved cases above honest: the system stopped asking about
+    # hats, not about genuine collisions.
+    Case("how is Nashit Raza doing",
          {"intent": "clarify_ambiguous", "metric": None}),
     # Naming the level resolves it without asking.
     Case("how is BCM Kamran Shah doing",
@@ -661,13 +672,14 @@ AMBIGUOUS = [
     Case("what is Kamran Shah's revenue",
          {"intent": "advisor_metric", "level": "advisor", "entity": "Kamran Shah",
           "metric": "mtd_cleared"}),
+    # The known_gap this recorded is CLOSED. It read: "Should be a roster
+    # of BCM Kamran Shah's advisors, or a clarification" — the roster is
+    # what it now returns. "advisors" names the OUTPUT and "under X" the
+    # relation, so neither describes Kamran Shah's own level; with no
+    # qualifier in the sentence his own hierarchy answers it, and BCM is
+    # the senior-most role he holds.
     Case("all advisors under Kamran Shah",
-         {"intent": "advisor_profile", "level": "advisor", "entity": "Kamran Shah"},
-         known_gap="Should be a roster of BCM Kamran Shah's advisors, or a "
-                   "clarification. The relational phrase 'under X' makes "
-                   "_score_clarify_ambiguous prune to the managerial reading, but the "
-                   "advisor reading then outscores the roster, so the query returns "
-                   "one person's profile and drops 'all advisors' entirely."),
+         {"intent": "roster", "level": "bcm", "entity": "Kamran Shah"}),
     # Unambiguous names in the SAME shapes, so the clarifications above
     # are shown to be driven by the ambiguity rather than the phrasing.
     Case("what is Hina Malik's revenue",

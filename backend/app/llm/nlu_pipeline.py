@@ -677,58 +677,123 @@ def _asks_for_the_group(text: str, entities: dict) -> bool:
     return bool(spec and spec.ranking)
 
 
+# "how many people are UNDER X" names no level at all, yet asks about the
+# people beneath someone. Kept minimal and separate from the relation
+# vocabulary reference_parser owns, which covers possessives ("X's team")
+# and does not parse this shape.
+#
+# `under` and `below` are ALSO comparator words (comparators.py: "less
+# than", "below", "under"), so a following number disqualifies the match
+# — "advisors under 50 connects" is a threshold, not a manager.
+_UNDER_RE = re.compile(
+    r"\b(under|beneath|below|reporting to|reports to)\b(?!\s*\d)", re.I)
+
+
+def _measures_the_group(text: str, stated: str | None, ambiguous_levels) -> bool:
+    """Is the level word about the GROUP under the person, not the person?
+
+    Three shapes, all of which name a level while meaning the people
+    beneath someone:
+
+        "show all ADVISORS under Kaleem Satti"   the OUTPUT is advisors
+        "TEAM size of Haseeb Arslan"             the TEAM is measured
+        "how many people are UNDER Haseeb"       no level word at all
+
+    A GENUINE TEAM SURVIVES THIS. `team` counts only when the ambiguous
+    value is NOT itself grounded at team — if a person shares a name with
+    a real team, `team` is one of the readings on offer and the question
+    is exactly which was meant, so it is left to the clarification. And
+    the whole function is reached only for a value that grounded at
+    several hierarchy levels; "connects of Blue Area" grounds at team
+    alone, produces no ambiguity, and never arrives here.
+
+    `advisor` and `team` are the only levels that can be read this way —
+    the one names the people a roster lists, the other the group they
+    form — so no other level word is second-guessed.
+    """
+    from app.llm import intent_catalog as cat
+
+    # ROSTER_RE wants the noun adjacent to its preposition ("advisors
+    # under X"); "how many advisors ARE under X" is the same question with
+    # a verb in between, so the relation phrase counts too.
+    if stated == "advisor" and (cat.ROSTER_RE.search(text) or _UNDER_RE.search(text)):
+        return True
+    if stated == "team" and "team" not in (ambiguous_levels or []):
+        return True
+    if stated is None and _UNDER_RE.search(text):
+        return True
+    return False
+
+
 def _subject_level_word(text: str, ambiguous_levels) -> str | None:
     """The level word that says WHO THE SUBJECT IS, not what to return.
 
-    A roster question names two levels and means different things by
-    them:
+    A question about a group names two levels and means different things
+    by them:
 
         "show all ADVISORS under UNIT HEAD Kaleem Satti"
                    ^ what to return      ^ who Kaleem is
 
-    detect_level returns the first entry in LEVEL_KEYWORDS order, which
-    is `advisor` — so the OUTPUT noun outranked the qualifier purely by
-    table position, and _pin_stated_level then pinned Kaleem Satti to
-    `advisor` and deleted his unit_head grounding. With no group entity
-    left the roster candidate scored nothing, `lookup` won, and the
-    question about 137 people was answered with one man's profile. The
-    roster service was correct throughout and was never called.
+        "TEAM size of Haseeb Arslan"
+         ^ what is measured    ^ who he is — his hierarchy decides
 
-    Same shape as the possessive guard below — a level word that belongs
-    to something other than the subject must not choose the subject — and
-    resolved from the same tables rather than a second vocabulary:
-    ROSTER_RE already says this is a roster phrasing, and LEVEL_KEYWORDS
-    already says which levels the sentence names.
+    detect_level returns the first entry in LEVEL_KEYWORDS order, so the
+    output noun outranked the qualifier purely by table position.
+    _pin_stated_level then pinned Kaleem Satti to `advisor` and deleted
+    his unit_head grounding, and the question about 137 people was
+    answered with one man's profile. "team size of X" fared differently
+    and no better: `team` is not one of the person's role levels, so the
+    pin declined outright and the reply asked which of four readings of
+    one man was meant.
 
-    Only `advisor` can be an output noun (it is the only level whose
-    keywords — advisor/advisors/agent/agents — are also words for the
-    people a roster lists), so nothing else is second-guessed. And the
-    replacement must be UNAMBIGUOUS: exactly one other named level, which
-    the value is actually grounded at. Two qualifiers, or one the value
-    does not hold, leaves the question genuinely open and falls through
-    to the clarification instead of guessing.
+    So when the level word describes the GROUP, the subject's level comes
+    from the sentence's other qualifier if it has one, and otherwise from
+    the person's own hierarchy — `_highest_role`, the same ranking the
+    possessive form ("X's team size") has used since Phase 28, which is
+    why all these phrasings now reach one number.
+
+    Two qualifiers settle nothing and fall through to the clarification
+    rather than guessing, and a stated junior role is still corrected
+    upward downstream by `_authoritative_role`.
     """
     from app.llm import intent_catalog as cat, token_match
 
     stated = cat.detect_level(text)
-    if stated != "advisor" or not cat.ROSTER_RE.search(text):
+    if not _measures_the_group(text, stated, ambiguous_levels):
         return stated
 
+    # An explicit level for the SUBJECT still wins: "advisors under Unit
+    # Head X" names both, and the qualifier is the one about the person.
     others = [
         level for level, keywords in cat.LEVEL_KEYWORDS.items()
-        if level != "advisor"
-        and level in ambiguous_levels
+        if level != stated
+        and level in (ambiguous_levels or [])
         and token_match.contains_any(text, keywords)
     ]
-    if len(others) != 1:
+    if len(others) == 1:
+        routing.decide(
+            "Level", f"read {others[0]!r} not {stated!r}",
+            f"{stated!r} names what the question measures while "
+            f"{others[0]!r} names who the subject is — the first only won "
+            "before because it comes first in LEVEL_KEYWORDS",
+        )
+        return others[0]
+    if others:
+        return None
+
+    # No qualifier — the person's own hierarchy answers it, exactly as it
+    # does when no level word is present at all.
+    role = _highest_role([lvl for lvl in (ambiguous_levels or [])
+                          if lvl in _ROLE_LEVELS])
+    if role is None or role == "advisor":
         return None
     routing.decide(
-        "Level", f"read {others[0]!r} not 'advisor'",
-        "'advisors' names what the roster should RETURN while "
-        f"{others[0]!r} names who the subject is — the output noun only "
-        "won before because it comes first in LEVEL_KEYWORDS",
+        "Level", f"pinned {role}",
+        f"the question measures the group under this person and names no "
+        f"role for them, so their own hierarchy answers it — {role!r} is "
+        "the senior-most role they hold",
     )
-    return others[0]
+    return role
 
 
 def _pin_stated_level(text: str, entities: dict) -> dict:
@@ -1060,7 +1125,8 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         # actually leads. A question about the person is left to the
         # branch above, so RULE 1 (a bare person query answers with their
         # OWN figure) is untouched.
-        role = _highest_role(levels) if _asks_for_the_group(cleaned, entities) else None
+        wants_group = _asks_for_the_group(cleaned, entities)
+        role = _highest_role(levels) if wants_group else None
         if role is not None and role != "advisor":
             routing.decide(
                 "Level", f"pinned {role}",
@@ -1070,6 +1136,38 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             )
             return resolve(cleaned, db, session_id=session_id, _depth=_depth or 1,
                            _pin=(value, role))
+
+        # AND A QUESTION ABOUT THE PERSON IS ABOUT THE PERSON, even when
+        # it names no measure. "who is X?", "details of X" and a bare name
+        # fell through both branches above — the first wants a measure
+        # named, the second a group — so the most natural way to ask about
+        # someone was the one way that got a question back: "the Unit Head
+        # or the Zonal Head or the BCM or the Advisor?", four readings of
+        # one man, for a sentence that plainly means the man.
+        #
+        # It also bit a BCM who is nothing else: "details of Abdul Qadir"
+        # asked "BCM or Advisor?" of a person whose highest role is not in
+        # doubt. Nothing about the PERSON decided any of this — only
+        # whether the wording happened to name a measure or a group.
+        #
+        # `advisor` rather than the senior role, because these words ask
+        # who someone IS, and that is the same answer a single-role
+        # advisor already gets for the same sentence. Their role and the
+        # team they lead belong IN that answer, not instead of it.
+        #
+        # Gated on _highest_role, which is None as soon as the name also
+        # reads as a TEAM or COMPANY — a different entity that happens to
+        # share a spelling, where no ranking settles anything and the
+        # question is still the honest reply.
+        if not wants_group and _highest_role(levels) is not None:
+            routing.decide(
+                "Level", "pinned advisor",
+                f"{value!r} names one person wearing several hats and the turn "
+                "asks about them rather than about a measure or their team — "
+                "which hat they wear settles nothing a profile does not say",
+            )
+            return resolve(cleaned, db, session_id=session_id, _depth=_depth or 1,
+                           _pin=(value, "advisor"))
 
         options = [hierarchy.label_for(lvl) for lvl in levels]
         audit.decision("routing", "clarify:ambiguous_entity",

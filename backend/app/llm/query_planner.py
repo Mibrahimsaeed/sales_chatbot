@@ -490,6 +490,15 @@ def _result_limit(ctx: _Intent) -> Optional[int]:
         return stated
     if token_match.contains_any(ctx.q, cat.ENUMERATE_WORDS):
         return None
+    # A CONDITION IS ALREADY THE LIMIT. "BCMs with answered calls above
+    # 60%" asks for the people who meet it — all of them — and the answer
+    # to "how many are there" is the point of asking. Cutting that to ten
+    # and reporting ten as the total makes a filtered list read as a
+    # complete one, which is the same defect the ALL case had, arriving
+    # by a different route. A ranking keeps its ten because "top" and
+    # "most" ask who is ahead; a threshold names no such bound.
+    if ctx.entities.get("thresholds"):
+        return None
     return _DEFAULT_LIMIT
 
 

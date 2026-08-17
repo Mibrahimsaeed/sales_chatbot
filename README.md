@@ -310,5 +310,5 @@ thirst, to give answered calls, connects and ans called% all 3 things collective
 3 things
 connects as whole w ans call and %
 complex querys
-bcm who have 0 team size
+bcm who have 0 team size 
 etc

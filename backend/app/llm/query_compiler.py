@@ -501,8 +501,38 @@ def _apply_metric_filters(query, ir: QueryIR, level: str, joined: dict):
         if not f_binding or f_binding.team_named:
             continue  # can't combine a team-named metric filter into an advisor-rooted query
         query, entity = _join_fact_table(query, joined, f_binding.model, f_binding.period)
-        expr = _rebind_to_entity(f_binding.expr, entity, f_binding.model)
-        query = query.filter(_apply_comparator(expr, f.operator, f.value))
+        query = _join_declared_models(query, joined, f_binding)
+
+        # THE METRIC'S VALUE, not its raw column. This read
+        # `f_binding.expr`, which for a RATIO is the NUMERATOR ALONE — so
+        # "answered calls % above 60" compiled to
+        # `answered_calls * 100 > 60`, i.e. `answered_calls > 0.6`, and
+        # returned all 404 advisors who answered any call where 185
+        # actually clear 60%. The denominator was not mis-scaled; it was
+        # absent. Asking the aggregation engine for the expression is the
+        # same call the SORT metric makes, so a threshold and a ranking on
+        # one measure can no longer disagree about what it is.
+        expr = aggregation.value_expression(
+            f_binding, f.field, level,
+            numerator=_rebind_to_entity(f_binding.ratio_numerator, entity, f_binding.model)
+            if f_binding.ratio_numerator is not None else None,
+            denominator=_rebind_to_entity(f_binding.ratio_denominator, entity, f_binding.model)
+            if f_binding.ratio_denominator is not None else None,
+            expr=_rebind_to_entity(f_binding.expr, entity, f_binding.model),
+        )
+        predicate = _apply_comparator(expr, f.operator, f.value)
+
+        # AND IT IS A CONDITION ON THE GROUP, so above the leaf it belongs
+        # AFTER the grouping. As a WHERE it selected individual advisor
+        # rows and the group was then aggregated over only those — a BCM
+        # qualified because one of her people did, and the figure shown
+        # was the partial sum: "BCMs with answered calls below 60%"
+        # answered with a BCM at 283, and a leaderboard row read 102 where
+        # the aggregation engine said 68 for the same person.
+        if level == "advisor":
+            query = query.filter(predicate)
+        else:
+            query = query.having(predicate)
     return query
 
 
