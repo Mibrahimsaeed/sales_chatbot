@@ -191,6 +191,17 @@ def _threshold_filters(plan) -> list["Filter"]:
     would turn an unanswerable query into a confident wrong answer, so
     the thresholds are dropped rather than guessed at.
 
+    UNLESS THE SENTENCE NAMED SEVERAL. `plan.metric` is one key, so
+    binding every threshold to it made "target achievement below 50% and
+    answered calls % below 20%" compile as `achievement_pct < 50 AND
+    achievement_pct < 20` — the second condition applied to the first
+    condition's column, which reduces the pair to `< 20` and answers a
+    question nobody asked. entity_extractor pairs each comparator with
+    the measure beside it (_bind_threshold_metrics) and leaves the key on
+    the threshold; this reads it, falling back to `plan.metric` for the
+    single-measure queries that are the overwhelming majority and where
+    no such key is set.
+
     The field is resolved for the plan's period HERE, not in the
     compiler. An extracted threshold carries no window of its own — "700"
     in "revenue above 700 this year" means 700 of whatever revenue the
@@ -210,17 +221,21 @@ def _threshold_filters(plan) -> list["Filter"]:
 
     from app.llm.query_compiler import resolve_metric_for_period
 
-    # `or metric_key`: a measure with no sibling for that period keeps
-    # its own field rather than losing the filter. The sort metric will
-    # independently fail to resolve and the query returns "can't answer",
-    # so this cannot produce a wrong answer on its own.
-    field = resolve_metric_for_period(metric_key, _period_for(plan)) or metric_key
-
-    return [
-        Filter(field=field, operator=t["operator"], value=t["value"])
-        for t in getattr(plan, "thresholds", None) or []
-        if t.get("operator") and t.get("value") is not None
-    ]
+    period = _period_for(plan)
+    filters: list["Filter"] = []
+    for t in getattr(plan, "thresholds", None) or []:
+        if not t.get("operator") or t.get("value") is None:
+            continue
+        # The measure this comparator was written beside, or the one the
+        # plan resolved when the sentence named only one.
+        named = t.get("metric") or metric_key
+        # `or named`: a measure with no sibling for that period keeps its
+        # own field rather than losing the filter. The sort metric will
+        # independently fail to resolve and the query returns "can't
+        # answer", so this cannot produce a wrong answer on its own.
+        field = resolve_metric_for_period(named, period) or named
+        filters.append(Filter(field=field, operator=t["operator"], value=t["value"]))
+    return filters
 
 
 def _direction_for(plan) -> str:

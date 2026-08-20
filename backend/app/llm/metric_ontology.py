@@ -767,6 +767,49 @@ METRICS: dict[str, MetricDef] = {
     ),
 
     # ---------------------------------------------------------------
+    # ORG SHAPE — how many people are in a scope.
+    #
+    # NOT A NEW CALCULATION. The row count over the advisors in scope has
+    # been team size throughout this file: it is what
+    # aggregation.headcount() returns for "team size of X", and what
+    # every working-day rate divides by (see the note above cr_rate —
+    # "the row count IS the team size"). What was missing is that it was
+    # never DECLARED, so it could not be sorted by or compared against
+    # and "BCMs with team size > 1" resolved no metric at all — or, worse,
+    # fallback_reasoning widened "Unit Heads with team size > 5" onto
+    # `one_unit_ratio` from the stray word "Unit" and filtered on the
+    # wrong measure.
+    #
+    # `literal(1)` per advisor row, rolled up with the default SUM, is
+    # therefore SUM(1) = COUNT(rows in scope) — the same expression
+    # value_expression already builds for those denominators, over the
+    # same master-sheet scope headcount() uses. One definition, reached
+    # two ways: this binding when the count is ranked or filtered,
+    # headcount() when a single scope's figure is read.
+    #
+    # entity_levels follows the convention the rate metrics use: advisor
+    # and team are declared with bindings, and bcm/zonal_head/unit_head
+    # are reached by the compiler's generic advisor-rollup fallback
+    # (query_compiler._binding_for) rather than by three more copies of
+    # one expression.
+    "team_size": MetricDef(
+        key="team_size",
+        label="Team Size",
+        # A count of people, so it rolls up by addition — the default,
+        # stated here because it is the whole behaviour of this metric.
+        rollup=Rollup.SUM,
+        entity_levels=["advisor", "team"],
+        primary_level="team",
+        bindings={
+            "advisor": ColumnBinding(model=Advisor, expr=literal(1)),
+            # The SAME expression, for the reason answered_calls_rate
+            # gives: a second, divergent one is how a number comes to
+            # have two answers.
+            "team": ColumnBinding(model=Advisor, expr=literal(1)),
+        },
+    ),
+
+    # ---------------------------------------------------------------
     # Funnel ratios (spec: Connect->CR, CR->Meeting, Meeting->Conversion)
     #
     # Real percentages, unlike the spec's target-RATE leaderboards: every

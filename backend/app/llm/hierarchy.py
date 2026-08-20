@@ -41,6 +41,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import and_, func, or_
+
 from app.database.models import Advisor
 from app.llm import relations
 
@@ -237,6 +239,63 @@ def scope_filter(level: str, value: str):
     if column is None:
         raise ValueError(f"'{level}' is not a known hierarchy level")
     return column.ilike(value)
+
+
+def direct_scope_filter(level: str, value: str, target_level: str | None = None):
+    """The predicate selecting only `value`'s IMMEDIATE reports.
+
+    `scope_filter` above is the whole subtree, because one column match
+    on a denormalised row IS every descendant: `rm ilike 'Faisal'`
+    selects all 16 advisors beneath that Unit Head however many managers
+    sit between. That is the right answer for "X's team" and the wrong
+    one for "who reports DIRECTLY to X" — the word was not in any
+    vocabulary, so both questions returned the same 16 people.
+
+    Directness is read off the chain rather than declared: a row is an
+    immediate report at `target_level` when the column of the level
+    ABOVE it holds `value`. Advisors are the leaf, so their immediate
+    manager is `bcm` (management_lead) — which is why the same Unit Head
+    is `rm` to 16 people, `portfolio_lead` to 11 and `management_lead`
+    to the 4 he actually manages himself.
+
+    `target_level` defaults to the level immediately below `level`, so
+    "who reports to a Unit Head" enumerates Zonal Heads. Naming it
+    explicitly is what "how many ADVISORS report directly to X" needs:
+    the target is the leaf, and the predicate becomes the leaf's own
+    parent column regardless of how far above it `level` sits.
+
+    SELF IS EXCLUDED. One person legitimately occupies several levels —
+    Faisal Hussain Naqvi is his own Zonal Head for 11 advisors — so
+    without this his direct reports include himself, and a headcount of
+    his reports counts him as one of them. Excluding it here rather than
+    at each caller keeps the count and the roster over one population.
+
+    Returns None when the level has no reports to enumerate (an advisor
+    is the leaf), which callers render as "not a question about this
+    level" rather than as an empty result.
+    """
+    level = canonical_level(level)
+    target = canonical_level(target_level) or child_of(level)
+    if target is None:
+        return None
+
+    manager_level = parent_of(target)
+    if manager_level is None:
+        return None
+    manager_column = column_for(manager_level)
+    if manager_column is None:
+        raise ValueError(f"'{manager_level}' is not a known hierarchy level")
+
+    predicate = manager_column.ilike(value)
+
+    own_column = column_for(target)
+    if own_column is not None:
+        predicate = and_(
+            predicate,
+            or_(own_column.is_(None),
+                func.lower(own_column) != (value or "").lower()),
+        )
+    return predicate
 
 
 # ---------------------------------------------------------------------

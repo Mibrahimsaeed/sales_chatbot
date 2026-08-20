@@ -94,6 +94,12 @@ class QueryPlan:
     # ABOUT. They were the same thing while only advisors could be
     # subjects, and are not once a BCM can be one.
     subject_level: str | None = None
+    # action=="direct_reports" only: WHICH level to enumerate beneath the
+    # manager. None means the level immediately below theirs, so "who
+    # reports directly to a Unit Head" lists Zonal Heads; naming it is
+    # what "how many ADVISORS report directly to X" needs, since the
+    # target is then the leaf rather than the next level down.
+    target_level: str | None = None
     flat: bool = False
     ambiguous: dict | None = None
     person_candidates: list = dataclass_field(default_factory=list)
@@ -350,11 +356,40 @@ def _score_clarify_ambiguous(ctx: _Intent) -> _Candidate | None:
         if token_match.contains_any(ctx.q, hierarchy.LEVEL_KEYWORDS.get(level, []))
     ]
 
+    # In a DIRECT question a level word can fill either of two slots, and
+    # only one of them is the subject. "How many ADVISORS report directly
+    # to Kaleem Satti" names the population being counted, not who Kaleem
+    # is — but the scan above cannot tell those apart, so it concluded the
+    # subject was the advisor reading and the question was answered with
+    # Kaleem's own profile. An advisor manages nobody, so the leaf is
+    # never the subject of this question.
+    if ctx.entities.get("direct"):
+        named_levels = [lvl for lvl in named_levels if lvl != "advisor"]
+
     # A relational phrasing likewise settles it: only a manager HAS a team.
     if len(named_levels) != 1 and ctx.is_relational:
         managerial = [lvl for lvl in ambiguous["levels"] if lvl in hierarchy.NEW_GROUP_LEVELS]
         if len(managerial) == 1:
             named_levels = managerial
+
+    # "Who reports DIRECTLY to X" is a question about X AS A MANAGER: the
+    # advisor reading has no answer at all, because an advisor manages
+    # nobody. That prunes the leaf, and where several MANAGER levels
+    # remain the chain's own rule settles the rest — a person belongs at
+    # the senior-most level they hold, which is _highest_role, the same
+    # ranking _exclude_more_senior_roles states for leaderboards.
+    #
+    # Without this every person-named direct question clarifies instead
+    # of answering, because in this data every manager also has an
+    # advisor row of their own.
+    if len(named_levels) != 1 and ctx.entities.get("direct"):
+        from app.llm.nlu_pipeline import _highest_role
+
+        managerial = [lvl for lvl in ambiguous["levels"]
+                      if lvl in hierarchy.CHAIN and lvl != "advisor"]
+        senior = _highest_role(managerial)
+        if senior:
+            named_levels = [senior]
 
     if len(named_levels) == 1:
         explicit = named_levels[0]
@@ -541,6 +576,34 @@ def _names_a_measure_here(ctx: _Intent) -> bool:
     return bool(match and match.metric)
 
 
+# Measures that a NAMED group answers through its own breakdown rather
+# than as a metric query.
+#
+# `team_size` is the group's SHAPE, not a measure over its members, and
+# the breakdown already reports it as the advisor count. Phase 37 settled
+# that all four phrasings of "how big is X's team" agree on that reply;
+# letting the metric take over would swap a settled answer for a
+# differently-shaped one carrying the same number.
+#
+# The declaration exists so the count can be RANKED and FILTERED across
+# many groups ("BCMs with team size > 5"). That shape names no single
+# entity, so neither scorer guarded here can see it.
+_GROUP_SHAPE_METRICS = frozenset({"team_size"})
+
+
+def _answers_as_group_shape(metric_key: str | None, entities: dict) -> bool:
+    """Is this measure one a NAMED group already answers by itself?
+
+    Only when a group IS named. "team size of Owais Tariq" names one, so
+    the breakdown answers it. "BCMs with team size > 5" names a LEVEL and
+    no entity, so nothing else can answer it and the metric must stand —
+    which is the whole reason it was declared.
+    """
+    if metric_key not in _GROUP_SHAPE_METRICS:
+        return False
+    return any(entities.get(level) for level in cat.GROUP_LEVEL_ORDER)
+
+
 def _score_hierarchy(ctx: _Intent) -> _Candidate | None:
     """"X's team" / "who reports to X" — the group under someone."""
     if not ctx.is_relational:
@@ -676,6 +739,95 @@ def _score_group_reverse_hierarchy(ctx: _Intent) -> _Candidate | None:
             level=target,
             subject_level=subject_level,
             entity_value=subject_value,
+        ),
+    )
+
+
+def _named_target_level(q: str, exclude: str | None) -> str | None:
+    """The chain level the question asks to ENUMERATE, if it named one.
+
+    "how many ADVISORS report directly to the Unit Head" names two
+    levels: one identifies the manager and one is the population being
+    counted. `exclude` is the manager's, already resolved by
+    detect_reverse_level from the role registry — which contains no entry
+    for `advisor`, because an advisor manages nobody. So the two slots
+    cannot claim the same word.
+    """
+    from app.llm import token_match
+
+    for level in hierarchy.CHAIN:
+        if level == exclude:
+            continue
+        if token_match.contains_any(q, hierarchy.LEVEL_KEYWORDS.get(level, [])):
+            return level
+
+    # "PEOPLE who report directly to X" asks the same question as
+    # "advisors who report directly to X". LEVEL_KEYWORDS carries the
+    # level's own names ("advisor", "agent"); cat.PEOPLE_WORDS carries
+    # the rest of the ways that population is said, and is the list
+    # ROSTER_RE already reads for exactly this reason.
+    if exclude != "advisor" and token_match.contains_any(q, list(cat.PEOPLE_WORDS)):
+        return "advisor"
+    return None
+
+
+def _score_direct_reports(ctx: _Intent) -> _Candidate | None:
+    """"Who reports DIRECTLY to X" — X's immediate reports, not X's tree.
+
+    Every phrasing of this used to produce the same plan as "X's team":
+    `directly` was in no vocabulary, and one column match on a
+    denormalised row is the whole subtree by construction. So "how many
+    advisors directly report to the Unit Head in AMD" answered 16 — every
+    advisor beneath him — where 3 people actually report to him.
+
+    TWO WAYS TO NAME THE MANAGER, and the plan says which:
+
+      - Named outright ("directly under Faisal Hussain Naqvi"), so the
+        grounded entity IS the manager and `subject_level` stays None.
+
+      - Named by ROLE WITHIN A SCOPE ("the Unit Head in AMD"), where the
+        grounded entity is the scope and the manager has to be read out
+        of it. That is exactly what reverse_hierarchy already does with a
+        group subject, so the same two fields carry it — `subject_level`
+        + `entity_value` are the scope, `level` is the role — and
+        dispatch resolves the person through get_manager_of_group before
+        asking for reports.
+    """
+    if not ctx.entities.get("direct"):
+        return None
+    group = ctx.group_entity()
+    if group is None:
+        return None
+    subject_level, subject_value = group
+    if not hierarchy.is_chain_level(subject_level):
+        return None
+
+    role = cat.detect_reverse_level(ctx.q) if _names_a_role(ctx.q) else None
+    target = _named_target_level(ctx.q, exclude=role)
+
+    # A role naming a DIFFERENT level than the grounded entity means the
+    # entity is the scope the role sits in, not the manager.
+    by_scope = role is not None and role != subject_level
+    manager_level = role if by_scope else subject_level
+    if hierarchy.child_of(manager_level) is None:
+        # An advisor has no reports. Declining lets the ordinary readings
+        # answer rather than returning an empty list as though it were
+        # the answer.
+        return None
+
+    score = cat.PRIOR["reverse_hierarchy"] + cat.W_EXPLICIT_PHRASE + cat.W_ENTITY
+    evidence = ["direct_phrase", f"manager_level:{manager_level}",
+                f"target:{target or hierarchy.child_of(manager_level)}"]
+    if by_scope:
+        evidence.append(f"role_in_scope:{subject_level}")
+    return _Candidate(
+        intent="direct_reports", score=score, evidence=evidence,
+        build=lambda: QueryPlan(
+            action="direct_reports",
+            level=manager_level,
+            entity_value=subject_value,
+            subject_level=subject_level if by_scope else None,
+            target_level=target,
         ),
     )
 
@@ -831,7 +983,6 @@ def _score_group_metric(ctx: _Intent) -> _Candidate | None:
         return None
     if ctx.entities.get("advisor_name"):
         return None  # a person was named too — not this group's own figure
-
     level, value = group
     if not is_answerable(ctx.metric, level):
         return None
@@ -1125,6 +1276,7 @@ _SCORERS: tuple[Callable[[_Intent], _Candidate | None], ...] = (
     _score_comparison,
     _score_roster,
     _score_ancestry,
+    _score_direct_reports,
     _score_reverse_hierarchy,
     _score_hierarchy,
     _score_attendance,
@@ -1181,11 +1333,15 @@ def score_intents(text: str, entities: dict) -> tuple[_Intent, list[_Candidate]]
                       if ref.kind == reference_parser.NAMED and ref.matched_text]
     if relation_spans:
         level_q = token_match.mask(level_q, relation_spans)
+    # ONE place decides whether team size is acting as a measure here.
+    # Guarding each scorer instead was three copies of one rule and still
+    # missed the leaderboard — see _answers_as_group_shape.
+    metric_key = None if _answers_as_group_shape(intent.key, entities) else intent.key
     ctx = _Intent(
         text=text,
         q=q,
         entities=entities,
-        metric=intent.key,
+        metric=metric_key,
         metric_intent=intent,
         level_q=level_q,
         # F9, on the evidence side. Same two problems, same two fixes:

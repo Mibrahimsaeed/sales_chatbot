@@ -28,6 +28,7 @@ from app.llm.response_formatter import (
     format_manager_reply,
     format_group_manager_reply,
     format_ancestry_reply,
+    format_direct_reports_reply,
     format_roster_reply,
     format_comparison_reply,
     format_team_member_breakdown,
@@ -274,6 +275,54 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
                                f"plan.action='roster' — flat enumeration of people in "
                                f"{plan.level} {plan.entity_value!r}")
         return respond("roster", format_roster_reply(roster), roster)
+
+    if plan.action == "direct_reports":
+        # "Who reports DIRECTLY to X" — X's immediate reports, never the
+        # whole subtree. See hierarchy.direct_scope_filter for why one
+        # column match is the subtree and what makes this one different.
+        manager_level = plan.level
+        manager_value = plan.entity_value
+        if plan.subject_level:
+            # The manager was named by ROLE WITHIN A SCOPE ("the Unit
+            # Head in AMD"), so read the person out of that scope first —
+            # through get_manager_of_group, which reverse_hierarchy
+            # already uses for exactly this, rather than a second way of
+            # asking who holds a role.
+            holder = hierarchy_service.get_manager_of_group(
+                db, plan.subject_level, plan.entity_value, manager_level
+            )
+            if not holder:
+                label = hierarchy.label_for(manager_level)
+                subject_label = hierarchy.label_for(plan.subject_level)
+                return respond("not_found",
+                               f"I don't have a {label} on file for {subject_label.lower()} "
+                               f"'{plan.entity_value}'.", None)
+            managers = holder["managers"]
+            if len(managers) > 1:
+                # The scope spans several holders of the role. Saying so
+                # beats picking one, which would answer confidently about
+                # a person the user never named.
+                label = hierarchy.label_for(manager_level)
+                joined = ", ".join(managers)
+                return respond("clarification",
+                               f"{hierarchy.label_for(plan.subject_level)} "
+                               f"'{plan.entity_value}' has more than one {label}: "
+                               f"{joined}. Which one did you mean?",
+                               None, options=managers)
+            manager_value = managers[0]
+
+        reports = hierarchy_service.get_direct_reports(
+            db, manager_level, manager_value, plan.target_level
+        )
+        if reports is None:
+            label = hierarchy.label_for(manager_level)
+            return respond("unsupported",
+                           f"{label} is the lowest level I hold, so there is nobody "
+                           f"below it to list.", None)
+        audit.record_formatter("format_direct_reports_reply",
+                               f"plan.action='direct_reports' — the {reports['target_level']!r} "
+                               f"level immediately below {manager_level} {manager_value!r}")
+        return respond("roster", format_direct_reports_reply(reports), reports)
 
     if plan.action == "ancestry":
         # "The full hierarchy above X" — every level up, not one.
@@ -599,9 +648,17 @@ def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
     string are decided here, by the owners that decide them for every
     other reply, and the card renders what it is given.
 
+    THE QUESTION DECIDES THE COLUMNS, not just the ontology. A measure
+    named in a CONDITION gets a column too (_condition_metrics), because
+    a filtered list that shows only the ranked figure cannot be checked
+    against what was asked: "advisors with achievement below 50% and
+    answered calls % below 50%" applied both conditions and displayed one
+    of them. The bundle still contributes what completes the primary, so
+    the two sources are unioned rather than one replacing the other.
+
     Returns the keys in display order, primary first, or [] when the
-    sorted measure is in no bundle — which is every other ranking,
-    unchanged.
+    sorted measure is in no bundle AND the query named no condition
+    metric — which is every other ranking, unchanged.
     """
     from app.llm.metric_ontology import bundle_for
     from app.llm.response_formatter import column_heading, format_metric_value
@@ -610,8 +667,17 @@ def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
         return []
     primary = effective_metric(ir)
     period = getattr(ir.time_range, "period", None)
-    keys = bundle_for(primary, period)
-    if len(keys) < 2:
+    bundle = bundle_for(primary, period)
+    conditions = _condition_metrics(ir)
+    # Ordered union, primary first. An unconditional ranking contributes
+    # no conditions, so `keys` is exactly what bundle_for returned and
+    # every existing leaderboard renders unchanged.
+    keys = _ordered_unique(([primary] if primary else []) + bundle + conditions)
+    # The bundle alone still needs two measures to be worth a table. A
+    # CONDITION earns its column at one: the user named that metric, and
+    # "advisors with achievement below 50%" showing no achievement figure
+    # is the defect this exists to fix.
+    if not conditions and len(keys) < 2:
         return []
 
     for row in rows:
@@ -634,6 +700,46 @@ def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
 
 
 _MISSING_CELL = "—"
+
+
+def _ordered_unique(keys: list[str]) -> list[str]:
+    """`keys` with duplicates dropped, first occurrence winning.
+
+    Order is the display order, so this cannot be a set: the primary
+    leads, and a band ("achievement between 80 and 100") names one metric
+    in two filters and must yield one column, not two identical ones.
+    """
+    seen: set[str] = set()
+    return [k for k in keys if not (k in seen or seen.add(k))]
+
+
+def _condition_metrics(ir) -> list[str]:
+    """The measures the user's CONDITIONS named, in the order stated.
+
+    "advisors with achievement below 50% and answered calls % below 50%"
+    returned the right people and showed one of the two numbers: the
+    columns came from the ontology's bundle declaration, which knows
+    nothing about what was asked. So the answer could not be checked
+    against the question — the second condition was applied and then left
+    invisible.
+
+    `f.field in METRICS` is query_compiler._apply_metric_filters' OWN test
+    for what counts as a metric filter, reused rather than restated, so a
+    column appears for exactly the conditions that were compiled and for
+    nothing else. Entity filters (team, company, attendance_status) are
+    not measures and are already named in the reply's header.
+
+    THE FIELD IS TAKEN VERBATIM — deliberately not run through
+    metric_for_period() or bundle_for(). The compiler does not re-resolve
+    a filter's period either (see _apply_metric_filters): "rank by MTD
+    revenue, but only advisors whose YTD revenue exceeds 1500" filters
+    ytd_cleared, and period-resolving the key here would print an MTD
+    column beside the YTD condition it came from. The displayed figure
+    has to be the filtered one, or the table is decoration.
+    """
+    from app.llm.metric_ontology import METRICS
+
+    return [f.field for f in ir.filters if f.field in METRICS]
 
 
 def _companion_value(db: Session, ir, row, key: str):

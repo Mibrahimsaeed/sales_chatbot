@@ -112,10 +112,24 @@ ENUMERATE_WORDS = ("all", "every", "each", "entire", "complete", "full list")
 # "who works in". A bare "who is in X's team" is deliberately NOT a
 # roster trigger — that asks about the team's shape, which the nested
 # breakdown answers.
+
+# The words that name PEOPLE rather than a hierarchy level. `advisor` is
+# the level these all denote — hierarchy.LEVEL_KEYWORDS carries the
+# level's own names ("advisor", "agent"), and these are the rest of the
+# ways the same population is said. Declared once because two callers
+# need it: ROSTER_RE below, and the direct-report target scan, which has
+# to read "people who report directly to X" as the advisor question it is.
+PEOPLE_WORDS = ("advisors", "advisers", "employees", "people", "staff", "agents")
+
+# "people" is deliberately absent here: "<people-word> in X" is a roster
+# trigger, but "people in X" is loose enough to catch questions that are
+# not roster questions at all.
+_SCOPED_PEOPLE_WORDS = tuple(w for w in PEOPLE_WORDS if w != "people")
+
 ROSTER_RE = re.compile(
     r"\b(all|list|show|name|give\s+me)\s+(the\s+|me\s+the\s+)?"
-    r"(advisors|advisers|employees|people|staff|agents)\b"
-    r"|\b(advisors|advisers|employees|staff|agents)\s+(in|from|under|at|of|for|assigned\s+to)\b"
+    rf"({'|'.join(PEOPLE_WORDS)})\b"
+    rf"|\b({'|'.join(_SCOPED_PEOPLE_WORDS)})\s+(in|from|under|at|of|for|assigned\s+to)\b"
     r"|\bwho\s+(works|work)\s+(in|at|for|under|with)\b",
     re.I,
 )
@@ -235,6 +249,19 @@ REVERSE_RE = re.compile(
     r"|\bwho\s+does\s+.+?\s+report\s+to\b"
     r"|\bwho\s+(is|are)\s+.+?\s+(report(ing)?\s+to|under|managed\s+by)\b"
     rf"|\b({_MANAGER_ROLE})\s+(of|for)\b"
+    # "the Unit Head IN AMD" — the same question as "the unit head OF
+    # AMD", which this pattern already answered, said with the other
+    # preposition. Without it the role word resolved to nothing, the
+    # sentence degraded to a plain team lookup, and "how many advisors
+    # report to the Unit Head in AMD" was answered with the whole team's
+    # headcount — a different question, confidently.
+    #
+    # THE ARTICLE IS REQUIRED, unlike the (of|for) branch above. "in" is
+    # the ordinary scoping preposition ("advisors in AMD", "BCMs in the
+    # branch in Islamabad"), and `_MANAGER_ROLE` includes bare words like
+    # "branch" and "lead" that appear inside those. "the <role> in" is
+    # specific enough to mean the person holding that role.
+    rf"|\b(the|our)\s+({_MANAGER_ROLE})\s+in\b"
     # Step 3: "which unit head MANAGES Ahmed" — the role named first, then
     # an active verb. Every other branch above expects the role to trail
     # its subject ("X's unit head") or the subject to trail a passive
@@ -398,6 +425,11 @@ W_RANK_METRIC_COMBO = 0.25
 PRIOR = {
     "clarify_ambiguous": 0.40,
     "clarify_person": 0.40,
+    # Above roster and reverse_hierarchy, and deliberately: "directly"
+    # is an explicit narrowing of a question both of those also match,
+    # and the reading that HONOURS the word must win over the two that
+    # ignore it. It only ever scores when the word is present.
+    "direct_reports": 0.37,
     "comparison": 0.36,
     "roster": 0.35,
     "reverse_hierarchy": 0.33,

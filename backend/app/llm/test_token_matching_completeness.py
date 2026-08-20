@@ -200,10 +200,17 @@ def test_a_range_consumes_both_of_its_bounds():
 
 
 def test_a_range_and_a_separate_threshold_coexist():
+    """Two measures, so each threshold also carries the one it was
+    written beside (_bind_threshold_metrics): the range's two bounds stay
+    on `achievement` and the loose comparator goes to `connects`. Binding
+    all three to one key is what made a two-condition query compile as
+    two conditions on the same column."""
     got = _extract_thresholds("achievement between 60 and 80 and connects above 5")
-    assert {"operator": ">=", "value": 60.0} in got
-    assert {"operator": "<=", "value": 80.0} in got
-    assert {"operator": ">", "value": 5.0} in got
+    assert got == [
+        {"operator": ">=", "value": 60.0, "metric": "achievement_pct"},
+        {"operator": "<=", "value": 80.0, "metric": "achievement_pct"},
+        {"operator": ">", "value": 5.0, "metric": "total_connects"},
+    ]
 
 
 def test_no_two_thresholds_share_a_span():

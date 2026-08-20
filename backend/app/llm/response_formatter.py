@@ -215,6 +215,47 @@ def _distinguishing_context(candidate, candidates: list) -> str:
 ROSTER_PREVIEW_LIMIT = 40
 
 
+def format_direct_reports_reply(reports: dict) -> str:
+    """X's immediate reports, counted and named.
+
+    States the TARGET LEVEL rather than saying "people", because the
+    answer to "who reports to a Unit Head" is Zonal Heads and the answer
+    to the same question about a BCM is advisors — a reply that did not
+    say which would be read as the other one.
+
+    The count leads: "how many report directly to X" and "who reports
+    directly to X" are one question asked two ways, served from one
+    population (hierarchy_service.get_direct_reports), so both are
+    answered here rather than by two formatters that could disagree.
+    """
+    label = reports.get("level_label") or "Manager"
+    value = reports.get("value", "")
+    target_label = reports.get("target_level_label") or "report"
+    members = reports.get("members", [])
+    count = reports.get("count", len(members))
+
+    # Labels are used AS DECLARED, not lowercased: hierarchy.label_for
+    # returns "BCM" as an acronym and "Unit Head" as words, and casefolding
+    # both to be uniform renders the first as "bcm".
+    if not members:
+        return (f"Nobody reports directly to {label} {value} — I hold no "
+                f"{target_label} with them as their immediate manager.")
+
+    header = (f"{count} {target_label}{'' if count == 1 else 's'} "
+              f"report{'s' if count == 1 else ''} directly to {label} {value}:")
+    lines = [header, ""]
+    for member in members[:ROSTER_PREVIEW_LIMIT]:
+        team = member.get("team")
+        suffix = f" — {team}" if team else ""
+        lines.append(f"• {member['name']}{suffix}")
+
+    remaining = count - min(count, ROSTER_PREVIEW_LIMIT)
+    if remaining > 0:
+        lines.append("")
+        lines.append(f"…and {remaining} more.")
+    return "\n".join(lines)
+
+
 def format_roster_reply(roster: dict) -> str:
     """A plain list of people — deliberately NOT the aggregate metrics an
     entity summary returns, because "all advisors in Blue Area" asks who
@@ -759,9 +800,19 @@ def format_ir_filtered_list_reply(
         header = f"Showing {_shown_through(rows, start_index)} of {total_count} result(s){_filters_summary(ir)}"
     else:
         header = f"{len(rows)} result(s){_filters_summary(ir)}:"
+    # The measures the conditions named, one column each — the same table
+    # the leaderboard renders, from the same cells. A conditional list
+    # showed only the ranked figure, so "achievement below 50% AND
+    # answered calls % below 50%" printed one of the two numbers it had
+    # just filtered on.
+    if rows[0].get("columns"):
+        return _bundle_table(ir, rows, metric_key, header, start_index)
     lines = [header, ""]
     for row in rows:
-        value_note = f" — {label}: {row.get('value', 0):,.0f}" if label else ""
+        # format_metric_value, not f"{...:,.0f}" — that dropped both the
+        # unit and the precision, printing an achievement of 40.0% as a
+        # bare "40" and a null ratio as a crash.
+        value_note = f" — {label}: {format_metric_value(metric_key, row.get('value'))}" if label else ""
         lines.append(f"• {row['name']}{value_note}")
     return "\n".join(lines)
 

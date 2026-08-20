@@ -5,11 +5,11 @@
 alembic upgrade head
 python -m etl.sync
 uvicorn app.main:app --reload                  
+ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 
 
-
-CREATE TABLE advisors (
+CREATE TABLE advisors (\
     sap_id           TEXT PRIMARY KEY,
     wid              TEXT UNIQUE,
     
@@ -312,3 +312,7 @@ connects as whole w ans call and %
 complex querys
 bcm who have 0 team size 
 etc
+
+
+
+

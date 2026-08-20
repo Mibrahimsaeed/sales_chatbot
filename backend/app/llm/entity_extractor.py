@@ -118,6 +118,22 @@ entity_linker.register_exemplar_type("comparator", lambda: _COMPARATOR_EXEMPLARS
 _SEMANTIC_COMPARATOR_FLOOR = 0.85
 _NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%?")
 
+# "Directly" — the word that distinguishes X's IMMEDIATE reports from
+# X's whole subtree. It was in no vocabulary at all, so every phrasing
+# below produced the identical plan and the identical answer: "how many
+# advisors directly report to X" and "X's team" both returned everyone
+# beneath X, however many managers sat in between.
+#
+# Only a modifier. It never selects a level or a subject on its own, and
+# with it absent every existing query keeps the subtree reading it has
+# always had — which is the right one for "X's team" and "people under
+# X".
+_DIRECT_RE = re.compile(
+    r"\bdirect(ly)?\b\s*(report(s|ing)?|under|below|beneath|works?)?"
+    r"|\breport(s|ing)?\s+direct(ly)?\b",
+    re.I,
+)
+
 
 def _distinct(db: Session, column, master_only) -> list[str]:
     """Distinct non-null values of one hierarchy column."""
@@ -235,8 +251,92 @@ def _limit_pattern() -> str:
     return rf"(?:{words})\s+(\d+)"
 
 
+def _span_gap(span: tuple[int, int], other: tuple[int, int]) -> int:
+    """Characters between two spans, 0 when they touch or overlap.
+
+    Distance between START offsets is the obvious measure and the wrong
+    one. In "connects > 1000 and answered calls > 500" the comparator
+    sits one character after "connects" and eleven before "answered
+    calls", so starts happen to rank correctly — but "> 500" starts 27
+    past `connects` and 15 past `answered calls`, and the phrase LENGTHS
+    are what separate them. Measuring the gap compares the words as they
+    sit in the sentence rather than where each happens to begin.
+    """
+    start, end = span
+    other_start, other_end = other
+    if other_end <= start:
+        return start - other_end
+    if end <= other_start:
+        return other_start - end
+    return 0
+
+
+def _bind_threshold_metrics(q: str, thresholds: list[dict],
+                            spans: list[tuple[int, int]]) -> list[dict]:
+    """Tag each threshold with the measure it sits next to.
+
+    "advisors with target achievement below 50% and answered calls %
+    below 20%" extracted both comparators and gave them no measure, so
+    query_ir._threshold_filters bound BOTH to the one metric the plan had
+    resolved: `achievement_pct < 50 AND achievement_pct < 20`. That is
+    not a display bug — the second condition was applied to the wrong
+    column, which for this pair means the whole query silently reduces to
+    `< 20` and returns nobody.
+
+    ONE MEASURE, UNCHANGED. When the sentence names fewer than two
+    measures the dicts are returned exactly as they were built: there is
+    nothing to disambiguate, `plan.metric` is already the right anchor,
+    and a band ("achievement between 80 and 100") must keep binding both
+    of its bounds to the single measure it names. This is why the vast
+    majority of queries — and every existing caller — see no change.
+
+    metric_aliases.resolve_all is the same registry `resolve()` reads,
+    scanning left to right with each hit masking its own span, so the
+    measures come back in the order the sentence names them and
+    "answered calls %" cannot also report the "answered calls" count
+    sitting inside it.
+    """
+    if not thresholds:
+        return thresholds
+
+    # SENTENCE ORDER. The three passes above run longest-pattern-first,
+    # not left to right, so "target achievement < 50% and connects >
+    # 1000" emitted the `>` before the `<` — invisible while every
+    # threshold bound to one measure, and the order the conditions are
+    # reported and columned in now that they do not. Stable, so a range's
+    # two bounds keep the order they were appended in.
+    order = sorted(range(len(thresholds)), key=lambda i: spans[i][0])
+    thresholds[:] = [thresholds[i] for i in order]
+    spans = [spans[i] for i in order]
+
+    from app.llm import metric_aliases, token_match
+
+    lowered = q.lower()
+    named: list[tuple[tuple[int, int], str]] = []
+    for match in metric_aliases.resolve_all(q):
+        if not match.available:
+            continue
+        found = token_match.find(lowered, match.phrase)
+        if found is not None:
+            named.append((found.span(), match.metric))
+
+    # Nothing to attribute, or nothing to choose between.
+    if len(named) < 2:
+        return thresholds
+
+    for threshold, span in zip(thresholds, spans):
+        nearest = min(named, key=lambda n: _span_gap(span, n[0]))
+        threshold["metric"] = nearest[1]
+    return thresholds
+
+
 def _extract_thresholds(q: str) -> list[dict]:
     thresholds = []
+    # Parallel to `thresholds`: where in the query each one was written,
+    # so a comparator can be attributed to the measure beside it when the
+    # sentence names more than one. Kept alongside rather than inside the
+    # dicts because the dict is the extractor's published shape.
+    spans: list[tuple[int, int]] = []
     consumed_spans: list[tuple[int, int]] = []
 
     def _overlaps(span: tuple[int, int]) -> bool:
@@ -255,6 +355,9 @@ def _extract_thresholds(q: str) -> list[dict]:
         low, high = min(low, high), max(low, high)
         thresholds.append({"operator": low_operator, "value": low})
         thresholds.append({"operator": high_operator, "value": high})
+        # BOTH bounds carry the whole range's span, so a band binds both
+        # of its ends to one measure however many the sentence names.
+        spans.extend([match.span(), match.span()])
         consumed_spans.append(match.span())
 
     for pattern, operator in _THRESHOLD_PATTERNS:
@@ -267,6 +370,7 @@ def _extract_thresholds(q: str) -> list[dict]:
             if _overlaps(match.span()):
                 continue
             thresholds.append({"operator": operator, "value": float(match.group(1))})
+            spans.append(match.span())
             consumed_spans.append(match.span())
 
     # Part 12: a number the closed vocabulary above didn't already pair
@@ -283,8 +387,9 @@ def _extract_thresholds(q: str) -> list[dict]:
         semantic = entity_linker.semantic_classify(window, "comparator", top_k=1, floor=_SEMANTIC_COMPARATOR_FLOOR)
         if semantic:
             thresholds.append({"operator": semantic[0]["value"], "value": float(match.group(1))})
+            spans.append(match.span())
 
-    return thresholds
+    return _bind_threshold_metrics(q, thresholds, spans)
 
 
 def _own_vocabulary(entity_type: str) -> list[str]:
@@ -619,6 +724,10 @@ def extract_entities(text: str, db: Session) -> dict:
         entities["limit"] = int(limit_match.group(1))
 
     entities["thresholds"] = _extract_thresholds(q)
+    # A MODIFIER on the relational reading, not an intent of its own —
+    # see _DIRECT_RE. False for every query that does not say it, which
+    # is what keeps "X's team" and "people under X" on the subtree.
+    entities["direct"] = bool(_DIRECT_RE.search(q))
 
     # companies/teams/offices/portfolio & management leads — exact substring,
     # then fuzzy, then embedding semantic search (Part 9); see

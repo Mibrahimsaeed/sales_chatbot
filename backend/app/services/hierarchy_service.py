@@ -72,6 +72,88 @@ def get_level_roster(db: Session, level: str, value: str) -> dict:
     }
 
 
+def _direct_members(db: Session, level: str, value: str, target: str) -> list[dict]:
+    """`value`'s immediate reports at exactly `target`, as member dicts.
+
+    NAMES at a manager target and advisor ROWS at the leaf: a manager
+    level is a column of names with no row of its own, while an advisor
+    is a person with a wid. Deliberately no aggregate — the count is
+    len() of this, so the number and the list can never come from two
+    different scopes.
+    """
+    predicate = hierarchy.direct_scope_filter(level, value, target)
+    if predicate is None:
+        return []
+
+    if target == "advisor":
+        rows = (
+            db.query(Advisor.wid, Advisor.name, Advisor.team, Advisor.company)
+            .filter(predicate, Advisor.in_master_sheet.is_(True))
+            .order_by(Advisor.name)
+            .all()
+        )
+        return [{"wid": r.wid, "name": r.name, "team": r.team,
+                 "company": r.company} for r in rows]
+
+    column = hierarchy.column_for(target)
+    rows = (
+        db.query(distinct(column))
+        .filter(predicate, Advisor.in_master_sheet.is_(True), column.isnot(None))
+        .all()
+    )
+    return [{"name": name} for name in sorted({r[0] for r in rows if r[0]})]
+
+
+def get_direct_reports(db: Session, level: str, value: str,
+                       target_level: str | None = None) -> dict | None:
+    """Who reports to `value` IMMEDIATELY — not the whole subtree.
+
+    The mirror of get_manager_of_group: that reads the level above a
+    group, this reads the level below a person. Both derive the pair from
+    the chain rather than naming it, so neither needs touching when CHAIN
+    is rebound.
+
+    ONE POPULATION FOR THE COUNT AND THE LIST. `count` is len(members),
+    not a second query — "how many advisors report directly to X" and
+    "who reports directly to X" are the same question asked two ways, and
+    answering them from two scopes is how they come to disagree.
+    """
+    level = hierarchy.canonical_level(level)
+    named_target = hierarchy.canonical_level(target_level)
+    target = named_target or hierarchy.child_of(level)
+    if target is None:
+        return None
+
+    members = _direct_members(db, level, value, target)
+
+    # WHERE THE DEFAULT TARGET IS EMPTY, KEEP DESCENDING. A person is
+    # routinely their own sub-level here — Ch Muhammad Usman is the only
+    # BCM beneath himself as Zonal Head — so once self is excluded the
+    # level immediately below holds nobody, while four advisors DO name
+    # him as their immediate manager. "Nobody reports to him" would be
+    # false in the only sense the question means.
+    #
+    # Skipped when the caller NAMED a target: "how many advisors report
+    # directly to X" asks about one level and must answer about that
+    # level, empty or not.
+    if named_target is None and not members:
+        for candidate in hierarchy.descendants(target):
+            found = _direct_members(db, level, value, candidate)
+            if found:
+                target, members = candidate, found
+                break
+
+    return {
+        "level": level,
+        "level_label": hierarchy.label_for(level),
+        "value": value,
+        "target_level": target,
+        "target_level_label": hierarchy.label_for(target),
+        "count": len(members),
+        "members": members,
+    }
+
+
 def get_manager_of(db: Session, wid: int, level: str) -> dict | None:
     """Reverse hierarchy lookup: who is this advisor's unit head / zonal
     head / business center? (Phase 1 identity refactor — keyed by WID, the

@@ -145,6 +145,27 @@ ALIASES: dict[str, tuple[str, ...]] = {
         "late count", "how many late", "number of late",
         "late arrival", "late arrivals", "lates", "tardiness", "late",
     ),
+    # ---- org shape ----
+    #
+    # How many people are in someone's scope. The MEASURE existed —
+    # aggregation.headcount() answers "team size of X", and every
+    # working-day rate already sums a per-row constant to get the same
+    # number — but it was not a metric, so it could not be ranked or
+    # compared and "BCMs with team size > 1" resolved nothing at all.
+    #
+    # Deliberately NOT "team", "advisors" or "how many advisors": those
+    # are how a ROSTER is asked for ("all advisors in X"), and the
+    # phrases here must name the SIZE rather than the population. The
+    # pronoun forms carry "them" for the same reason — "advisors under
+    # Kaleem Satti" stays a roster, "advisors under them" is a count.
+    "team_size": (
+        "team size", "teamsize", "team-size", "size of team",
+        "size of the team", "team strength", "team headcount",
+        "headcount", "head count",
+        "team members", "number of team members",
+        "people under them", "advisors under them", "reports under them",
+        "number of people under them", "number of advisors under them",
+    ),
     # Working-day scaled rates. These three lived in UNAVAILABLE until
     # working_days.py gave `workingDays` a source; the phrases are
     # carried over unchanged so every wording that used to get the

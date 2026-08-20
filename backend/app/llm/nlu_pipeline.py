@@ -99,6 +99,17 @@ _RULE_BASED_ACTIONS = (
     # "roster" ("all advisors in X") is a plain filtered list off one
     # Advisor column — deterministic, nothing for the LLM to add.
     "roster",
+    # "direct_reports" ("who reports directly to X") is the same kind of
+    # read as roster and reverse_hierarchy: one column match on the
+    # advisor rows, with the column chosen by the chain. Deterministic,
+    # and nothing the LLM could add that hierarchy.direct_scope_filter
+    # does not already decide.
+    #
+    # An action missing from this tuple does not degrade gracefully — it
+    # is routed to the semantic parser instead, and when that is
+    # unreachable the whole query answers "I'm not tracking that one",
+    # discarding a plan the rule planner had already built correctly.
+    "direct_reports",
     # Phase 5B: "comparison" is CONDITIONAL — see _is_rule_based() below.
     # A comparison that names a metric is now an ordinary comparison IR
     # and inherits everything QueryIR owns. A comparison that names NONE
@@ -671,6 +682,14 @@ def _asks_for_the_group(text: str, entities: dict) -> bool:
     """
     from app.llm import reference_parser
 
+    # A DIRECT question is about the people under someone by definition:
+    # "how many advisors directly report to X" has no reading in which it
+    # asks for X's own figure. Without this the name pins to `advisor` —
+    # every manager here has an advisor row — and the turn answers with
+    # the manager's own profile, discarding a direct_reports plan the
+    # planner had already built.
+    if entities.get("direct"):
+        return True
     if reference_parser.parse(text):
         return True
     spec = conversation_context.specified(text, entities)
@@ -685,8 +704,27 @@ def _asks_for_the_group(text: str, entities: dict) -> bool:
 # `under` and `below` are ALSO comparator words (comparators.py: "less
 # than", "below", "under"), so a following number disqualifies the match
 # — "advisors under 50 connects" is a threshold, not a manager.
+#
+# The VERB'S INFLECTION IS OPTIONAL. This listed "reports to" and
+# "reporting to" but not the bare "report to", which is the form a plural
+# subject produces: "advisors directly REPORT TO X". So the relation went
+# unrecognised, "advisors" was read as naming who X is rather than what to
+# return, and a question about X's reports answered with X's own profile.
 _UNDER_RE = re.compile(
-    r"\b(under|beneath|below|reporting to|reports to)\b(?!\s*\d)", re.I)
+    r"\b(under|beneath|below|report(s|ing)?\s+to)\b(?!\s*\d)", re.I)
+
+# "Who DOES Ali Murtaza REPORT TO" is the same two words pointing the
+# other way: there the named person is the SUBORDINATE, and reading it as
+# a relation makes the question about the people under him. The auxiliary
+# is what separates the two — a forward relation ("advisors report to X")
+# never has one — so it is the whole discriminator rather than a list of
+# reverse phrasings kept in step with intent_catalog's.
+_REVERSE_REPORT_RE = re.compile(r"\b(does|do|did)\s+.+?\s+report\s+to\b", re.I)
+
+
+def _names_a_forward_relation(text: str) -> bool:
+    """Does `text` place people UNDER the named person?"""
+    return bool(_UNDER_RE.search(text)) and not _REVERSE_REPORT_RE.search(text)
 
 
 def _measures_the_group(text: str, stated: str | None, ambiguous_levels) -> bool:
@@ -716,11 +754,11 @@ def _measures_the_group(text: str, stated: str | None, ambiguous_levels) -> bool
     # ROSTER_RE wants the noun adjacent to its preposition ("advisors
     # under X"); "how many advisors ARE under X" is the same question with
     # a verb in between, so the relation phrase counts too.
-    if stated == "advisor" and (cat.ROSTER_RE.search(text) or _UNDER_RE.search(text)):
+    if stated == "advisor" and (cat.ROSTER_RE.search(text) or _names_a_forward_relation(text)):
         return True
     if stated == "team" and "team" not in (ambiguous_levels or []):
         return True
-    if stated is None and _UNDER_RE.search(text):
+    if stated is None and _names_a_forward_relation(text):
         return True
     return False
 
