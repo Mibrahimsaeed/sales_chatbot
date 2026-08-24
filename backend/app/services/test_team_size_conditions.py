@@ -249,33 +249,69 @@ def test_team_of_x_is_unchanged(org):
     assert resolution.plan.action == "breakdown"
 
 
-def test_team_size_of_x_is_unchanged(org):
-    """Requirement 17. A NAMED group keeps the breakdown that Phase 37
-    settled — declaring the metric must not take the query over.
+def test_team_size_of_one_subject_is_one_sentence(org):
+    """Requirement 1. "What is X's team size?" answers with who and how
+    many, and nothing else — no member list, no surrounding card.
 
-    This is what _answers_as_group_shape exists for, and it is the one
-    thing this change had to be careful about: the metric resolves for
-    "team size of ZH1" just as it does for "BCMs with team size > 5", and
-    only the presence of a named group tells the two apart.
+    This supersedes the earlier routing: a NAMED group used to fall
+    through to the breakdown card, which buried the figure among
+    connects and targets. The count is still headcount()'s, which is
+    what test_team_size.py pins across all four phrasings.
     """
-    resolution = nlu_pipeline.resolve("team size of ZH1", org, session_id=None)
+    reply = str(chat_service._dispatch(
+        org, nlu_pipeline.resolve("team size of ZH1", org, session_id=None)
+    ).get("reply") or "").strip()
 
-    assert resolution.kind == "plan"
-    assert resolution.plan.action == "breakdown"
-    assert resolution.ir is None, "a named group must not take the metric path"
-
-    reply = str(chat_service._dispatch(org, resolution).get("reply") or "")
-    assert f"{aggregation.headcount(org, 'zonal_head', 'ZH1')} advisors" in reply
-    assert "55 advisors" in reply
+    assert reply == "ZH1 has a team size of 55."
+    assert aggregation.headcount(org, "zonal_head", "ZH1") == 55
+    assert "\n" not in reply, "one sentence only — no member list"
 
 
-def test_the_named_group_is_what_separates_the_two_readings(org):
-    """The same words, with and without a named group."""
-    named = nlu_pipeline.resolve("team size of ZH1", org, session_id=None)
+def test_the_single_subject_and_the_ranked_readings_stay_distinct(org):
+    """One subject is a count; a level with a condition is a table."""
+    named = str(chat_service._dispatch(
+        org, nlu_pipeline.resolve("team size of ZH1", org, session_id=None)
+    ).get("reply") or "").strip()
     ranked = nlu_pipeline.resolve("BCMs with team size > 5", org, session_id=None)
 
-    assert named.ir is None
+    assert named == "ZH1 has a team size of 55."
     assert ranked.ir is not None and ranked.ir.sort.metric == "team_size"
+    assert [(f.field, f.operator, f.value) for f in ranked.ir.filters] == \
+        [("team_size", ">", 5.0)]
+
+
+def test_exactly_n_is_an_equality_condition(org):
+    """"Which Unit Heads have exactly 10 team members" extracted no
+    comparator at all, so the threshold was dropped and every row came
+    back."""
+    ir, rows = _rows(org, "Which BCMs have exactly 5 team members?")
+    assert [(f.field, f.operator, f.value) for f in ir.filters] == [("team_size", "=", 5.0)]
+    assert _sizes(rows) == {"BCM05": 5}
+
+
+@pytest.mark.parametrize("phrase", [
+    "team count", "how many members", "number of members under them",
+    "number of people in their team", "how many people do they manage",
+])
+def test_every_spec_phrase_means_team_size(phrase, org):
+    """Requirement 4 — the phrasings that must reach the metric."""
+    from app.llm import metric_ontology
+
+    assert metric_ontology.resolve_metric(phrase) == "team_size", phrase
+
+
+def test_split_phrasings_resolve_at_the_managers_own_level(org):
+    """"How many people are in X's team" / "does X manage" name the
+    measure across the gap the subject sits in. Resolving them at the
+    advisor row instead would answer 1 — a plausible-looking wrong
+    number, since team_size there is a per-row literal.
+    """
+    for text in ("How many people are in ZH1's team?",
+                 "how many people does ZH1 manage"):
+        reply = str(chat_service._dispatch(
+            org, nlu_pipeline.resolve(text, org, session_id=None)
+        ).get("reply") or "").strip()
+        assert reply == "ZH1 has a team size of 55.", (text, reply)
 
 
 def test_a_roster_is_unchanged(org):

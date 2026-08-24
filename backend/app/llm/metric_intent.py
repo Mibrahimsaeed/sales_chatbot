@@ -234,6 +234,13 @@ def detect(text: str, entities: dict) -> MetricIntent:
     information than this module can recover from the raw string.
     """
     key = entities.get("metric") or resolve_metric(text)
+    # A phrasing the contiguous registry cannot see because the SUBJECT
+    # sits inside it — "how many people are in Ahmed's team". Consulted
+    # only after the ordinary lookup, so nothing it already resolved can
+    # change. See metric_aliases._SPLIT_ALIASES for why both halves of
+    # the phrase have to be present.
+    if not key:
+        key = metric_aliases.resolve_split(text)
     if key:
         return MetricIntent(key=key, named_text=None, keys=_all_named(text, key))
 

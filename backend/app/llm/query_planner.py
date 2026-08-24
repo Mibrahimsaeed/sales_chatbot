@@ -573,35 +573,11 @@ def _names_a_measure_here(ctx: _Intent) -> bool:
     from app.llm import metric_aliases
 
     match = metric_aliases.resolve(ctx.text)
-    return bool(match and match.metric)
-
-
-# Measures that a NAMED group answers through its own breakdown rather
-# than as a metric query.
-#
-# `team_size` is the group's SHAPE, not a measure over its members, and
-# the breakdown already reports it as the advisor count. Phase 37 settled
-# that all four phrasings of "how big is X's team" agree on that reply;
-# letting the metric take over would swap a settled answer for a
-# differently-shaped one carrying the same number.
-#
-# The declaration exists so the count can be RANKED and FILTERED across
-# many groups ("BCMs with team size > 5"). That shape names no single
-# entity, so neither scorer guarded here can see it.
-_GROUP_SHAPE_METRICS = frozenset({"team_size"})
-
-
-def _answers_as_group_shape(metric_key: str | None, entities: dict) -> bool:
-    """Is this measure one a NAMED group already answers by itself?
-
-    Only when a group IS named. "team size of Owais Tariq" names one, so
-    the breakdown answers it. "BCMs with team size > 5" names a LEVEL and
-    no entity, so nothing else can answer it and the metric must stand —
-    which is the whole reason it was declared.
-    """
-    if metric_key not in _GROUP_SHAPE_METRICS:
-        return False
-    return any(entities.get(level) for level in cat.GROUP_LEVEL_ORDER)
+    if match and match.metric:
+        return True
+    # "How many people are in Ahmed's team" names a measure across the
+    # gap the subject sits in, which the contiguous registry cannot see.
+    return metric_aliases.resolve_split(ctx.text) is not None
 
 
 def _score_hierarchy(ctx: _Intent) -> _Candidate | None:
@@ -1333,15 +1309,11 @@ def score_intents(text: str, entities: dict) -> tuple[_Intent, list[_Candidate]]
                       if ref.kind == reference_parser.NAMED and ref.matched_text]
     if relation_spans:
         level_q = token_match.mask(level_q, relation_spans)
-    # ONE place decides whether team size is acting as a measure here.
-    # Guarding each scorer instead was three copies of one rule and still
-    # missed the leaderboard — see _answers_as_group_shape.
-    metric_key = None if _answers_as_group_shape(intent.key, entities) else intent.key
     ctx = _Intent(
         text=text,
         q=q,
         entities=entities,
-        metric=metric_key,
+        metric=intent.key,
         metric_intent=intent,
         level_q=level_q,
         # F9, on the evidence side. Same two problems, same two fixes:

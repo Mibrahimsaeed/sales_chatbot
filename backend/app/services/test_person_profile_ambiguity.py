@@ -177,16 +177,19 @@ def test_a_team_question_still_uses_the_highest_role(db, name, highest, expected
     from app.llm import aggregation
 
     assert aggregation.headcount(db, highest, name) == expected
+    # One sentence: who, and how many. The level it was counted at is
+    # what this test pins, and a wrong level shows up as a wrong number.
     for question in (f"team size of {name}", f"{name}'s team size"):
-        assert f"{expected} advisors" in _ask(db, question)["reply"]
+        assert str(_ask(db, question)["reply"]).strip() == \
+            f"{name} has a team size of {expected}."
 
 
 def test_the_person_and_the_team_remain_different_answers(db):
     """The distinction the whole branch exists to keep."""
     person = _ask(db, "details of Owais Tariq")["reply"]
-    team = _ask(db, "team size of Owais Tariq")["reply"]
+    team = str(_ask(db, "team size of Owais Tariq")["reply"]).strip()
     assert "7 advisors" not in person
-    assert "7 advisors" in team
+    assert team == "Owais Tariq has a team size of 7."
 
 
 # ---------------------------------------------------------------------

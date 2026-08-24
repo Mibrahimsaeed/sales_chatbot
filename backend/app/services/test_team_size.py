@@ -113,13 +113,24 @@ def _ask(db, text):
 
 
 def _size(db, text):
-    """The advisor count a reply reports, or the response type when it
-    reported none — so a clarification fails loudly rather than as 0."""
+    """The team size a reply reports, or the response type when it
+    reported none — so a clarification fails loudly rather than as 0.
+
+    TWO SHAPES, ONE NUMBER. A single-subject team-size question answers
+    with a sentence of its own ("Ahmed has a team size of 74."), while
+    "team of X" still produces the breakdown wording. Both are read here
+    so these tests keep measuring the NUMBER and the level it was counted
+    at — what they were written to pin — rather than the phrasing.
+    """
     import re
 
     response = _ask(db, text)
-    match = re.search(r"has (\d[\d,]*) advisors", str(response.get("reply")))
-    return int(match.group(1).replace(",", "")) if match else response["type"]
+    reply = str(response.get("reply") or "").strip()
+    for pattern in (r"has a team size of (\d[\d,]*)", r"has (\d[\d,]*) advisors"):
+        match = re.search(pattern, reply)
+        if match:
+            return int(match.group(1).replace(",", ""))
+    return response["type"]
 
 
 # ---------------------------------------------------------------------

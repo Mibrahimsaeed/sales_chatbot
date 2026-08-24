@@ -31,6 +31,7 @@ measure a question resolves to; it can never change a number.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -162,9 +163,14 @@ ALIASES: dict[str, tuple[str, ...]] = {
         "team size", "teamsize", "team-size", "size of team",
         "size of the team", "team strength", "team headcount",
         "headcount", "head count",
-        "team members", "number of team members",
+        "team members", "number of team members", "team count",
+        "how many members", "number of members",
         "people under them", "advisors under them", "reports under them",
         "number of people under them", "number of advisors under them",
+        "number of members under them", "members under them",
+        "number of people in their team", "people in their team",
+        "how many people do they manage", "how many people they manage",
+        "people they manage", "advisors they manage",
     ),
     # Working-day scaled rates. These three lived in UNAVAILABLE until
     # working_days.py gave `workingDays` a source; the phrases are
@@ -429,6 +435,37 @@ def resolve(text: str) -> Optional[AliasMatch]:
     for phrase, match in _INDEX:
         if token_match.contains(lowered, phrase):
             return match
+    return None
+
+
+# Team-size phrasings whose words are SPLIT BY THE SUBJECT, so the
+# contiguous index above cannot see them:
+#
+#     "How many people are in Ahmed's team?"
+#     "How many people does Ahmed manage?"
+#
+# Both name the measure across a gap the subject sits in. Anchored on
+# BOTH halves on purpose: a bare "how many people/advisors" is how a
+# ROSTER is asked for ("how many advisors in AMD"), and that reading must
+# not change — so the second half ("team", "manage") has to be present
+# too, within a short window.
+_SPLIT_ALIASES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bhow many (?:people|members|advisors|advisers|employees|staff)\b"
+                r"[^.?!]{0,40}?\bteams?\b", re.I), "team_size"),
+    (re.compile(r"\bhow many (?:people|members|advisors|advisers|employees|staff)\b"
+                r"[^.?!]{0,40}?\bmanages?\b", re.I), "team_size"),
+)
+
+
+def resolve_split(text: str) -> Optional[str]:
+    """The metric key a SPLIT phrasing names, or None.
+
+    Separate from resolve() so the contiguous registry keeps its exact
+    behaviour: this is consulted only after that one finds nothing.
+    """
+    for pattern, key in _SPLIT_ALIASES:
+        if pattern.search(text):
+            return key
     return None
 
 

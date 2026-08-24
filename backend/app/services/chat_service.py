@@ -916,6 +916,12 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
     # the headline (and stays byte-identical for every caller that pins
     # it), while the members say who it is made of.
     members = _team_member_rows(db, ir)
+    # NOT FOR TEAM SIZE. The members are what MAKE UP another measure's
+    # total, which is why they are worth appending to it — but for a
+    # count of those same people they are the total restated as a list,
+    # and "how big is X's team" is answered by the number alone.
+    if members and effective_metric(ir) == "team_size":
+        members = []
     if members:
         reply += "\n\n" + format_team_member_breakdown(ir, members, rows)
 

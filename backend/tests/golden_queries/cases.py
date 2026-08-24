@@ -434,6 +434,12 @@ THRESHOLDS = [
     Case("advisors with no less than 80 percent achievement",
          {"intent": "leaderboard", "comparators": (">=",),
           "filters": (("achievement_pct", ">=", 80.0),)}),
+    # EQUALITY. "exactly N" extracted no comparator at all, so the
+    # threshold was dropped and every row came back — a superset that
+    # reads as an answer.
+    Case("advisors with exactly 80 percent achievement",
+         {"intent": "leaderboard", "comparators": ("=",),
+          "filters": (("achievement_pct", "=", 80.0),)}),
     Case("advisors not below 80 percent achievement",
          {"intent": "leaderboard", "comparators": (">=",)}),
     Case("advisors not above 50 percent achievement",

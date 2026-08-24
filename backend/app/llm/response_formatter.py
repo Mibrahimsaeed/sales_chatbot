@@ -738,6 +738,21 @@ def format_ir_single_value_reply(
     metric_key = effective_metric(ir)
     value = format_metric_value(metric_key, row.get("value", 0))
 
+    # TEAM SIZE, FOR ONE SUBJECT, IS ONE SENTENCE: who, and how many.
+    # The generic wording this function builds for every other measure
+    # ("Ahmed has 5 Team Size") reads as a measurement rather than a
+    # count, and a count of people has a natural phrasing of its own.
+    #
+    # The scope narrowing is dropped with it: the only filter on this
+    # shape is the subject's own, and naming it again ("... filtered by
+    # unit_head = Ahmed") repeats the thing being answered about.
+    #
+    # Only the SINGLE-subject shape. A ranked or filtered team-size query
+    # ("BCMs with team size > 5") is a list, is formatted by the
+    # leaderboard, and keeps its name-and-value rows.
+    if metric_key == "team_size":
+        return f"{row.get('name', 'They')} has a team size of {value}."
+
     # The narrowing the query applied, stated. Every other IR formatter
     # includes _filters_summary; this one omitted it, so a follow-up that
     # narrowed the scope read as if it had been ignored:

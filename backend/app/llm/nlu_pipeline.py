@@ -690,6 +690,14 @@ def _asks_for_the_group(text: str, entities: dict) -> bool:
     # planner had already built.
     if entities.get("direct"):
         return True
+    # "How many people does Ahmed MANAGE" asks about the people under
+    # him, so the name must resolve at the role he holds rather than at
+    # his own advisor row — where team_size is 1, a plausible-looking
+    # wrong answer. Same reason the direct case above is here.
+    from app.llm import metric_aliases
+
+    if metric_aliases.resolve_split(text) is not None:
+        return True
     if reference_parser.parse(text):
         return True
     spec = conversation_context.specified(text, entities)

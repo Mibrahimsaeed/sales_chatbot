@@ -63,6 +63,20 @@ class Comparator:
 # below, longest-first, so a longer phrase always wins over a shorter one
 # it contains ("no more than" before "more than").
 COMPARATORS: tuple[Comparator, ...] = (
+    # EQUALITY. "Which Unit Heads have exactly 10 team members" extracted
+    # no comparator at all, so the threshold was dropped and every Unit
+    # Head came back — a superset that reads as an answer.
+    #
+    # Deliberately only the phrases that can mean nothing else. A bare
+    # "is" or "of" would fire on most of the corpus, and `=` is already
+    # the operator every downstream branch defaults to, so a wrong match
+    # here silently narrows a query rather than failing.
+    Comparator(
+        operator="=",
+        phrases=("exactly", "equal to", "equals"),
+        symbols=("==",),
+        exemplars=(),
+    ),
     Comparator(
         operator=">",
         phrases=("more than", "greater than", "over", "above"),
