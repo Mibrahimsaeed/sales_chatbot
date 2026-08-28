@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import operator as op
 
-from sqlalchemy import asc, desc, func, select
+from sqlalchemy import and_, asc, desc, func, not_, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.database.models import Advisor, Attendance, PerformancePeriod
@@ -40,7 +40,7 @@ from app.llm import aggregation, hierarchy
 from app.llm.metric_ontology import (
     METRICS, ColumnBinding, lower_is_better, metric_for_period,
 )
-from app.llm.query_ir import QueryIR, Filter
+from app.llm.query_ir import QueryIR, Filter, FilterGroup
 
 # Derived from the single hierarchy mapping (app/llm/hierarchy.py) instead
 # of hardcoding one dict entry per level here — team/company keep their
@@ -134,7 +134,7 @@ def _tiebreak(ir: QueryIR):
     by construction, so it totally orders every tie without changing
     which rows come back or how they rank.
     """
-    level = ir.subject_level
+    level = ir.grouping_level()
     if level == "advisor":
         return Advisor.wid
     return _LEVEL_GROUP_COLUMN.get(level)
@@ -254,7 +254,13 @@ def compile_and_run(db: Session, ir: QueryIR, offset: int = 0) -> list[dict] | N
     pagination) skips this many rows past the start of the ordered
     result — default 0 preserves the exact prior behavior for every
     existing caller."""
-    level = ir.subject_level
+    # A POPULATION needs no measure — see _is_population_query. Checked
+    # before the metric requirement below, which would otherwise refuse
+    # it for lacking something it deliberately does not have.
+    if _is_population_query(ir):
+        return _run_population(db, ir, offset)
+
+    level = ir.grouping_level()
     sort_metric_key = _effective_metric(ir)
     if not sort_metric_key:
         return None
@@ -268,13 +274,85 @@ def compile_and_run(db: Session, ir: QueryIR, offset: int = 0) -> list[dict] | N
     return _run_advisor_rooted(db, ir, binding, sort_metric_key, offset)
 
 
+def _is_population_query(ir: QueryIR) -> bool:
+    """Does this IR ask WHO, with no measure to rank by?
+
+    "list the advisors excluding Blue Area" is a population, and forcing
+    a metric onto it changes the answer: every metric is reached through
+    its fact table, and that join drops the rows with no record in it —
+    13 advisors here have no `calls` row, so a connects-ranked
+    "population" returned 507 of 518.
+
+    So a population is expressed by the ABSENCE of a metric rather than
+    by a placeholder one. `operation="population"` says the absence is
+    deliberate, which is what separates it from an IR that simply failed
+    to resolve a measure — that one must still be refused.
+    """
+    return ir.resolved_operation() == "population"
+
+
+def _build_population_query(db, ir: QueryIR):
+    """Members matching the filters, with no metric and no fact join.
+
+    Every filter helper the metric path uses is reused unchanged, so an
+    OR or a NOT means the same thing here as it does in a ranking — the
+    only difference is that nothing is joined to rank by.
+    """
+    level = ir.grouping_level()
+    joined: dict = {}
+
+    if level == "advisor":
+        query = db.query(Advisor.wid, Advisor.name, Advisor.team, Advisor.company)
+    else:
+        group_col = _LEVEL_GROUP_COLUMN[level]
+        query = db.query(group_col.label("name")).select_from(Advisor)
+        query = query.filter(group_col.isnot(None))
+
+    query = query.filter(Advisor.in_master_sheet.is_(True))
+    query = _apply_entity_filters(query, ir)
+    query = _apply_subject_filter(query, ir)
+    query = _apply_attendance_filter(query, ir, joined)
+    query = _apply_metric_filters(query, ir, level, joined)
+    query = _apply_filter_tree(query, ir, level, joined)
+    query = _exclude_more_senior_roles(query, level)
+
+    if level != "advisor":
+        query = query.group_by(_LEVEL_GROUP_COLUMN[level])
+    return query, level
+
+
+def _run_population(db, ir: QueryIR, offset: int = 0) -> list[dict]:
+    query, level = _build_population_query(db, ir)
+
+    # Ordered by identity, because there is no value to order by. Still
+    # TOTAL, so paging cannot repeat or skip a row.
+    query = query.order_by(Advisor.name if level == "advisor"
+                           else _LEVEL_GROUP_COLUMN[level])
+    if ir.limit:
+        query = query.limit(ir.limit)
+    if offset:
+        query = query.offset(offset)
+
+    rows = query.all()
+    if level == "advisor":
+        # `value` is None, not 0: there is no measure here, and a zero
+        # would render as one.
+        return [{**dict(r._mapping), "value": None} for r in rows]
+    return [{"wid": None, "name": r.name, "team": None, "company": None,
+             "value": None} for r in rows]
+
+
 def count_ir(db: Session, ir: QueryIR) -> int | None:
     """Total rows the IR's filters would match, ignoring limit/offset —
     same unanswerable conditions (None) as compile_and_run, since this is
     meant to be called as the answerability gate before it (Part 8:
     pagination needs the true total to decide whether/how many pages
     exist, decoupled from however many rows get displayed)."""
-    level = ir.subject_level
+    if _is_population_query(ir):
+        query, _level = _build_population_query(db, ir)
+        return db.query(func.count()).select_from(query.subquery()).scalar()
+
+    level = ir.grouping_level()
     sort_metric_key = _effective_metric(ir)
     if not sort_metric_key:
         return None
@@ -478,6 +556,146 @@ def _apply_attendance_filter(query, ir: QueryIR, joined: dict):
     return query
 
 
+class UncompilableFilterTree(Exception):
+    """A boolean combination this compiler cannot express in one clause.
+
+    Raised rather than approximated. The only case is a disjunction that
+    mixes a ROW predicate with a GROUP AGGREGATE above the leaf: "BCMs in
+    Blue Area OR with team size > 5" needs `WHERE team=... OR HAVING
+    count(*)>5`, and SQL has no such clause. Approximating it — pushing
+    the aggregate into WHERE, or the row test into HAVING — returns a
+    plausible, wrong set, which is the failure mode this whole change
+    exists to remove.
+    """
+
+
+def _metric_leaf_expression(f: Filter, level: str, joined: dict, query):
+    """(query, predicate, is_aggregate) for one metric filter leaf.
+
+    The predicate is built the way _apply_metric_filters builds it — the
+    metric's VALUE expression from the aggregation engine, not the raw
+    binding column, so a ratio filter compares the ratio rather than its
+    numerator. Extracted here so the flat path and the tree path cannot
+    compare a measure two different ways.
+    """
+    f_binding = _binding_for(f.field, level)
+    if not f_binding or f_binding.team_named:
+        return query, None, False
+
+    query, entity = _join_fact_table(query, joined, f_binding.model, f_binding.period)
+    query = _join_declared_models(query, joined, f_binding)
+
+    expr = aggregation.value_expression(
+        f_binding, f.field, level,
+        numerator=_rebind_to_entity(f_binding.ratio_numerator, entity, f_binding.model)
+        if f_binding.ratio_numerator is not None else None,
+        denominator=_rebind_to_entity(f_binding.ratio_denominator, entity, f_binding.model)
+        if f_binding.ratio_denominator is not None else None,
+        expr=_rebind_to_entity(f_binding.expr, entity, f_binding.model),
+    )
+    # Above the leaf the metric's value is an aggregate over the group, so
+    # the predicate belongs in HAVING — the same rule _apply_metric_filters
+    # follows, and for the same reason: as a WHERE it selects individual
+    # advisor rows and the group is then aggregated over only those.
+    return query, _apply_comparator(expr, f.operator, f.value), level != "advisor"
+
+
+def _leaf_predicate(f: Filter, ir: QueryIR, level: str, joined: dict, query):
+    """(query, predicate, is_aggregate) for any filter leaf.
+
+    Dispatches on the same three families the flat path handles in three
+    separate functions — a hierarchy level, attendance status, or a
+    metric. A leaf naming none of them contributes nothing rather than
+    raising: an ungroundable field is the validator's business, and
+    silently dropping it here matches what the flat path already does.
+    """
+    if hierarchy.column_for(f.field) is not None:
+        return query, hierarchy.scope_filter(f.field, f.value), False
+
+    if f.field == "attendance_status":
+        query, entity = _join_fact_table(query, joined, Attendance, None)
+        return query, entity.biometric_status == f.value, False
+
+    if f.field in METRICS:
+        return _metric_leaf_expression(f, level, joined, query)
+
+    return query, None, False
+
+
+def _compile_filter_node(node, ir: QueryIR, level: str, joined: dict, query):
+    """(query, predicate, is_aggregate) for a node of the filter tree.
+
+    Recursive over FilterGroup. `is_aggregate` propagates upward so the
+    caller knows whether the finished predicate belongs in WHERE or
+    HAVING, and so a mixed disjunction can be refused rather than
+    silently compiled wrong.
+    """
+    if isinstance(node, Filter):
+        return _leaf_predicate(node, ir, level, joined, query)
+
+    parts = []
+    any_aggregate = False
+    all_aggregate = True
+    for child in node.children:
+        query, predicate, is_aggregate = _compile_filter_node(child, ir, level, joined, query)
+        if predicate is None:
+            # DROPPING IS ONLY SAFE UNDER `and`. There it narrows less
+            # than asked, which is what the flat list already does for an
+            # ungroundable field. Under `or` it WIDENS the result and
+            # under `not` it inverts the meaning, so a leaf that compiles
+            # to nothing there makes the whole group unanswerable.
+            if node.op == "and":
+                continue
+            raise UncompilableFilterTree(
+                f"a leaf of a {node.op!r} group could not be compiled "
+                f"({getattr(child, 'field', 'group')!r}); dropping it would "
+                "change what the query means"
+            )
+        parts.append(predicate)
+        any_aggregate = any_aggregate or is_aggregate
+        all_aggregate = all_aggregate and is_aggregate
+
+    if not parts:
+        return query, None, False
+
+    # A CONJUNCTION can be split between the two clauses, so a mix is
+    # fine: the caller applies the row parts as WHERE and the aggregate
+    # parts as HAVING. A DISJUNCTION cannot — the whole expression has to
+    # live in one clause, and there is no clause that can hold both.
+    if node.op in ("or", "not") and any_aggregate and not all_aggregate:
+        raise UncompilableFilterTree(
+            f"a {node.op!r} group mixes a row filter with a group aggregate at "
+            f"level {level!r}; SQL cannot combine WHERE and HAVING in one clause"
+        )
+
+    if node.op == "and":
+        combined = and_(*parts)
+    elif node.op == "or":
+        combined = or_(*parts)
+    else:
+        # `not(A, B)` negates the CONJUNCTION of its children, which is
+        # what "excluding X and Y" means.
+        combined = not_(and_(*parts))
+    return query, combined, any_aggregate
+
+
+def _apply_filter_tree(query, ir: QueryIR, level: str, joined: dict):
+    """AND the IR's filter tree onto `query`, if it has one.
+
+    Applied ALONGSIDE the flat `filters` list rather than instead of it —
+    `QueryIR.filter_tree` is documented as a further conjunct — so an IR
+    with no tree compiles down exactly the path it always did.
+    """
+    if ir.filter_tree is None:
+        return query
+
+    query, predicate, is_aggregate = _compile_filter_node(
+        ir.filter_tree, ir, level, joined, query)
+    if predicate is None:
+        return query
+    return query.having(predicate) if is_aggregate else query.filter(predicate)
+
+
 def _apply_metric_filters(query, ir: QueryIR, level: str, joined: dict):
     """Filters on a metric OTHER than the sort metric (Root Cause #1/#3 fix:
     "high sales but poor attendance" filters on late_count while sorting
@@ -559,7 +777,7 @@ def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
     place. Returns (query, value_expr) — value_expr is needed by the
     caller to order by (the raw per-advisor column at the leaf, or the
     engine's roll-up expression at a group level)."""
-    level = ir.subject_level
+    level = ir.grouping_level()
     joined: dict = {}
     # PHASE 4: the compiler no longer decides whether or how to roll up.
     # It used to compute `is_rollup = level != "advisor"` and pick sum()
@@ -601,6 +819,9 @@ def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
     query = _apply_subject_filter(query, ir)
     query = _apply_attendance_filter(query, ir, joined)
     query = _apply_metric_filters(query, ir, level, joined)
+    # P0: the boolean structure, ANDed on after the flat conjuncts above.
+    # A no-tree IR returns unchanged from here.
+    query = _apply_filter_tree(query, ir, level, joined)
 
     query = _exclude_more_senior_roles(query, level)
 
@@ -611,7 +832,7 @@ def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
 
 
 def _run_advisor_rooted(db, ir: QueryIR, binding: ColumnBinding, sort_metric_key: str, offset: int = 0) -> list[dict] | None:
-    level = ir.subject_level
+    level = ir.grouping_level()
     query, value_expr = _build_advisor_rooted_query(db, ir, binding)
 
     # value_expr is already the right expression to order by: the raw

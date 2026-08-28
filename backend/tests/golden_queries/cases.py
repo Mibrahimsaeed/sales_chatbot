@@ -107,8 +107,18 @@ LEADERBOARDS = [
     Case("top advisors in Graana by connects",
          {"intent": "leaderboard", "metric": "total_connects",
           "filters": (("company", "=", "Graana"),)}),
+    # P0 SAFETY. This resolved by EDIT DISTANCE — the same fuzzy scan that
+    # let a measure be chosen because it resembled part of a sentence, and
+    # a guessed measure is indistinguishable from a correct one in the
+    # reply. The tier is off, so the misspelling is now asked about
+    # instead. Recorded as a known gap because the INTENT is recoverable
+    # and the right place to recover it is the LLM parser, which reads the
+    # whole sentence rather than a character distance.
     Case("top 5 advisors by revnue",
-         {"intent": "leaderboard", "metric": "mtd_cleared", "limit": 5}),
+         {"intent": "clarify_metric", "metric": None},
+         known_gap="A misspelled measure is refused rather than corrected. "
+                   "Deliberate: the widening that fixed this also guessed "
+                   "wrong measures. The LLM parser should recover it."),
     Case("top advisors by widget velocity",
          {"intent": "clarify_metric", "metric": None}),
     # RETIRED REFUSAL — working_days.py made the rate computable.

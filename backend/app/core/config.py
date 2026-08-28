@@ -1,3 +1,4 @@
+from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -8,10 +9,103 @@ class Settings(BaseSettings):
 
     # OpenAI (back from a local Ollama model — see git history — which was
     # too slow for interactive chat latency)
-    openai_api_key: str = Field(alias="OPENAI_API_KEY")
-    openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
-    openai_embedding_model: str = Field(default="text-embedding-3-small", alias="OPENAI_EMBEDDING_MODEL")
+    # openai_api_key: str = Field(alias="OPENAI_API_KEY")
+    # openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
+    # openai_embedding_model: str = Field(default="text-embedding-3-small", alias="OPENAI_EMBEDDING_MODEL")
+    # Which provider serves inference AND embeddings. Read by
+    # embeddings.PROVIDER so the health endpoint reports the truth — it
+    # was declared during the migration and then read by nothing, so
+    # status kept saying "openai" after the switch.
+    llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")
 
+    ollama_base_url: str = Field(
+        default="http://localhost:11434", alias="OLLAMA_BASE_URL"
+    )
+    ollama_model: str = Field(default="qwen3:8b", alias="OLLAMA_MODEL")
+
+    # EMBEDDINGS ARE OPT-IN. Empty means no embedding model is available,
+    # which is the honest default: the migration left create_embeddings
+    # calling OpenAI with a deleted API-key setting, so the tier could
+    # only ever fail. Name a model pulled into Ollama (e.g.
+    # "nomic-embed-text") and turn the two flags below back on to enable
+    # semantic entity linking and metric retrieval.
+    ollama_embedding_model: str = Field(default="", alias="OLLAMA_EMBEDDING_MODEL")
+
+    # ---- Ollama inference options ----
+    #
+    # All four were previously unset, so every call silently inherited
+    # Ollama's defaults. Making them explicit is what lets a change be
+    # measured rather than guessed at; the values below are reasoned from
+    # the measured prompt and output sizes, not picked round.
+
+    # REASONING OFF. qwen3 is a hybrid-reasoning model and thinks by
+    # default, emitting a reasoning block before the answer. Both calls
+    # this project makes are constrained transformations, not open
+    # problems: the structured call's output shape is already enforced by
+    # a JSON grammar, and the narrative call is copy-editing whose result
+    # is rejected outright if it introduces a number. Thinking tokens are
+    # therefore pure added latency on the interactive path.
+    #
+    # None means "do not send the parameter at all" — an escape hatch for
+    # a model that rejects it, without a code change.
+    # The installed client (ollama 0.6.2) types this as
+    # `bool | Literal["low","medium","high"] | None` and takes it as a
+    # TOP-LEVEL chat() argument, not an Options field — verified against
+    # inspect.signature(ollama.chat) rather than assumed. The effort
+    # levels are accepted here so a model that supports graded reasoning
+    # can be tried from config; qwen3 takes the boolean form.
+    ollama_think: bool | Literal["low", "medium", "high"] | None = Field(
+        default=False, alias="OLLAMA_THINK"
+    )
+
+    # HOLD THE MODEL BETWEEN QUESTIONS. Ollama unloads after ~5 minutes
+    # idle, so the first question after any pause pays a full model load —
+    # which reads to a user as "the model is slow" rather than "the model
+    # was evicted". A chat session has gaps of exactly that size. Accepts
+    # Ollama's duration syntax; "-1" pins indefinitely, "0" unloads
+    # immediately for a memory-constrained host.
+    ollama_keep_alive: str = Field(default="30m", alias="OLLAMA_KEEP_ALIVE")
+
+    # CONTEXT WINDOW, sized from the measured prompt.
+    #
+    # Re-derived after the Task 3 prompt reduction, by BUILDING the worst
+    # case rather than estimating it: an unresolved metric phrase (so the
+    # full synonym catalog is sent), a name from all three person
+    # gazetteers (so none is retired), a prior IR and a full six-turn
+    # conversation window. That prompt measures 28,548 chars ~= 7,137
+    # tokens at chars/4. chars/4 UNDER-counts dense JSON and proper names,
+    # so applying a conservative 1.35x gives ~9,634, and ~10,402 with the
+    # num_predict output budget below.
+    #
+    # 16384 holds that with 1.57x headroom, and leaves room for the
+    # gazetteers to grow as the org does. It must NOT be 4096: the user's
+    # question sits near the END of the prompt (build_ir_prompt appends it
+    # after the examples), so a window that truncates loses the question
+    # itself and the model confidently answers something else.
+    ollama_num_ctx: int = Field(default=16384, alias="OLLAMA_NUM_CTX")
+
+    # OUTPUT CEILING — a runaway guard, not a target. Measured, not
+    # guessed: a maximal IR that still passes QueryIR validation
+    # (comparison, two subjects with their own metric bindings, three
+    # metrics, three flat filters AND a nested or/and filter tree,
+    # compare-mode time range, group_by) serialises to 1,390 chars ~= 347
+    # tokens. The narrative reply is 60-120. 768 is 2.2x the largest real
+    # structured output, so it bounds a runaway without ever truncating a
+    # legitimate one.
+    #
+    # CAUTION: on Ollama, reasoning tokens count against this budget too.
+    # This ceiling is sized for ollama_think=False. Enabling thinking
+    # without raising it can truncate a valid IR mid-object.
+    ollama_num_predict: int = Field(default=768, alias="OLLAMA_NUM_PREDICT")
+
+    # DECODING TEMPERATURE. 0.0 is not a tuning choice here, it is the
+    # correctness requirement: both call sites are deterministic
+    # transforms — text -> QueryIR under a JSON grammar, and a copy-edit
+    # whose output is rejected if it introduces a number. Sampling adds
+    # variance to a task with one right answer, and makes a wrong parse
+    # unreproducible. Exposed so a benchmark can vary it deliberately;
+    # the default preserves exactly the value both call sites already used.
+    ollama_temperature: float = Field(default=0.0, alias="OLLAMA_TEMPERATURE")
     ccmc_sheet_id: str = Field(alias="CCMC_SHEET_ID")
     biometric_sheet_id: str = Field(alias="BIOMETRIC_SHEET_ID")
 
@@ -68,8 +162,12 @@ class Settings(BaseSettings):
     # nothing when the key/quota is unavailable; a separate flag from
     # nlu_mode so it can be killed independently via env var if it ever
     # misbehaves.
+    # Default OFF: this tier calls embeddings, and no embedding model is
+    # configured by default (see ollama_embedding_model). Leaving it on
+    # bought one guaranteed failed call per process for a subsystem that
+    # could not work. Set OLLAMA_EMBEDDING_MODEL, then re-enable.
     semantic_retrieval_enabled: bool = Field(
-        default=True,
+        default=False,
         alias="SEMANTIC_RETRIEVAL_ENABLED",
     )
 
@@ -78,8 +176,9 @@ class Settings(BaseSettings):
     # portfolio_lead/management_lead/unit_head/zonal_head/business_center
     # names instead of metrics. A separate flag so either can be killed
     # independently via env var.
+    # Default OFF for the same reason as semantic_retrieval_enabled.
     entity_linking_enabled: bool = Field(
-        default=True,
+        default=False,
         alias="ENTITY_LINKING_ENABLED",
     )
 

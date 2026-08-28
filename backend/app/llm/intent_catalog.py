@@ -197,6 +197,22 @@ RELATIONAL_RE = re.compile(
     re.I,
 )
 
+# TRANSITIVE SCOPE — "which BCMs work under Unit Head X".
+#
+# Deliberately NOT folded into RELATIONAL_RE above. That expression
+# drives _score_hierarchy, which answers "X's team"; widening it to reach
+# "below" and "reporting to" would change what those questions resolve to
+# as a side effect. This one is read by a single scorer whose other three
+# conditions (a named target level strictly below the manager, a grounded
+# group entity, and no "directly") are what make it specific — so the
+# relation words themselves can stay plain.
+SCOPED_UNDER_RE = re.compile(
+    r"\b(under|below|beneath|underneath)\b"
+    r"|\breport(s|ing)?\s+to\b"
+    r"|\bwork(s|ing)?\s+(under|for)\b",
+    re.I,
+)
+
 # Role words that name a manager WITHOUT naming which level — "who is
 # X's boss" asks the same question as "who is X's manager". They belong
 # to language, not to any one relation, so they stay here rather than in
@@ -430,6 +446,12 @@ PRIOR = {
     # and the reading that HONOURS the word must win over the two that
     # ignore it. It only ever scores when the word is present.
     "direct_reports": 0.37,
+    # Same tier as direct_reports: it is the same mechanism read
+    # transitively, and the two are mutually exclusive (one requires
+    # "directly", the other declines on it), so the tie never arises.
+    # Above `roster` (0.35) because "the BCMs under X" and "the advisors
+    # in X" are different questions and the roster reading answered both.
+    "scoped_reports": 0.37,
     "comparison": 0.36,
     "roster": 0.35,
     "reverse_hierarchy": 0.33,

@@ -82,6 +82,17 @@ class Subject(BaseModel):
     # one person, in which case name matching remains the fallback.
     resolved_wid: Optional[int] = None
     match_confidence: float = 1.0
+    # P0: the measure THIS subject was asked about, when the turn pairs a
+    # different one with each. "Zainab's connects and Awais's answered
+    # calls" is two (subject, measure) pairs, and with one metric on the
+    # IR it could only be answered by attaching both measures to whichever
+    # person resolved — not a partial answer but the wrong person's number
+    # under the right label, which is why nlu_pipeline._distributes_metrics
+    # refuses the shape outright today.
+    #
+    # None means "use the query's own metric", so every existing subject
+    # behaves exactly as before.
+    metric: Optional[MetricRef] = None
 
 
 class MetricRef(BaseModel):
@@ -94,6 +105,45 @@ class Filter(BaseModel):
     operator: Operator = "="
     value: Optional[Union[str, float, int, list]] = None
     confidence: float = 1.0
+
+
+class FilterGroup(BaseModel):
+    """A boolean combination of filters — the shape a flat list cannot hold.
+
+    P0. `QueryIR.filters` is AND-combined by construction, so "BCMs in
+    Blue Area OR Downtown" had no representation: the disjunction either
+    became a conjunction matching nobody, or one branch was dropped
+    before compilation. Same for exclusion — `excluding` routed a query
+    to the LLM and was then unrepresentable, so the word changed the PATH
+    without changing the ANSWER.
+
+    `not` takes its children as a group: `not(A)` negates one, and
+    `not(A, B)` negates their conjunction, which is what "excluding X and
+    Y" means. Written that way rather than as a unary node so the shape
+    is uniform and the LLM cannot emit a `not` with the wrong arity.
+    """
+
+    op: Literal["and", "or", "not"] = "and"
+    children: list[Union["FilterGroup", Filter]] = Field(default_factory=list)
+
+    def leaves(self) -> list[Filter]:
+        """Every Filter in this subtree, depth-first, left to right.
+
+        The BOOLEAN STRUCTURE IS LOST here, deliberately. Callers that
+        ask "which fields did this query constrain" — grounding, the
+        condition columns, the filters summary — need the set, not the
+        shape; only the compiler needs the shape.
+        """
+        found: list[Filter] = []
+        for child in self.children:
+            found.extend(child.leaves() if isinstance(child, FilterGroup) else [child])
+        return found
+
+
+FilterGroup.model_rebuild()
+# Subject.metric forward-references MetricRef, which is declared below it
+# (`from __future__ import annotations` makes every annotation a string).
+Subject.model_rebuild()
 
 
 class TimeRange(BaseModel):
@@ -115,11 +165,40 @@ class Sort(BaseModel):
 
 
 class QueryIR(BaseModel):
+    # THE operation this query performs, from the one registry that
+    # declares them (app/llm/operations.py).
+    #
+    # `intent` below is the older, narrower name for the same idea: seven
+    # values, one of five vocabularies that named these concepts without
+    # any of them deriving from another. `operation` is the single field
+    # those collapse into, and it can carry operations `intent` has no
+    # value for — a roster, an ancestry walk, a manager lookup.
+    #
+    # None means "read it from `intent`", which resolved_operation() does,
+    # so an IR built before this field existed answers identically and
+    # nothing has to set both.
+    operation: Optional[str] = None
     intent: Intent
     subject_level: Level = "advisor"
     subjects: list[Subject] = Field(default_factory=list)
+    # THE PRIMARY measure: what the answer is ranked and sorted by, and
+    # what every existing consumer reads. Unchanged.
     metric: Optional[MetricRef] = None
+    # P0: EVERY measure the turn named, primary first. The IR held one,
+    # so a two-measure question lost one before compilation — QueryPlan
+    # has carried a `metrics` list for exactly this reason and the IR was
+    # never widened to match.
+    #
+    # Empty means "just the primary", so an IR built the old way is
+    # unaffected; read it through metric_keys() rather than directly, and
+    # the two cases collapse.
+    metrics: list[MetricRef] = Field(default_factory=list)
     filters: list[Filter] = Field(default_factory=list)      # AND-combined
+    # P0: the boolean structure a flat list cannot express, AND-combined
+    # WITH `filters` above rather than replacing it. None — every query
+    # that needs only conjunction — compiles down exactly the path it
+    # always did. See FilterGroup.
+    filter_tree: Optional[FilterGroup] = None
     time_range: TimeRange = Field(default_factory=TimeRange)
     sort: Sort = Field(default_factory=Sort)
     limit: Optional[int] = 10
@@ -142,6 +221,73 @@ class QueryIR(BaseModel):
     # observability only (persisted in ChatLog.resolved_ir): which NLU mode
     # served this IR — not part of the LLM output schema, never validated
     nlu_mode: Optional[str] = None
+
+    # ---- accessors -------------------------------------------------
+    #
+    # Each of these exists so a caller reads ONE thing where the model now
+    # holds two. The alternative — every consumer checking both the flat
+    # field and the new one — is how the two representations drift apart,
+    # and there are around twenty such consumers.
+
+    def resolved_operation(self) -> str:
+        """The operation, from `operation` or derived from `intent`.
+
+        ONE reading, so a consumer never has to check both fields and the
+        two can never disagree about what this query is. Falls back to
+        the intent's own name for an operation the registry does not
+        know, rather than raising: an unrecognised value is the
+        validator's business, not this accessor's.
+        """
+        from app.llm import operations
+
+        if self.operation and self.operation in operations.OPERATIONS:
+            return self.operation
+        mapped = operations.for_ir_intent(self.intent)
+        return mapped.name if mapped else self.intent
+
+    def filter_leaves(self) -> list[Filter]:
+        """Every filter this query applies, flat, tree included.
+
+        For callers asking WHICH fields are constrained (grounding, the
+        condition columns, the reply's filter summary). The boolean shape
+        is deliberately not preserved — only the compiler needs it.
+        """
+        leaves = list(self.filters)
+        if self.filter_tree is not None:
+            leaves.extend(self.filter_tree.leaves())
+        return leaves
+
+    def metric_keys(self) -> list[str]:
+        """Every measure named, primary first, deduplicated in order.
+
+        `metrics` empty means the primary alone, so an IR built before
+        that field existed answers this identically.
+        """
+        ordered = ([self.metric.key] if self.metric else []) + [m.key for m in self.metrics]
+        seen: set[str] = set()
+        return [k for k in ordered if k and not (k in seen or seen.add(k))]
+
+    def grouping_level(self) -> str:
+        """The level rows are grouped by.
+
+        `group_by` was carried by the schema and read by NOTHING — the
+        compiler grouped by `subject_level` unconditionally, so a model
+        that filled it correctly got no benefit. It is honoured here when
+        set, and falls back to the level that has always been used.
+        """
+        return self.group_by or self.subject_level
+
+    def compare_period(self) -> Optional[str]:
+        """The period this query is compared AGAINST, when it is one.
+
+        `compare_to` was likewise inert. Reading it through here means the
+        one place that decides "is this a period comparison" is also the
+        one place that has to be taught to render it.
+        """
+        compare_to = getattr(self.time_range, "compare_to", None)
+        if not compare_to or compare_to == self.time_range.period:
+            return None
+        return compare_to
 
 
 def _period_of(metric_key: str | None) -> str:
@@ -309,8 +455,17 @@ def plan_to_ir(plan, entities: dict) -> QueryIR:
         # narrow to the intersection of both sides and return nothing.
         filters = [f for f in filters if f.field not in _SUBJECT_FIELDS]
 
+    from app.llm import operations
+
+    # The plan's action IS an operation — the registry knows it by that
+    # name. Stamped here so a plan-built IR carries the same single field
+    # a parser-built one does, rather than only the narrower `intent`.
+    planned = operations.for_plan_action(getattr(plan, "action", None))
+
     return QueryIR(
         intent="comparison" if subjects else "leaderboard",
+        operation=(planned.name if planned and planned.expressible_in_ir
+                   else ("comparison" if subjects else "leaderboard")),
         subjects=subjects,
         # The subjects carry their own levels, so a mixed-level
         # comparison ("Waqar Haider vs his team") keeps both. This is the

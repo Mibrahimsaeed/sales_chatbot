@@ -63,7 +63,11 @@ def test_routing_decision_states_why_the_llm_was_never_called(audited_db):
     text = _audit_text()
 
     assert "routing: rule_based_path" in text
-    assert "_RULE_BASED_ACTIONS" in text
+    # P1 renamed the registry: the gate is now a CAPABILITY question
+    # ("no QueryIR expresses this answer shape") rather than a keyword
+    # one. The audit must still say which registry decided and that no
+    # call was made — that is what this test is for.
+    assert "_PLAN_ONLY_ACTIONS" in text
     assert "NO LLM call is made" in text
 
 

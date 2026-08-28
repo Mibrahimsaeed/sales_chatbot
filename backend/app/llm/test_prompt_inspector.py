@@ -23,8 +23,13 @@ from app.llm.prompt_builder import build_ir_prompt
 
 @pytest.fixture()
 def ir_prompt():
+    # Names Kaleem Ullah explicitly: since TASK 3 a person gazetteer is
+    # only sent when the message could actually be referring to someone on
+    # it (prompt_builder._person_gazetteer), and this fixture exists to
+    # check that the gazetteer is SEGMENTED as retrieved context — which
+    # needs a prompt that has one.
     return build_ir_prompt(
-        "top 5 advisors in Graana who were late",
+        "top 5 advisors under Kaleem Ullah in Graana who were late",
         known_teams=["Blue Area", "Downtown"],
         known_companies=["Graana", "Agency21"],
         grounded_entities={"company": "Graana", "attendance_status": "Late"},
@@ -85,7 +90,7 @@ def test_history_is_absent_on_a_first_turn():
 
 def test_user_message_section_carries_the_actual_query(ir_prompt):
     user = "\n".join(s.text for s in pi.segment(ir_prompt).by_category(pi.USER))
-    assert "top 5 advisors in Graana who were late" in user
+    assert "top 5 advisors under Kaleem Ullah in Graana who were late" in user
 
 
 def test_nothing_is_left_unclassified_in_a_real_prompt(ir_prompt):

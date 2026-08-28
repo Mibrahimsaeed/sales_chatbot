@@ -51,8 +51,17 @@ def test_find_in_text_empty_text():
     assert find_in_text("", TEAMS) == []
 
 
-def test_fuzzy_resolve_metric_typo():
-    assert fuzzy_resolve_metric("atendance rate above 90") == "attendance_rate"
+def test_fuzzy_resolve_metric_refuses_a_typo():
+    """P0 SAFETY: the approximate tier is off.
+
+    This widened a misspelling onto the intended measure by edit
+    distance. The same scan is what let a measure be chosen because it
+    RESEMBLED part of a sentence, and a guessed measure is
+    indistinguishable from a correct one in the reply — so the deliberate
+    trade is to refuse and let the LLM parser, which reads the whole
+    sentence, recover the intent instead.
+    """
+    assert fuzzy_resolve_metric("atendance rate above 90") is None
 
 
 def test_fuzzy_resolve_metric_substring_still_short_circuits():

@@ -88,6 +88,12 @@ _RULE_BASED_ACTIONS = (
     # for the LLM to contribute that the resolved metric key doesn't
     # already say.
     "advisor_metric",
+    # "scoped_reports" ("which BCMs work under Unit Head X") enumerates one
+    # named level inside a subtree — the same column read as
+    # direct_reports, taken transitively. No QueryIR field carries a
+    # target level, so the plan is the only thing that holds the whole
+    # question.
+    "scoped_reports",
     # "reverse_hierarchy" ("who is X's BM") is a direct column read off one
     # advisor row — there is nothing for the metric compiler or the LLM to
     # contribute, so it stays on the deterministic path.
@@ -161,7 +167,287 @@ def _is_rule_based(plan: QueryPlan) -> bool:
 
 # Actions complete enough to serve directly even when looks_compound()
 # would otherwise send the query to the LLM.
+#
+# Read only under NLU_MODE="rules_first" now — see _plan_is_authoritative.
 _COMPOUND_EXEMPT_ACTIONS = ("comparison", "comparison_incomplete")
+
+
+# P1 INVERSION.
+#
+# The gate used to be "is this action rule-based, and does the text avoid
+# a list of keywords" — so whether the LLM was consulted depended on
+# whether the user happened to write "but", "except" or "vs". A question
+# that was complex without using one of those words was answered by the
+# rule planner's single-metric reading, and the model that could have
+# understood it was never asked.
+#
+# It is now a CAPABILITY question. These are the actions whose ANSWER
+# SHAPE no QueryIR can express, so the plan is not a fast path for them —
+# it is the only path:
+#
+#   the profile and summary CARDS   many measures at once; QueryIR
+#                                   carries one primary metric
+#   the hierarchy READS             roster, ancestry, a manager lookup,
+#                                   direct reports — no IR intent covers
+#                                   enumerating a reporting line
+#   the CLARIFICATIONS              a question about which person was
+#                                   meant, which the LLM cannot answer
+#                                   either: it has no WIDs
+#
+# Everything else — every metric-bearing analytical query — now goes to
+# the LLM first, unconditionally, with the rule plan kept as the fallback
+# for when it cannot be reached (see the tail of resolve()).
+#
+# Derived from _RULE_BASED_ACTIONS rather than restated, so an action
+# added there cannot be silently dropped from this reasoning.
+_PLAN_ONLY_ACTIONS = frozenset(_RULE_BASED_ACTIONS)
+
+
+def _names_several_entities(entities: dict) -> bool:
+    """Did grounding find more than one entity at the same level?
+
+    The one part of looks_compound() worth keeping. It is a STRUCTURAL
+    fact about what resolved — "Graana and Downtown" grounds two teams —
+    rather than a keyword list, so a compound query no longer has to
+    contain a particular word to be recognised as one.
+
+    A card-shaped plan carries a single entity, so when several grounded
+    it cannot be the whole answer and the LLM is asked instead.
+    """
+    return any(len(entities.get(key, []) or []) > 1
+               for key in hierarchy.LEVEL_ENTITY_KEYS.values())
+
+
+# Words naming a capability the RULE PLAN cannot represent at all.
+#
+# Deliberately not looks_compound()'s grab-bag — that list included
+# "but", "still" and "vs", which say nothing about whether the plan can
+# hold the question. These two families do: a QueryPlan has no negation
+# and no disjunction, so a query containing one is answered by a plan
+# that has silently dropped it.
+_UNREPRESENTABLE_IN_A_PLAN = (
+    (re.compile(r"\b(except|excluding|other than|apart from|but not|"
+                r"without|besides)\b", re.I), "an exclusion"),
+    (re.compile(r"\b(either|or)\b", re.I), "an either/or"),
+)
+
+
+def _carryable_context(plan: QueryPlan):
+    """The part of a plan-served turn a FOLLOW-UP can legitimately reuse.
+
+    A plan-served answer is a card or a hierarchy read, and no QueryIR
+    describes one — which is why this path used to clear the context
+    outright. But "what about connects" after "compare Blue Area and
+    DownTown" then inherited NOTHING and became a bare leaderboard with
+    no subjects, losing both sides of the comparison the user was in the
+    middle of.
+
+    NOT A COPY OF THE PLAN. Only what survives a change of question is
+    carried: WHO the turn was about, and at what level. The action, the
+    card's shape and its measures are all deliberately dropped, because
+    the next turn is asking something else about the same subjects.
+
+    Returns None when there is no subject worth carrying, in which case
+    the caller still clears — an unresolved turn should not linger.
+    """
+    from app.llm.query_ir import MetricRef, QueryIR, Subject
+
+    # COMPARISONS ONLY, and the narrowness is the point.
+    #
+    # A single-entity plan turn must still clear. test_conversation_chains
+    # documents why: a profile answered correctly and left the PREVIOUS
+    # turn's team as the follow-up base, so the turn after it silently
+    # went back to Blue Area — the leak was one turn late and therefore
+    # invisible. Its sibling test says it outright: "storing a fabricated
+    # IR would be worse than storing none", because the closest IR for a
+    # one-person plan is a leaderboard with nobody in it, and the next
+    # "top 5" would rank everyone while looking like a continuation.
+    #
+    # A comparison is different in kind. Its subjects are explicit, there
+    # are at least two of them, and "what about connects" after "compare
+    # Blue Area and DownTown" can only mean those two — there is no
+    # ambiguity for a stale scope to hide in.
+    targets = list(getattr(plan, "comparison_targets", None) or [])
+    if plan.action != "comparison" or len(targets) < 2:
+        return None
+
+    subjects = [Subject(type=level, value=value) for level, value in targets
+                if level in hierarchy.HIERARCHY_LEVELS]
+    if len(subjects) < 2:
+        return None
+
+    return QueryIR(
+        intent="comparison",
+        operation="comparison",
+        subject_level=subjects[0].type,
+        subjects=subjects,
+        # The measure is deliberately NOT carried: a no-metric comparison
+        # is the shape that reaches this path, and the follow-up is
+        # usually the turn that names one.
+        metric=MetricRef(key=plan.metric) if plan.metric else None,
+    )
+
+
+def _remember_plan_context(session_id, plan: QueryPlan) -> None:
+    """Store what a follow-up may reuse, or clear if there is nothing."""
+    carried = _carryable_context(plan) if plan is not None else None
+    if carried is None:
+        conversation_memory.clear_last_ir(session_id)
+        return
+    routing.decide(
+        "Context", "carried from plan",
+        f"{plan.action!r} answers with a shape no QueryIR describes, but the "
+        f"subjects it was about ({', '.join(s.value for s in carried.subjects)}) "
+        "remain what the conversation is about",
+    )
+    conversation_memory.set(session_id, carried)
+
+
+def _understanding_unavailable(gaps: list[str]) -> str:
+    """Say that the question was not understood, and why.
+
+    Names what could not be handled rather than offering a generic
+    apology, so the user can rephrase deliberately — and never states or
+    implies a number, because the point of this reply is that no
+    trustworthy one is available.
+    """
+    detail = gaps[0] if len(gaps) == 1 else ", ".join(gaps[:-1]) + f" and {gaps[-1]}"
+    return (
+        f"I couldn't fully work out that question right now — it asks for {detail}, "
+        "and I can't answer that accurately at the moment. Rather than give you a "
+        "number for a narrower question than the one you asked, I'd rather say so. "
+        "Try asking for one part at a time, or send it again in a moment."
+    )
+
+
+# A SECOND QUESTION after "and". "who is the top advisor in Blue Area and
+# what is their team size" is two independent asks: a ranking, then a
+# property of its winner. One QueryIR is one query, so answering it means
+# answering ONE of them — and the reply names no part it dropped.
+#
+# Anchored on an interrogative, not on "and" alone: "connects and answered
+# calls", "achievement < 50 and answered calls % < 20" and "compare X and
+# Y" are all single questions that happen to contain the word.
+_SECOND_QUESTION_RE = re.compile(
+    r"\band\s+(what|whats|what's|who|whos|who's|which|how\s+many|how\s+much)\b",
+    re.I,
+)
+
+
+def _periods_named(text: str) -> set[str]:
+    """Every DISTINCT period the text names.
+
+    Read from temporal_parser's own pattern table rather than a second
+    list of period words, so a phrasing it learns is one this sees too.
+    Deduplicated by period, so "current month" and "this month" together
+    are one period rather than a comparison.
+    """
+    from app.llm.temporal_parser import _EQUIVALENT_PATTERNS
+
+    return {period for pattern, period in _EQUIVALENT_PATTERNS
+            if re.search(pattern, text, re.I)}
+
+
+def _semantic_gaps(text: str, entities: dict, plan: QueryPlan) -> list[str]:
+    """What the rule plan would LOSE if it answered this query.
+
+    P0 SAFETY. The plan is a single metric, a single subject and a flat
+    conjunction. For most questions that is the whole question, and the
+    plan is the answer. For the rest it is a NARROWER question wearing the
+    same clothes — and the reply is indistinguishable from a correct one,
+    which is what makes silently serving it the worst available outcome
+    when the LLM cannot be reached.
+
+    Every check reads STRUCTURE that deterministic extraction already
+    produced — how many measures were named, how many entities grounded,
+    whether the conditions target different measures — rather than
+    scanning for keywords. The two vocabulary checks cover capabilities a
+    plan cannot express in any wording.
+
+    Empty means the plan can hold the question and answering with it is
+    not a downgrade.
+    """
+    gaps: list[str] = []
+
+    # A SECOND MEASURE IS ONLY LOST IF NOTHING CARRIES IT. A plan holds
+    # one metric, but a threshold carries its own since extraction began
+    # tagging each with the measure it was written beside — so "achievement
+    # below 50% and answered calls % below 20%" names two measures and
+    # loses neither, and refusing it would be its own kind of wrong.
+    #
+    # What IS lost is a measure asked for as OUTPUT with nothing to hold
+    # it: "connects and answered calls of all BCMs" ranks by the first and
+    # drops the second.
+    # ONLY WHEN THE PLAN ACTUALLY USES A MEASURE. A reverse lookup, a
+    # profile or an attendance filter has plan.metric None while
+    # plan.metrics still lists whatever the wording brushed against —
+    # "Waqar Haider's portfolio lead" matches `portfolio_value`, and
+    # "performance of X" matches `achievement_pct`. Nothing is being
+    # dropped there: the action is not a metric query at all, and
+    # flagging it refused three working shapes.
+    if plan.metric:
+        carried = {t.get("metric") for t in (entities.get("thresholds") or [])
+                   if t.get("metric")}
+        carried.add(plan.metric)
+        if set(getattr(plan, "metrics", None) or []) - carried:
+            gaps.append("more than one measure")
+
+    if _names_several_entities(entities):
+        gaps.append("more than one subject")
+
+    for pattern, description in _UNREPRESENTABLE_IN_A_PLAN:
+        if pattern.search(text):
+            gaps.append(description)
+
+    # A PERIOD COMPARISON. "revenue this month versus year to date" names
+    # two windows; the IR carries one, and `time_range.compare_to` is
+    # readable but has no executor. So the query answered MTD alone and
+    # said nothing about the half it dropped.
+    if len(_periods_named(text)) > 1:
+        gaps.append("two time periods compared against each other")
+
+    # TWO INDEPENDENT QUESTIONS. One IR is one query. "who is the top
+    # advisor in Blue Area and what is their team size" answered the
+    # SECOND part only — and at advisor level, where team_size is a
+    # per-row literal, so it reported a team size of 1.
+    if _SECOND_QUESTION_RE.search(text):
+        gaps.append("two separate questions in one message")
+
+    return gaps
+
+
+def _plan_is_authoritative(plan: QueryPlan, entities: dict, text: str = "") -> bool:
+    """Should this plan answer, without asking the LLM at all?
+
+    True only for the shapes above, and only when the plan can actually
+    hold the whole question — a single-entity card cannot answer a
+    two-entity one, however it is worded.
+    """
+    if not _is_rule_based(plan):
+        return False
+    if plan.action not in _PLAN_ONLY_ACTIONS:
+        return False
+    # A comparison is exempt: it is ALREADY multi-entity by nature, and
+    # _is_rule_based has separately decided it needs the multi-KPI table
+    # that comparison_service builds and QueryIR cannot.
+    if plan.action in _COMPOUND_EXEMPT_ACTIONS:
+        # A comparison is MULTI-SUBJECT BY NATURE, so the gap check below
+        # would refuse every one of them for naming several subjects.
+        # _is_rule_based has separately decided it needs the multi-KPI
+        # table QueryIR cannot express.
+        return True
+    # A PLAN-ONLY SHAPE IS STILL ONLY A PLAN. "list all advisors
+    # excluding Blue Area" resolves to a roster, which is plan-served —
+    # and a roster carries one entity filter with no negation, so it
+    # dropped the exclusion and answered with Blue Area's 52 members:
+    # the exact opposite of the question, stated confidently.
+    #
+    # The same gap check the fallback path uses, applied BEFORE the plan
+    # is served rather than only after the parser declines. Without it
+    # this branch is a hole straight through the Phase 1 safety work.
+    if text and _semantic_gaps(text, entities, plan):
+        return False
+    return not _names_several_entities(entities)
 
 # Plan actions that reach the plan path but ANSWER WITH A QUESTION.
 # chat_service._dispatch renders these as kind="clarification", so the
@@ -240,6 +526,11 @@ def _fill_pending_slot(
     # promote to an executable intent so revalidation can pass
     if ir.intent == "clarify":
         ir.intent = "comparison" if len(ir.subjects) >= 2 else "leaderboard"
+        # Both names, or they disagree — see the same pairing in
+        # conversation_context. resolved_operation() prefers `operation`,
+        # so promoting only the intent would leave the filled slot
+        # answering as the clarification it no longer is.
+        ir.operation = ir.intent
 
     # Part 10: overall_confidence/intent_confidence reflected doubt about
     # WHAT the user wanted before they answered directly — a slot the user
@@ -1426,19 +1717,30 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
     # lookup/summary/attendance_filter stay on the simple rule-based path,
     # but only when the query doesn't look compound — "summary for Graana
     # AND Downtown" belongs to the semantic parser, not a single-entity plan.
-    if _is_rule_based(plan) and (
-        plan.action in _COMPOUND_EXEMPT_ACTIONS
-        or not semantic_parser.looks_compound(cleaned, entities)
-    ):
+    # P1: capability, not keywords. Under the rollback mode the previous
+    # keyword gate is used verbatim, so NLU_MODE="rules_first" restores
+    # the pre-inversion routing exactly.
+    # Read through semantic_parser, which owns the mode and which the
+    # existing tests monkeypatch — so a test that pins "rules_first"
+    # pins it for the routing gate too, rather than for half the pipeline.
+    if semantic_parser.settings.nlu_mode == "rules_first":
+        serve_plan = _is_rule_based(plan) and (
+            plan.action in _COMPOUND_EXEMPT_ACTIONS
+            or not semantic_parser.looks_compound(cleaned, entities)
+        )
+        gate_reason = "NLU_MODE=rules_first — the pre-inversion keyword gate"
+    else:
+        serve_plan = _plan_is_authoritative(plan, entities, cleaned)
+        gate_reason = (
+            f"{plan.action!r} has an answer shape no QueryIR expresses "
+            "(_PLAN_ONLY_ACTIONS) and the plan holds the whole question"
+        )
+
+    if serve_plan:
         audit.mark_rule_path(
-            f"plan.action={plan.action!r} is in _RULE_BASED_ACTIONS and "
-            + (
-                f"is compound-exempt ({plan.action!r} in _COMPOUND_EXEMPT_ACTIONS)"
-                if plan.action in _COMPOUND_EXEMPT_ACTIONS
-                else "looks_compound() returned False"
-            )
-            + " — returned before semantic_parser.parse(), so NO LLM call is made "
-            "for this query regardless of NLU_MODE"
+            f"plan.action={plan.action!r}: {gate_reason}"
+            " — returned before semantic_parser.parse(), so NO LLM call is made "
+            "for this query"
         )
         # Phase 10: this path ANSWERS, and until now it neither read nor
         # wrote conversation state — the one exit that could leave the
@@ -1462,15 +1764,17 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
                     "the conversation is about, so it is dropped rather than left "
                     "for the next turn to inherit",
                 )
-            conversation_memory.clear_last_ir(session_id)
+            _remember_plan_context(session_id, plan)
         return Resolution(kind="plan", plan=plan, entities=entities)
 
     audit.decision(
         "routing", "semantic_parser",
         f"plan.action={plan.action!r} is "
-        + ("not in _RULE_BASED_ACTIONS" if plan.action not in _RULE_BASED_ACTIONS
-           else "rule-based but looks_compound() returned True")
-        + " — handed to the LLM semantic parser",
+        + ("an analytical shape QueryIR can express"
+           if plan.action not in _PLAN_ONLY_ACTIONS
+           else "plan-shaped but the turn names several entities, which a "
+                "single-entity plan cannot hold")
+        + " — handed to the LLM semantic parser, with the plan kept as fallback",
     )
     outcome = semantic_parser.parse(cleaned, entities, db, session_id, plan=plan)
 
@@ -1524,6 +1828,55 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             clarify_message=message,
             clarify_options=options,
         )
+
+    # P1: THE RULE PLANNER IS THE FALLBACK, not a discarded first draft.
+    #
+    # Reaching here means the parser produced no IR at all — the LLM was
+    # unreachable and nothing could be degraded into one. Before the
+    # inversion that was rare, because a rule-servable action never got
+    # this far. Now that every analytical query is handed to the LLM
+    # first, it is the ordinary outage path, and answering "I'm not
+    # tracking that one" for a question the rule planner had already
+    # resolved would make the system WORSE whenever the provider is down.
+    #
+    # This is also the defect class the audit found independently: an
+    # action the LLM could not serve was routed away and its correctly
+    # built plan thrown away.
+    # P0 SAFETY: only when the plan is the ANSWER, not a downgrade.
+    #
+    # The fallback exists so an outage does not lose a question the rule
+    # planner had already resolved. It must not become the other failure:
+    # answering a COMPLEX question with the simpler one the plan happens
+    # to encode. A reply built from a plan that dropped a measure, a
+    # subject or an exclusion reads exactly like a correct answer, so the
+    # user has no way to tell — which is why this refuses instead.
+    gaps = _semantic_gaps(cleaned, entities, plan) if plan is not None else []
+    if gaps:
+        routing.decide(
+            "Routing", "refused — understanding unavailable",
+            f"the semantic parser returned no IR and the rule plan "
+            f"({plan.action!r}) cannot hold {', '.join(gaps)}; answering with it "
+            "would silently narrow the question",
+        )
+        return Resolution(
+            kind="clarify",
+            entities=entities,
+            clarify_message=_understanding_unavailable(gaps),
+        )
+
+    if plan is not None and plan.action not in ("unresolved", "clarify_ambiguous"):
+        routing.decide(
+            "Routing", "plan fallback",
+            f"the semantic parser returned no IR, so the rule-based plan "
+            f"({plan.action!r}) answers instead of discarding it",
+        )
+        audit.mark_rule_path(
+            f"plan.action={plan.action!r} — served as the FALLBACK after "
+            "semantic_parser.parse() returned no IR (LLM unavailable)"
+        )
+        if plan.action not in _CLARIFYING_ACTIONS:
+            _remember_plan_context(session_id, plan)
+        return Resolution(kind="plan", plan=plan, entities=entities)
 
     return Resolution(
         kind="clarify",

@@ -48,7 +48,13 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "achievement_pct": (
         "target achievement", "achievement", "hit rate", "on target",
         "achieved target", "target hit", "performance against target",
-        "top performer", "performer", "performance",
+        # Both numbers of each, DECLARED. The plural used to resolve only
+        # through the fuzzy widening tier ("performers" ~ "performer" at
+        # 0.95), so retiring that tier took ordinary phrasing with it —
+        # a plural is not a typo. An exact alias guesses nothing and is
+        # the right home for a word form.
+        "top performer", "top performers", "best performer", "best performers",
+        "performer", "performers", "performance",
         # The spec calls this the Performance leaderboard's "performance
         # rate" — pct = Cleared / Target x 100. Same measure, business
         # wording, and the only target-rate KPI whose denominator this

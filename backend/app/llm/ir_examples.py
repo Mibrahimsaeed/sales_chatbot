@@ -427,13 +427,41 @@ EXAMPLES: list[dict] = [
 
 
 def render_examples() -> str:
-    """The examples block injected into the parser prompt."""
+    """The examples block injected into the parser prompt.
+
+    Rendered COMPACTLY: a field whose value equals the schema default is
+    omitted. Every field is `required` in llm_client.QUERY_IR_JSON_SCHEMA,
+    so grammar-constrained decoding emits all of them no matter what these
+    examples show — spelling out `"subjects": [], "filters": [], "limit":
+    null, ...` on all 18 examples repeated ~1,200 tokens of nothing per
+    call. What differs between examples is what carries the teaching
+    signal; what is constant is what the grammar already guarantees.
+    """
     import json
 
-    lines = ["Examples (follow these exactly in style and strictness):"]
+    defaults = {
+        "operation": None,
+        "subjects": [],
+        "metric": None,
+        "metrics": [],
+        "filters": [],
+        "filter_tree": None,
+        "limit": None,
+        "group_by": None,
+        "flat": False,
+        "sort": {"metric": None, "direction": "desc"},
+    }
+
+    def compact(ir: dict) -> dict:
+        return {k: v for k, v in ir.items() if k not in defaults or v != defaults[k]}
+
+    lines = [
+        "Examples (follow these exactly in style and strictness).",
+        "Fields omitted from an example are the defaults — you must still emit every field.",
+    ]
     for i, ex in enumerate(EXAMPLES, 1):
         lines.append(f'Example {i} — User: "{ex["utterance"]}"')
         if ex["prior_ir"]:
-            lines.append(f"  (Previous turn's query was: {json.dumps(ex['prior_ir'])})")
-        lines.append(f"  -> {json.dumps(ex['ir'])}")
+            lines.append(f"  (Previous turn's query was: {json.dumps(compact(ex['prior_ir']))})")
+        lines.append(f"  -> {json.dumps(compact(ex['ir']))}")
     return "\n".join(lines)

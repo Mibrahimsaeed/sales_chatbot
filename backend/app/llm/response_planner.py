@@ -246,13 +246,31 @@ def plan_response(ir: QueryIR, rows: list[dict]) -> ResponsePlan:
                                       "empty result, not a missing capability"),),
         )
 
-    if ir.intent == "comparison":
+    # ONE FIELD DECIDES THE SHAPE. resolved_operation() reads `operation`
+    # when the parser set it and derives it from `intent` otherwise, so
+    # these branches consult a single value instead of the narrower of
+    # two names for the same thing.
+    operation = ir.resolved_operation()
+
+    if operation == "comparison":
         return ResponsePlan(
             shape="comparison_table", show_insights=len(rows) >= 3,
             mode="comparison", why="the query names several subjects to set side by side",
         )
 
-    if ir.intent == "filtered_list":
+    # A POPULATION has no measure, so it renders as the same plain list a
+    # filtered_list does — that formatter omits the value entirely when
+    # there is no metric, which is exactly right here. Without this the
+    # rows fell through to the leaderboard and printed "no data" beside
+    # every name.
+    if operation == "population":
+        return ResponsePlan(
+            shape="filtered_table", show_insights=False, show_explanation=False,
+            mode="breakdown",
+            why="the query asks WHO, with no measure to rank by",
+        )
+
+    if operation == "filtered_list":
         return ResponsePlan(
             shape="filtered_table", show_insights=len(rows) >= 3,
             mode="breakdown", why="the query asks for the members matching a constraint",

@@ -808,6 +808,134 @@ def _score_direct_reports(ctx: _Intent) -> _Candidate | None:
     )
 
 
+# The chain levels that name a PERSON. `team` is a group name, which is
+# what makes it the scope half of "the Unit Head in AMD". Derived from
+# CHAIN so a rebind cannot leave this behind.
+_PERSON_LEVELS = frozenset(lvl for lvl in hierarchy.CHAIN if lvl != "team")
+
+
+def _score_scoped_reports(ctx: _Intent) -> _Candidate | None:
+    """"Which BCMs work under Unit Head X" — a named level, whole subtree.
+
+    THE DEFECT THIS CLOSES. The question names two levels: one identifies
+    the manager and one is the population wanted. `_score_direct_reports`
+    below already reads both, through `_named_target_level`, but only
+    when the query says "directly" — and without that word the same
+    sentence fell to `roster` or `hierarchy`, which carry no target level
+    at all. So "which BCMs work under Unit Head X" answered with his 129
+    ADVISORS, and "how many BCMs" and "how many advisors" returned the
+    identical number. The target level was understood and then dropped.
+
+    Nothing new is invented here: the target scan, the role exclusion and
+    the `target_level` field are direct_reports' own, reused verbatim.
+    The single difference is transitivity — the whole subtree rather than
+    the rung immediately below — which is why it is a separate action
+    (hierarchy.subtree_scope_filter) rather than a flag on that one.
+
+    FOUR CONDITIONS, all required, which is what keeps it off every
+    question it must not touch:
+
+      - "directly" ABSENT. That word belongs to _score_direct_reports and
+        the two must never both fire.
+      - a target level NAMED and strictly BELOW the manager's. "Who is
+        under X" names none and keeps its breakdown; "X's team" names
+        `team`, which is above `unit_head`, so it keeps its reading too.
+      - a grounded group entity to be the scope.
+      - NO measure named this turn. "top 5 advisors under X by connects"
+        is a leaderboard that already works through the IR path with a
+        scope filter, and stays there.
+    """
+    if ctx.entities.get("direct"):
+        return None
+    if not cat.SCOPED_UNDER_RE.search(ctx.q):
+        return None
+    # A measure makes this a ranking question, which the metric paths own.
+    if _names_a_measure_here(ctx):
+        return None
+
+    group = ctx.group_entity()
+    if group is None:
+        return None
+    subject_level, subject_value = group
+    if not hierarchy.is_chain_level(subject_level):
+        return None
+
+    role = cat.detect_reverse_level(ctx.q) if _names_a_role(ctx.q) else None
+    target = _named_target_level(ctx.q, exclude=role)
+    if target is None:
+        return None
+
+    # THE LEAF IS NOT THIS QUESTION. "advisors under X" — and "people",
+    # "staff", "agents", "how many advisors are under X" — is the roster
+    # and team-size reading, which already resolves correctly and has its
+    # own settled definition of the population (test_unit_head_roster,
+    # test_team_size, and the hierarchy golden queries all pin it,
+    # including whether the manager counts among their own advisors).
+    #
+    # What was broken is asking for a MANAGER level: those had nowhere to
+    # go and fell back to the advisor population, so "which BCMs" and
+    # "how many advisors" returned the same number. Claiming the leaf too
+    # would replace a working answer with a differently-defined one for
+    # no gain, so it is left exactly where it was.
+    if target == "advisor":
+        return None
+
+    # The role names the manager's level when it differs from the
+    # grounded entity's — the same reading direct_reports takes, so "the
+    # Unit Head in AMD" resolves the person out of the scope there too.
+    #
+    # A ROLE IN FRONT OF A PERSON'S NAME IS NOT A SCOPE. "the Unit Head in
+    # AMD" names a group and asks for the person holding a role inside it;
+    # "BCM Ali Asghar" names the person outright and the role word merely
+    # says which hat. Both look identical to `role != subject_level` —
+    # Ali Asghar grounds at zonal_head too, because he holds both — and
+    # reading the second as the first made him a scope to search for some
+    # other BCM, which answered "Zonal Head 'Ali Asghar' has more than one
+    # BCM: Ali Asghar, ...".
+    #
+    # The discriminator is what KIND of thing the subject is. A scope is a
+    # place — "AMD" is a team — and the role has to be looked up inside
+    # it. A person level is already somebody, so the role word in front
+    # of their name is a title, not a container. (Testing the advisor
+    # grounding instead does not work: pinning an ambiguous name to one
+    # level strips `advisor_name`, so by the time the scorer runs the
+    # person no longer looks like one.)
+    #
+    # WHICH of his roles is then the manager level is NOT decided here.
+    # nlu_pipeline._pin_stated_level and _authoritative_role already
+    # settled that upstream — a stated junior role is deliberately
+    # corrected upward to the senior-most role the person holds — and
+    # `subject_level` is that decision's output. Re-deciding it here would
+    # give one answer for "BCM Ali Asghar" and another for "Ali Asghar",
+    # which is the class of disagreement this whole change exists to end.
+    subject_is_a_person = subject_level in _PERSON_LEVELS
+
+    by_scope = role is not None and role != subject_level and not subject_is_a_person
+    manager_level = role if by_scope else subject_level
+
+    # Strictly below, or this is not a descent. hierarchy owns the test;
+    # asking it here as well keeps a non-answer out of the candidate list
+    # rather than letting dispatch discover it.
+    if target not in hierarchy.descendants(manager_level):
+        return None
+
+    score = cat.PRIOR["scoped_reports"] + cat.W_EXPLICIT_PHRASE + cat.W_ENTITY
+    evidence = ["scoped_under_phrase", f"manager_level:{manager_level}",
+                f"target:{target}"]
+    if by_scope:
+        evidence.append(f"role_in_scope:{subject_level}")
+    return _Candidate(
+        intent="scoped_reports", score=score, evidence=evidence,
+        build=lambda: QueryPlan(
+            action="scoped_reports",
+            level=manager_level,
+            entity_value=subject_value,
+            subject_level=subject_level if by_scope else None,
+            target_level=target,
+        ),
+    )
+
+
 def _names_a_role(q: str) -> bool:
     """Did the question name a specific manager level, or just ask who is
     above? "who is above X" must use the chain's parent rather than
@@ -1253,6 +1381,7 @@ _SCORERS: tuple[Callable[[_Intent], _Candidate | None], ...] = (
     _score_roster,
     _score_ancestry,
     _score_direct_reports,
+    _score_scoped_reports,
     _score_reverse_hierarchy,
     _score_hierarchy,
     _score_attendance,

@@ -190,16 +190,28 @@ def test_a_named_and_resolvable_measure_is_used(org, text, expected):
 # Widening runs before refusing
 # ---------------------------------------------------------------------
 
-@pytest.mark.parametrize("typo,expected", [
-    ("top advisors by revnue", "mtd_cleared"),
-    ("top advisors by achievment", "achievement_pct"),
-    ("top advisors by pipline", "pipeline_value"),
+@pytest.mark.parametrize("typo", [
+    "top advisors by revnue",
+    "top advisors by achievment",
+    "top advisors by pipline",
 ])
-def test_a_typo_is_widened_not_refused(org, typo, expected):
-    """Refusing a typo would trade a wrong answer for a wrong refusal."""
+def test_a_typo_is_refused_rather_than_guessed(org, typo):
+    """P0 SAFETY, and a deliberate trade.
+
+    These used to widen onto the intended measure by edit distance. The
+    same machinery, run against the whole sentence, is what let a measure
+    be picked because it RESEMBLED part of the question — and a wrong
+    measure is indistinguishable from a right one in the reply, because
+    the number is well-formed and carries the guessed metric's own label.
+
+    So the typo is now refused. `named_text` is still set, so the reply
+    can say WHICH word was not recognised rather than ignoring it, and
+    the LLM parser — which reads the whole sentence rather than an edit
+    distance — is the honest place to recover the intent.
+    """
     intent = _intent(typo, org)
-    assert intent.key == expected, intent
-    assert not intent.unresolved
+    assert intent.key is None, intent
+    assert intent.named_text
 
 
 def test_entities_are_not_mistaken_for_measures(org):
@@ -284,8 +296,9 @@ def test_a_short_synonym_matches_exactly_but_never_fuzzily(org):
     assert fuzzy_resolve_metric("top advisors by cr") == "client_registrations"
     assert fuzzy_resolve_metric("advisors in Mars Region") is None
     assert fuzzy_resolve_metric("advisors in North Region") is None
-    # Typos still widen — the floor sits between coincidence and typo.
-    assert fuzzy_resolve_metric("revnue") == "mtd_cleared"
+    # P0: the approximate tier is off, so a typo is refused rather than
+    # widened. The exact hits above are unaffected — they guess nothing.
+    assert fuzzy_resolve_metric("revnue") is None
 
 
 def test_cr_does_not_fire_inside_longer_words():

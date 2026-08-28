@@ -230,6 +230,23 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
         missing.append(f"filter:{f.field}")
     ir.filters = grounded_filters
 
+    # ---- filter tree — validated, never PRUNED ----
+    #
+    # The flat list above drops a bad filter and carries on, which only
+    # ever widens the result. A tree cannot be treated that way: dropping
+    # a child of an `or` widens it, and dropping a child of a `not`
+    # INVERTS it. So a bad leaf is recorded and the tree is left intact —
+    # the compiler refuses to build a disjunction it cannot express
+    # rather than quietly answering a different question
+    # (query_compiler.UncompilableFilterTree).
+    if ir.filter_tree is not None:
+        for f in ir.filter_tree.leaves():
+            if f.confidence < _CONFIDENCE_FLOOR:
+                missing.append(f"filter_low_confidence:{f.field}")
+            elif (f.field not in _NON_METRIC_FILTER_FIELDS
+                  and f.field not in METRICS):
+                missing.append(f"filter:{f.field}")
+
     # ---- subjects (comparisons / named entities) ----
     grounded_subjects = []
     for s in ir.subjects:

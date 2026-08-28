@@ -298,6 +298,61 @@ def direct_scope_filter(level: str, value: str, target_level: str | None = None)
     return predicate
 
 
+def subtree_scope_filter(level: str, value: str, target_level: str | None = None):
+    """The predicate selecting everyone at `target_level` ANYWHERE beneath
+    `value` — the transitive counterpart of direct_scope_filter above.
+
+    "Which BCMs work under Unit Head X" and "who reports directly to X"
+    differ in exactly one way, and it is not the target level: the first
+    reaches the whole subtree, the second only the rung immediately
+    below. So this is direct_scope_filter with the manager column swapped
+    for the SCOPE column — `rm ilike 'X'` rather than the target's own
+    parent — and everything else, self-exclusion included, held identical
+    so the two readings of one question cannot disagree about who counts.
+
+    SELF IS EXCLUDED, for the same reason and by the same rule as the
+    direct version: a Unit Head is routinely named in his own subtree's
+    `management_lead`, and "which BCMs work under him" that answers with
+    him among them has counted the manager as one of his own reports.
+
+    WHAT THIS DOES NOT DECIDE. A person who is both a Zonal Head and a
+    BCM is counted here as a BCM, because the BCM column names them. That
+    is the rule direct_scope_filter already applies, and it is NOT the
+    rule query_compiler._exclude_more_senior_roles applies to a
+    leaderboard, which keeps only people whose senior-most role is the
+    one asked for. Both definitions are left exactly as they were —
+    extending the reports mechanism means inheriting the reports
+    mechanism's definition, not choosing between the two.
+
+    Returns None when the pairing cannot be enumerated (no such target,
+    or a target that is not strictly below `level`), which callers render
+    as "not a question about this level" rather than as an empty answer.
+    """
+    level = canonical_level(level)
+    target = canonical_level(target_level) or child_of(level)
+    if target is None:
+        return None
+
+    scope_column = column_for(level)
+    if scope_column is None:
+        return None
+    # Strictly BELOW, so "X's team" (target `team`, level `unit_head`)
+    # cannot be read as a descent and keeps the reading it has today.
+    if target not in descendants(level):
+        return None
+
+    predicate = scope_column.ilike(value)
+
+    own_column = column_for(target)
+    if own_column is not None:
+        predicate = and_(
+            predicate,
+            or_(own_column.is_(None),
+                func.lower(own_column) != (value or "").lower()),
+        )
+    return predicate
+
+
 # ---------------------------------------------------------------------
 # Reverse hierarchy — "who is X's BM/ZM/RM?"
 #

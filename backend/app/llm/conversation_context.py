@@ -1,67 +1,3 @@
-"""THE owner of cross-turn context.
-
-Phase 2 (conversation context). The behavioural audit found that the
-pipeline understands each turn correctly and then loses the conversation
-between turns:
-
-    "Top advisors by revenue" -> "only Graana" -> "top 3"
-      the company filter silently vanishes on turn 3
-
-    "Blue Area revenue" -> "what about pipeline?"
-      the team scope silently vanishes on turn 2
-
-THE ROOT CAUSE is that no merge step existed. Carry-over was
-all-or-nothing: `ir_patcher.try_patch` either cloned the prior IR whole,
-or the pipeline built a fresh IR from this turn's words with ZERO
-inheritance. Every failing conversation needs the third option — inherit
-some fields, override others — and there was nowhere to express it.
-
-Two supporting causes:
-
-  * Ellipsis was inferred from `plan.action`, which answers "what would
-    the planner DO with this message", not "does this message need the
-    previous one". Those are different questions and the answers diverge
-    exactly on short follow-ups.
-
-  * Two carry-over mechanisms with different contracts: the structured
-    patch above, and semantic_parser serialising the prior IR into the
-    LLM PROMPT, where the model decides what to keep. Behaviour therefore
-    depended on nlu_mode.
-
-WHAT THIS MODULE OWNS
-
-  1. `specified()`  — what THIS turn's words actually pinned down. Asked
-     of the existing owners (metric_aliases, subject_level,
-     intent_catalog, the entity dict), never re-derived here, so this
-     module cannot drift from them.
-
-  2. `ellipsis()`   — the explicit is-this-incomplete decision that
-     replaces the plan.action proxy.
-
-  3. `merge()`      — field-by-field inheritance with one deterministic
-     owner per field, and a record of what was inherited, overridden and
-     discarded WITH REASONS.
-
-  4. `carry_into_plan()` — the same inheritance, one step EARLIER: what
-     the previous turn hands to this turn's PLANNER, in the shape entity
-     extraction would have produced it. Phase 10; see its docstring.
-
-DEFINITION OF ELLIPSIS, without matching phrases. A turn stands alone
-when it names a MEASURE and says what to measure it over — a subject, an
-explicit level word, or a ranking. Anything else is incomplete and needs
-the previous turn.
-
-    "Blue Area revenue"        metric + subject          -> standalone
-    "Top advisors by revenue"  metric + level word       -> standalone
-    "what about pipeline?"     metric, nothing to scope  -> ELLIPTICAL
-    "only Graana"              subject, no metric        -> ELLIPTICAL
-    "top 3"                    neither                   -> ELLIPTICAL
-
-Deriving it this way is what keeps the rule free of per-phrase handling:
-"and revenue?", "what about pipeline", "pipeline" and "now pipeline" all
-reach the same decision because they all specify the same things.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -362,6 +298,14 @@ def merge(prior, current, spec: TurnSpec, decision: Ellipsis) -> MergeResult:
             )
         if current.intent != "comparison":
             current.intent = prior.intent
+            # BOTH NAMES, OR THEY DISAGREE. `operation` and `intent` are
+            # the same fact under the old and new vocabularies, and
+            # resolved_operation() prefers `operation` — so carrying the
+            # intent alone left a follow-up reading "comparison" by one
+            # field and "leaderboard" by the other, and answering as the
+            # second. Carried together here because this is the one place
+            # that rewrites either.
+            current.operation = prior.resolved_operation()
             result.inherited.append(
                 ("intent", "the previous turn was a comparison and this turn "
                            "named no new subjects, so it stays one")

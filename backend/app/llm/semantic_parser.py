@@ -164,6 +164,18 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
         ir = _call_llm_for_ir(text, entities, db, session_id)
         if ir is not None:
             return _finish(ir, db, session_id, used_llm=True)
+        # P0 SAFETY: do not degrade a question the plan cannot hold.
+        #
+        # plan_to_ir builds from ONE metric and a flat conjunction, so
+        # degrading a multi-measure or exclusion query produces a
+        # well-formed IR for a DIFFERENT, narrower question — and the
+        # reply is indistinguishable from a correct one. Returning no IR
+        # hands the decision to nlu_pipeline, which says so plainly
+        # rather than answering.
+        from app.llm.nlu_pipeline import _semantic_gaps
+
+        if _semantic_gaps(text, entities, plan):
+            return ParseOutcome(ir=None, missing=["understanding"], used_llm=False)
         degraded = _rule_based_ir(text, entities, plan)
         if degraded is not None:
             return _finish(degraded, db, session_id, used_llm=False)

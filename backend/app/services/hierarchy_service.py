@@ -81,7 +81,16 @@ def _direct_members(db: Session, level: str, value: str, target: str) -> list[di
     len() of this, so the number and the list can never come from two
     different scopes.
     """
-    predicate = hierarchy.direct_scope_filter(level, value, target)
+    return _members_for(db, hierarchy.direct_scope_filter(level, value, target), target)
+
+
+def _members_for(db: Session, predicate, target: str) -> list[dict]:
+    """The member dicts for an already-built scope predicate.
+
+    Shared by the direct and transitive readings so they cannot drift on
+    what a member IS — names at a manager target, advisor rows at the
+    leaf, master-sheet filtered, in one order.
+    """
     if predicate is None:
         return []
 
@@ -143,6 +152,44 @@ def get_direct_reports(db: Session, level: str, value: str,
                 target, members = candidate, found
                 break
 
+    return {
+        "level": level,
+        "level_label": hierarchy.label_for(level),
+        "value": value,
+        "target_level": target,
+        "target_level_label": hierarchy.label_for(target),
+        "count": len(members),
+        "members": members,
+    }
+
+
+def get_scoped_reports(db: Session, level: str, value: str,
+                       target_level: str) -> dict | None:
+    """Everyone at `target_level` ANYWHERE beneath `value`.
+
+    The transitive twin of get_direct_reports: "which BCMs work under
+    Unit Head X" rather than "who reports directly to X". Deliberately
+    the same shape, the same keys and the same one-population rule — the
+    count is len(members), so "how many BCMs work under X" and "which
+    BCMs work under X" are one question answered from one scope.
+
+    `target_level` is REQUIRED here, unlike the direct version. The
+    direct reading has a sensible default (the rung immediately below);
+    the transitive one does not — "everyone under X" without a named
+    level is the existing roster/breakdown question and must keep going
+    there, so a caller with no target is a caller that should not have
+    reached this function.
+
+    Returns None when the target is not a level strictly beneath `level`,
+    which the caller renders as "not a question about this level".
+    """
+    level = hierarchy.canonical_level(level)
+    target = hierarchy.canonical_level(target_level)
+    predicate = hierarchy.subtree_scope_filter(level, value, target)
+    if predicate is None:
+        return None
+
+    members = _members_for(db, predicate, target)
     return {
         "level": level,
         "level_label": hierarchy.label_for(level),

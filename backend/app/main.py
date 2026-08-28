@@ -47,12 +47,13 @@ from app.api.router import api_router
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Best-effort: a live sanity check against the OpenAI API at boot, so
+    """Best-effort: a live sanity check against the configured LLM at boot, so
     a bad key / no quota / network issue shows up in the startup log
     instead of silently degrading every chat message to the rule-based
     fallback until someone notices. Purely a diagnostic — the whole LLM
     layer is already fail-soft (call_llm_json() itself never raises
     regardless), so a failure here must never block startup."""
+    from app.core.config import settings
     from app.core.logger import get_logger
     from app.llm.llm_client import call_llm_json
     from app.llm import entity_extractor  # noqa: F401 — import registers entity types with entity_linker
@@ -61,9 +62,13 @@ async def _lifespan(app: FastAPI):
 
     log = get_logger("main")
     if call_llm_json('Return ONLY JSON: {"ok": true}') is not None:
-        log.info("OpenAI reachable")
+        log.info("LLM reachable (%s / %s)", settings.llm_provider, settings.ollama_model)
     else:
-        log.warning("OpenAI unreachable at startup (bad key, no quota, or network) — will retry lazily on first chat request")
+        log.warning(
+            "LLM unreachable at startup (%s at %s — is the daemon running, is the "
+            "model pulled?) — will retry lazily on first chat request",
+            settings.llm_provider, settings.ollama_base_url,
+        )
 
     # ---- embeddings: probe ONCE, then live with the answer ----
     # Graceful degradation: embeddings are an optional widening tier

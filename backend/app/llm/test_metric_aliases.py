@@ -332,8 +332,10 @@ def test_an_unavailable_phrase_is_not_fuzzy_widened_to_a_neighbour():
     # "cr", the count's own synonym.
     assert fuzzy_resolve_metric("cr %") == "cr_rate"
     assert fuzzy_resolve_metric("answered calls %") == "answered_calls_rate"
-    # Widening still works for everything else.
-    assert fuzzy_resolve_metric("revnue") == "mtd_cleared"
+    # P0: the APPROXIMATE tier is off, so a typo is no longer widened —
+    # a wrong measure reads exactly like a right one, and the exact tiers
+    # above (which guess nothing) are what remain.
+    assert fuzzy_resolve_metric("revnue") is None
 
 
 # ---------------------------------------------------------------------

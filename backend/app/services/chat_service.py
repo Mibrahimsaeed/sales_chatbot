@@ -29,6 +29,7 @@ from app.llm.response_formatter import (
     format_group_manager_reply,
     format_ancestry_reply,
     format_direct_reports_reply,
+    format_scoped_reports_reply,
     format_roster_reply,
     format_comparison_reply,
     format_team_member_breakdown,
@@ -323,6 +324,49 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
                                f"plan.action='direct_reports' — the {reports['target_level']!r} "
                                f"level immediately below {manager_level} {manager_value!r}")
         return respond("roster", format_direct_reports_reply(reports), reports)
+
+    if plan.action == "scoped_reports":
+        # "Which BCMs work under Unit Head X" — one NAMED level inside the
+        # whole subtree. Same manager resolution as direct_reports above,
+        # deliberately: a role named within a scope ("the Unit Head in
+        # AMD") has to reach the person the same way, or the two readings
+        # of one question would resolve different people.
+        manager_level = plan.level
+        manager_value = plan.entity_value
+        if plan.subject_level:
+            holder = hierarchy_service.get_manager_of_group(
+                db, plan.subject_level, plan.entity_value, manager_level
+            )
+            if not holder:
+                label = hierarchy.label_for(manager_level)
+                subject_label = hierarchy.label_for(plan.subject_level)
+                return respond("not_found",
+                               f"I don't have a {label} on file for {subject_label.lower()} "
+                               f"'{plan.entity_value}'.", None)
+            managers = holder["managers"]
+            if len(managers) > 1:
+                label = hierarchy.label_for(manager_level)
+                joined = ", ".join(managers)
+                return respond("clarification",
+                               f"{hierarchy.label_for(plan.subject_level)} "
+                               f"'{plan.entity_value}' has more than one {label}: "
+                               f"{joined}. Which one did you mean?",
+                               None, options=managers)
+            manager_value = managers[0]
+
+        reports = hierarchy_service.get_scoped_reports(
+            db, manager_level, manager_value, plan.target_level
+        )
+        if reports is None:
+            label = hierarchy.label_for(manager_level)
+            target_label = hierarchy.label_for(plan.target_level)
+            return respond("unsupported",
+                           f"{target_label} does not sit beneath {label}, so there is "
+                           f"nothing to list.", None)
+        audit.record_formatter("format_scoped_reports_reply",
+                               f"plan.action='scoped_reports' — every {reports['target_level']!r} "
+                               f"beneath {manager_level} {manager_value!r}")
+        return respond("roster", format_scoped_reports_reply(reports), reports)
 
     if plan.action == "ancestry":
         # "The full hierarchy above X" — every level up, not one.
@@ -669,15 +713,22 @@ def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
     period = getattr(ir.time_range, "period", None)
     bundle = bundle_for(primary, period)
     conditions = _condition_metrics(ir)
-    # Ordered union, primary first. An unconditional ranking contributes
-    # no conditions, so `keys` is exactly what bundle_for returned and
-    # every existing leaderboard renders unchanged.
-    keys = _ordered_unique(([primary] if primary else []) + bundle + conditions)
+    # P0: every measure the turn NAMED, not only the one it ranks by. The
+    # IR carried one metric, so "connects and answered calls of all BCMs"
+    # lost a measure before it could ever be displayed; `metric_keys()`
+    # returns the primary plus the rest, and is just [primary] for an IR
+    # built before the field existed.
+    named = [k for k in ir.metric_keys() if k != primary]
+    # Ordered union, primary first. An unconditional single-measure
+    # ranking contributes neither conditions nor extra named measures, so
+    # `keys` is exactly what bundle_for returned and every existing
+    # leaderboard renders unchanged.
+    keys = _ordered_unique(([primary] if primary else []) + bundle + named + conditions)
     # The bundle alone still needs two measures to be worth a table. A
-    # CONDITION earns its column at one: the user named that metric, and
-    # "advisors with achievement below 50%" showing no achievement figure
-    # is the defect this exists to fix.
-    if not conditions and len(keys) < 2:
+    # CONDITION or a second NAMED measure earns its column at one: the
+    # user named that metric, and "advisors with achievement below 50%"
+    # showing no achievement figure is the defect this exists to fix.
+    if not conditions and not named and len(keys) < 2:
         return []
 
     for row in rows:
@@ -739,7 +790,10 @@ def _condition_metrics(ir) -> list[str]:
     """
     from app.llm.metric_ontology import METRICS
 
-    return [f.field for f in ir.filters if f.field in METRICS]
+    # filter_leaves(), not `filters`: a measure constrained inside an
+    # OR or a NOT is still a measure the user named, and its column
+    # belongs in the table for the same reason.
+    return [f.field for f in ir.filter_leaves() if f.field in METRICS]
 
 
 def _companion_value(db: Session, ir, row, key: str):

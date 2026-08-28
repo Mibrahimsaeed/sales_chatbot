@@ -316,3 +316,28 @@ etc
 
 
 
+
+
+
+
+
+OpenAI quota is exhausted → 429 insufficient_quota
+LLM-first is not fully implemented → rule planner still controls access.
+5 QueryIR capability gaps remain:
+hierarchy: direct_reports
+hierarchy: roster
+period comparison
+multi-part question
+decomposition/steps[]
+13/20 operations are still plan-only.
+The three multi-turn tests are now all passing, so don't touch that part.
+The immediate next step
+
+First fix the OpenAI API quota/billing.
+
+Your logs explicitly show:
+
+429 - insufficient_quota
+You exceeded your current quota, please check your plan and billing details.
+
+Until that is fixed, you cannot meaningfully evaluate LLM-first behavior. Your current 9 live failures are largely artificial because the LLM literally cannot respond.

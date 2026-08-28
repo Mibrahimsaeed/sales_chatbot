@@ -42,7 +42,11 @@ from app.llm import llm_client
 
 log = get_logger("llm.embeddings")
 
-PROVIDER = "openai"
+# The provider these slugs describe. Reads the configured value rather
+# than naming a vendor: `llm_provider` was declared in config.py during
+# the Ollama migration and then read by nothing, so the health endpoint
+# went on reporting "openai" after the switch.
+PROVIDER = settings.llm_provider
 
 # Stable slugs. Kept as constants so the health endpoint, tests, and any
 # alerting rule all reference the same strings.
@@ -55,6 +59,9 @@ REASON_TIMEOUT = "timeout"
 REASON_API_ERROR = "api_error"
 REASON_UNEXPECTED = "unexpected_error"
 REASON_DISABLED = "disabled_by_config"
+# No embedding model named for the active provider — a setup state, not a
+# provider fault, and worth its own slug so the log says which.
+REASON_NOT_CONFIGURED = "not_configured"
 REASON_EMPTY = "empty_response"
 
 
@@ -133,9 +140,30 @@ def classify_error(exc: BaseException) -> str:
     Imported lazily and defensively: the openai package's exception
     hierarchy is not something to hard-depend on at module import, and a
     classification failure must never be what takes the subsystem down."""
+    # Checked before any provider's exception hierarchy: this one is
+    # raised by llm_client itself and means "nobody configured a model",
+    # which no provider-specific branch below would recognise.
+    if isinstance(exc, llm_client.EmbeddingsNotConfigured):
+        return REASON_NOT_CONFIGURED
+
+    # Provider-agnostic transport failures. The Ollama client raises
+    # httpx errors directly rather than wrapping them, so a local daemon
+    # that is simply not running must classify as a connection error and
+    # not fall through to "unexpected".
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return REASON_TIMEOUT
+    if "Connect" in name:
+        return REASON_CONNECTION
+
+    # The OpenAI hierarchy is still mapped: these slugs remain correct if
+    # embeddings are pointed back at it, and the mapping is what
+    # test_embeddings_degradation.py pins. Imported lazily and
+    # defensively — a classification failure must never be what takes the
+    # subsystem down.
     try:
         import openai
-    except Exception:  # pragma: no cover — openai is a hard dependency in practice
+    except Exception:  # pragma: no cover — openai is an optional dependency now
         return REASON_UNEXPECTED
 
     # Quota exhaustion arrives as a RateLimitError whose body carries

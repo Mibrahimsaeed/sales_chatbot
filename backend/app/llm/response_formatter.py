@@ -256,6 +256,40 @@ def format_direct_reports_reply(reports: dict) -> str:
     return "\n".join(lines)
 
 
+def format_scoped_reports_reply(reports: dict) -> str:
+    """Everyone at a named level beneath someone, counted and named.
+
+    The transitive twin of format_direct_reports_reply. Kept separate for
+    one reason: that one says "report directly to", and saying it of a
+    subtree would be a false statement about the org — the 46 BCMs under
+    a Unit Head do not report directly to him. The wording is the only
+    difference; the population, the count and the preview rule are shared
+    through the same payload shape.
+    """
+    label = reports.get("level_label") or "Manager"
+    value = reports.get("value", "")
+    target_label = reports.get("target_level_label") or "report"
+    members = reports.get("members", [])
+    count = reports.get("count", len(members))
+
+    if not members:
+        return (f"I hold no {target_label} under {label} {value}.")
+
+    header = (f"{count} {target_label}{'' if count == 1 else 's'} "
+              f"under {label} {value}:")
+    lines = [header, ""]
+    for member in members[:ROSTER_PREVIEW_LIMIT]:
+        team = member.get("team")
+        suffix = f" — {team}" if team else ""
+        lines.append(f"• {member['name']}{suffix}")
+
+    remaining = count - min(count, ROSTER_PREVIEW_LIMIT)
+    if remaining > 0:
+        lines.append("")
+        lines.append(f"…and {remaining} more.")
+    return "\n".join(lines)
+
+
 def format_roster_reply(roster: dict) -> str:
     """A plain list of people — deliberately NOT the aggregate metrics an
     entity summary returns, because "all advisors in Blue Area" asks who
@@ -574,13 +608,41 @@ def _metric_label(metric_key: str | None) -> str:
 
 
 def _filters_summary(ir: QueryIR) -> str:
-    if not ir.filters:
+    if not ir.filter_leaves():
         return ""
-    parts = []
-    for f in ir.filters:
-        label = _metric_label(f.field) if f.field in METRICS else f.field
-        parts.append(f"{label} {f.operator} {f.value}")
+    parts = [_render_filter(f) for f in ir.filters]
+    # THE TREE IS RENDERED WITH ITS OPERATORS, not flattened into the
+    # comma list above. Commas read as AND, so listing the branches of an
+    # `or` beside the conjuncts would describe a narrower query than the
+    # one that ran — the reply would misreport its own scope.
+    if ir.filter_tree is not None:
+        rendered = _render_filter_group(ir.filter_tree)
+        if rendered:
+            parts.append(rendered)
     return " (filtered by " + ", ".join(parts) + ")" if parts else ""
+
+
+def _render_filter(f) -> str:
+    label = _metric_label(f.field) if f.field in METRICS else f.field
+    return f"{label} {f.operator} {f.value}"
+
+
+def _render_filter_group(group) -> str:
+    """A filter tree as readable boolean text, parenthesised where nested."""
+    from app.llm.query_ir import FilterGroup
+
+    rendered = [
+        _render_filter_group(child) if isinstance(child, FilterGroup) else _render_filter(child)
+        for child in group.children
+    ]
+    rendered = [r for r in rendered if r]
+    if not rendered:
+        return ""
+    if group.op == "not":
+        return f"NOT ({' AND '.join(rendered)})"
+    joiner = " OR " if group.op == "or" else " AND "
+    body = joiner.join(rendered)
+    return f"({body})" if len(rendered) > 1 else body
 
 
 def _shown_through(rows: list[dict], start_index: int) -> int:

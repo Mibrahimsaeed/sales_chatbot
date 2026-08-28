@@ -14,9 +14,11 @@ checks this regardless, but grounding it in the prompt cuts down on wasted
 round trips.
 """
 
-from app.llm import hierarchy, periods
+import re
+
+from app.llm import hierarchy, metric_aliases, periods
 from app.llm.ir_examples import render_examples
-from app.llm.metric_ontology import metric_catalog_for_prompt
+from app.llm.metric_ontology import METRICS, metric_catalog_for_prompt
 
 # Business phrases that don't literally name a metric but have one
 # conventional meaning in this domain. Anything NOT on this list and not a
@@ -96,25 +98,71 @@ def _role_vocabulary() -> str:
     return "\n".join(lines)
 
 
+def _operation_union() -> str:
+    """The operations the IR can express, from the one registry."""
+    from app.llm.operations import IR_EXPRESSIBLE
+
+    return " | ".join(f'"{name}"' for name in sorted(IR_EXPRESSIBLE))
+
+
 def _ir_schema() -> str:
     """Built at call time so a hierarchy change reaches the prompt without
     anyone remembering to edit prose."""
     levels = _level_union()
-    return f"""Return ONLY a JSON object, no other text, no markdown fences, matching this shape:
-{{
-  "intent": "leaderboard" | "comparison" | "lookup" | "trend" | "filtered_list" | "breakdown" | "clarify",
-  "subject_level": {levels},
-  "subjects": [ {{ "type": {levels}, "value": string, "match_confidence": number }} ],
-  "metric": {{ "key": string, "confidence": number }} | null,
-  "filters": [ {{ "field": string, "operator": "="|"!="|">"|">="|"<"|"<="|"in", "value": string|number, "confidence": number }} ],
-  "time_range": {{ "mode": "snapshot"|"compare", "period": {_period_union()}, "compare_to": string|null, "confidence": number }},
-  "sort": {{ "metric": string|null, "direction": "asc"|"desc" }},
-  "limit": number|null,
-  "group_by": {levels}|null,
-  "flat": boolean,
-  "overall_confidence": number,
-  "intent_confidence": number
-}}
+    # The field names, types and enums are NOT restated here. Ollama
+    # constrains decoding with llm_client.QUERY_IR_JSON_SCHEMA, which is
+    # sent alongside this prompt and lists all 15 fields as `required`, so
+    # the shape is already guaranteed by the grammar. Describing it again
+    # cost ~2,100 tokens a call to prevent mistakes the decoder cannot
+    # make. What remains below is only what a JSON schema cannot say:
+    # what the fields MEAN and when to use which.
+    return f"""Return ONLY a JSON object, no other text, no markdown fences.
+
+Emit every field: operation, intent, subject_level, subjects, metric, metrics, filters,
+filter_tree, time_range, sort, limit, group_by, flat, overall_confidence, intent_confidence.
+
+Valid operations: {_operation_union()}
+Valid levels: {levels}
+Valid periods: {_period_union()}
+
+OPERATION. "operation" names WHAT THE QUERY DOES, from the list above — it is the single field
+that decides the answer's shape. Set it and "intent" to the matching pair; when unsure, set
+"operation" to null and the intent alone is used.
+
+POPULATION vs RANKING. Use "population" when the question asks WHO and names no measure to
+rank by — "list the advisors excluding Blue Area", "advisors in Blue Area or DownTown". Set
+"metric" to null for it. Do NOT invent a measure to rank a population by: every measure is read
+through its own table, and joining one drops the people who have no row in it, so the list comes
+back shorter than the truth. Use "leaderboard" only when the user actually named something to
+rank by.
+
+TWO QUESTIONS IN ONE MESSAGE. If the message asks two INDEPENDENT things — "who is the top
+advisor in Blue Area and what is their team size" is a ranking and then a property of its winner
+— set "intent" to "clarify" and list what you could not combine in "missing". One structure
+answers one question, so answering half of it silently is worse than saying so. A single question
+that merely mentions two measures or two subjects is NOT this: "connects and answered calls of
+all BCMs" is one question.
+
+MULTIPLE MEASURES. "metric" is the ONE the answer is ranked and sorted by. "metrics" lists
+EVERY measure the question named, primary first — put both in it for "connects and answered
+calls of all BCMs". Leave "metrics" empty when the question names one measure.
+
+DIFFERENT MEASURES FOR DIFFERENT PEOPLE. When the question pairs a measure with each subject
+("Zainab's connects and Awais's answered calls"), set each subject's own "metric". Leave a
+subject's "metric" null when it shares the query's measure.
+
+BOOLEAN FILTERS. "filters" is AND-combined and is the right place for almost everything. Use
+"filter_tree" ONLY for a disjunction or an exclusion the flat list cannot express:
+  "BCMs in Blue Area or Downtown"  -> filter_tree {{"op":"or","children":[team=Blue Area, team=Downtown]}}
+  "advisors excluding Blue Area"   -> filter_tree {{"op":"not","children":[team=Blue Area]}}
+Both are combined with AND, so a query can carry conjuncts in "filters" and one disjunction in
+"filter_tree" at the same time. Nesting is allowed to three levels. Set it to null otherwise.
+
+GROUPING. "group_by" changes the level the rows are grouped and reported at, when that differs
+from subject_level. Leave it null unless the question genuinely asks for a different grouping.
+
+PERIOD COMPARISON. Set "compare_to" to the period being compared AGAINST ("this month vs last
+month" -> period MTD, compare_to the earlier one). Leave it null for a single-period question.
 
 Org hierarchy, top to bottom — each level CONTAINS the next:
 {_chain_description()}
@@ -172,6 +220,88 @@ Rules:
   or state the period ("this month", "ytd", "year to date", "last 3 months")."""
 
 
+_NAME_PREFIX = 4
+
+
+def _mentions_a_name_from(text: str, names: list[str]) -> bool:
+    """Could this message be referring to anyone on this list?
+
+    A name is only recognisable in the message if some word in the message
+    is that name's word — so if the message shares no name-word with the
+    list, the list cannot help parse this message and is pure prompt
+    weight. Compared on a 4-character prefix rather than equality so an
+    inexact spelling ("Muhamad" for "Muhammad") still pulls the list in;
+    entity_extractor's fuzzy matcher is what ultimately resolves it.
+    """
+    words = {w for w in re.findall(r"[a-z]{%d,}" % _NAME_PREFIX, text.lower())}
+    if not words:
+        return False
+    prefixes = {w[:_NAME_PREFIX] for w in words}
+    for name in names:
+        for part in re.findall(r"[a-z]{%d,}" % _NAME_PREFIX, name.lower()):
+            if part[:_NAME_PREFIX] in prefixes:
+                return True
+    return False
+
+
+def _person_gazetteer(label: str, names: list[str], text: str, already_grounded: bool) -> list[str]:
+    """One level's name list, included only when it can still do work.
+
+    The 269 known people are ~1,100 tokens on EVERY call, including the
+    many analytical queries that name no person at all ("top 5 advisors by
+    connects"). Two conditions retire it (category B — conditionally
+    required): the level is already grounded, so the resolved value is
+    stated verbatim a few lines below and the list can only restate it; or
+    the message shares no word with any name on it, so no name on it is
+    reachable from this message.
+
+    The list is never truncated to "likely" names — it goes in whole or
+    not at all, so a name the model can reach is never a name the model
+    was shown half of.
+    """
+    if not names or already_grounded:
+        return []
+    if not _mentions_a_name_from(text, names):
+        return []
+    return [f"Known {label}: {', '.join(names[:200])}"]
+
+
+def _metric_catalog_block(text: str) -> list[str]:
+    """The metric grounding, sized to what the deterministic layer already knows.
+
+    The catalog's 44 synonym lists are ~1,400 tokens — 63% of the block —
+    and they are metric_aliases.ALIASES rendered as prose: the SAME table
+    the deterministic resolver matches against before the LLM is ever
+    called. When resolve_all() already matched a phrase, restating the
+    table asks the model to redo, less reliably, a string match that has
+    already been done exactly (category D — already resolved
+    deterministically). When it matched nothing, the phrasing is novel and
+    the table is the model's only phrasing-to-key bridge, so it is sent in
+    full (category B — conditionally required).
+
+    Either way EVERY metric key, label and level list is sent, so the model
+    can still choose a metric the resolver never considered, and the match
+    is offered as evidence rather than an instruction — the LLM is the
+    primary planner and has to be able to disagree with the alias table
+    when the sentence means something else.
+    """
+    matched = metric_aliases.resolve_all(text)
+    if not matched:
+        return ["Metric catalog (the ONLY valid metric keys):", metric_catalog_for_prompt()]
+
+    terse = "\n".join(
+        f"- {m.key}: {m.label} (levels: {', '.join(m.entity_levels)})"
+        for m in METRICS.values()
+    )
+    found = "; ".join(f'"{m.phrase}" -> {m.metric}' for m in matched)
+    return [
+        "Metric catalog (the ONLY valid metric keys):",
+        terse,
+        f"Phrases in this message the deterministic alias resolver already matched: {found}. "
+        "Use these unless the sentence clearly means a different measure.",
+    ]
+
+
 def build_ir_prompt(
     text: str,
     known_teams: list[str],
@@ -188,19 +318,20 @@ def build_ir_prompt(
     # data load blowing up the prompt.
     teams_sample = ", ".join(known_teams[:200])
     companies = ", ".join(known_companies)
-    metric_catalog = metric_catalog_for_prompt()
 
     context_lines = [f"You are a query-understanding parser for a real-estate sales operations chatbot."]
     context_lines.append(f"Known teams: {teams_sample}")
     context_lines.append(f"Known companies: {companies}")
-    if known_unit_heads:
-        context_lines.append(f"Known unit heads: {', '.join(known_unit_heads[:200])}")
-    if known_zonal_heads:
-        context_lines.append(f"Known zonal heads: {', '.join(known_zonal_heads[:200])}")
-    if known_bcms:
-        context_lines.append(f"Known BCMs: {', '.join(known_bcms[:200])}")
-    context_lines.append("Metric catalog (the ONLY valid metric keys):")
-    context_lines.append(metric_catalog)
+    grounded_levels = {k for k, v in grounded_entities.items() if v and not k.startswith("_")}
+    for label, names, entity_key in (
+        ("unit heads", known_unit_heads or [], hierarchy.LEVEL_ENTITY_KEYS.get("unit_head")),
+        ("zonal heads", known_zonal_heads or [], hierarchy.LEVEL_ENTITY_KEYS.get("zonal_head")),
+        ("BCMs", known_bcms or [], hierarchy.LEVEL_ENTITY_KEYS.get("bcm")),
+    ):
+        context_lines.extend(
+            _person_gazetteer(label, names, text, entity_key in grounded_levels)
+        )
+    context_lines.extend(_metric_catalog_block(text))
     context_lines.append(BUSINESS_PHRASE_GLOSSARY)
 
     # Underscore-prefixed keys are META about the extraction (provenance

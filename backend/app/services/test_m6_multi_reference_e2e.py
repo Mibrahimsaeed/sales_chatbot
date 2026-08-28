@@ -40,7 +40,11 @@ def db(db_session, monkeypatch):
     monkeypatch.setattr(semantic_parser.settings, "nlu_mode", "llm_first")
     monkeypatch.setattr(narrative.settings, "nlu_narrative", False)
     import app.llm.llm_client as llm_client
-    monkeypatch.setattr(llm_client._client.chat.completions, "create",
+    # Patch the PROVIDER BOUNDARY, not a vendor SDK's call shape. The
+    # previous form named llm_client._client.chat.completions.create —
+    # four OpenAI internals — and every one of them broke when the client
+    # became Ollama, erroring 146 tests that were not about the provider.
+    monkeypatch.setattr(llm_client, "_chat",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("off")))
     yield db_session
     entity_extractor._cache["loaded_at"] = 0

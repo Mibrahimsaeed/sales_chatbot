@@ -22,6 +22,7 @@ import pytest
 
 from app.database.models import Advisor, Performance, PerformancePeriod, SalesFunnel
 from app.llm import advisor_resolver, conversation_memory, embeddings, entity_extractor
+from app.core.config import settings
 from app.llm import entity_linker, llm_client, narrative, semantic_parser
 from app.services.chat_service import handle_chat_message
 
@@ -189,7 +190,9 @@ def test_probe_never_raises_and_reports_status(monkeypatch):
     status = embeddings.probe()          # must not raise
     assert status.enabled is True
     assert status.ready is False
-    assert status.provider == "openai"
+    # The CONFIGURED provider, not a literal: hardcoding "openai" here is
+    # what made this test stale the moment inference moved to Ollama.
+    assert status.provider == settings.llm_provider
     assert status.reason == embeddings.REASON_AUTH
 
 
@@ -219,7 +222,7 @@ def test_health_endpoint_exposes_embedding_status(client, monkeypatch):
     body = client.get("/health").json()
     assert body["status"] == "ok", "an optional tier being down must not mark the service unhealthy"
     assert body["embeddings"]["ready"] is False
-    assert body["embeddings"]["provider"] == "openai"
+    assert body["embeddings"]["provider"] == settings.llm_provider
     assert body["embeddings"]["reason"] == "invalid_api_key"
 
 

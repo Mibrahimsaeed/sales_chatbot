@@ -39,6 +39,12 @@ _MIN_FUZZY_SYNONYM_LENGTH = 4
 # between them, not under both.
 _FUZZY_CUTOFF = 0.80
 
+# P0: the approximate tier is disabled — see the note at the end of
+# fuzzy_resolve_metric. Kept as a named switch rather than deleted so the
+# behaviour that was removed is still legible, and so a future change can
+# re-enable it deliberately with evidence rather than by accident.
+_APPROXIMATE_WIDENING_ENABLED = False
+
 
 def fuzzy_resolve_metric(text: str, cutoff: float = _FUZZY_CUTOFF) -> str | None:
     from app.llm import metric_aliases, token_match
@@ -76,10 +82,32 @@ def fuzzy_resolve_metric(text: str, cutoff: float = _FUZZY_CUTOFF) -> str | None
             if len(candidate) >= _MIN_FUZZY_SYNONYM_LENGTH:
                 synonym_to_key.setdefault(candidate, metric.key)
 
-    # typo'd synonyms ("atendance rate", "revnue") — fuzzy-scan the text
-    # windows against every synonym long enough for the score to mean
-    # something, best hit wins
-    hits = find_in_text(q, list(synonym_to_key), kind="metric", floor=cutoff)
-    if hits:
-        return synonym_to_key[hits[0][0]]
+    # P0 SAFETY: THE APPROXIMATE TIER IS OFF.
+    #
+    # Everything above this point is an EXACT lookup — the registry, or a
+    # token-aware synonym hit — and stays, because it is the same
+    # resolution metric_ontology.resolve_metric performs and it guesses
+    # nothing.
+    #
+    # What is disabled is the fuzzy scan that followed: it matched a
+    # metric name against ANY window of the sentence, so a measure only
+    # had to RESEMBLE part of the question. That turned "I don't know
+    # which measure this is" into a confident wrong one — the audit found
+    # "Unit Heads with team size > 5" widened onto `one_unit_ratio` from
+    # the stray word "Unit", then filtered on it and reported the result
+    # as an answer.
+    #
+    # A wrong measure is worse than no answer, because nothing downstream
+    # can tell it apart from a right one: the number is well-formed, the
+    # label matches the metric that was guessed, and the reply reads
+    # exactly like a correct one. Asking the user which measure they meant
+    # costs a turn; guessing costs their trust in every other number.
+    #
+    # The genuine typos this served ("revnue", "achievment") are a real
+    # loss, and the honest place to recover them is the LLM parser, which
+    # sees the whole sentence rather than an edit distance.
+    if _APPROXIMATE_WIDENING_ENABLED:  # pragma: no cover - off by default
+        hits = find_in_text(q, list(synonym_to_key), kind="metric", floor=cutoff)
+        if hits:
+            return synonym_to_key[hits[0][0]]
     return None
