@@ -11,6 +11,50 @@ import app.database.models  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_llm_provider(request, monkeypatch):
+    """No test reaches the real provider unless it is marked `live`.
+
+    WHY AT THE CREDENTIAL, not at a call site. `backend/.env` is loaded by
+    pydantic-settings on import, so a developer or CI runner with
+    OPENAI_API_KEY set turned every NLU_MODE="llm_first" test into a live,
+    billable, non-deterministic API call — silently. That is what made the
+    working-tree suite take 340s against HEAD's 20s, and it is why two
+    test files could disagree with themselves between runs.
+
+    Blanking the key is the honest offline state rather than a fake: it
+    makes `_openai()` raise ProviderNotConfigured, which is a condition
+    the codebase already models and degrades from end to end
+    (call_llm_structured -> None -> semantic_parser fallback). Nothing is
+    told what the model "would have said", so a test can still only pass
+    for a real reason.
+
+    It is also the widest possible seam. `_chat` and `create_embeddings`
+    are the two network call sites and both go through `_openai()`, so one
+    guard covers chat and embeddings together — and tests that install
+    their own fake client (test_openai_provider._use_openai) or patch
+    `_chat`/`call_llm_structured` are unaffected, because they never reach
+    the credential.
+
+    The client is cached in a module global, so it is reset on the way in
+    AND on the way out: without the second reset a `live` test would leave
+    a real, authenticated client behind for whatever ran next.
+    """
+    from app.llm import llm_client
+
+    if "live" in request.keywords:
+        # A live test gets the real credential — that is its whole point.
+        llm_client._reset_provider_clients_for_tests()
+        yield
+        llm_client._reset_provider_clients_for_tests()
+        return
+
+    llm_client._reset_provider_clients_for_tests()
+    monkeypatch.setattr(llm_client.settings, "openai_api_key", "", raising=False)
+    yield
+    llm_client._reset_provider_clients_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _no_live_semantic_retrieval(monkeypatch):
     """Part 8: semantic_retrieval.py is a real network call site
     (embeddings), but only test_semantic_retrieval.py should ever exercise

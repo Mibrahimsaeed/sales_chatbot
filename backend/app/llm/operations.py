@@ -66,14 +66,14 @@ _ALL: tuple[Operation, ...] = (
     # ---- analytical: the IR expresses these, and the LLM leads ----
     Operation("leaderboard", "leaderboard", "leaderboard", "leaderboard", True,
               "rank subjects at one level by one measure"),
-    Operation("filtered_list", None, "filtered_list", "breakdown", True,
+    Operation("filtered_list", None, "filtered_list", "filtered_list", True,
               "the members matching a constraint — parser-only, no scorer builds it"),
     # WHO, with no measure. Distinct from `roster`, which is plan-served
     # and takes a single entity filter: this one carries the IR's full
     # filter machinery, so "advisors excluding Blue Area" or "in A or B"
     # is expressible — and it joins no fact table, so the population is
     # not reduced to the rows that happen to have one.
-    Operation("population", None, None, "breakdown", True,
+    Operation("population", None, None, "population", True,
               "the members matching a constraint, with no ranking measure"),
     Operation("comparison", "comparison", "comparison", "comparison", True,
               "several named subjects set side by side"),

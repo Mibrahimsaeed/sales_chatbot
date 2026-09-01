@@ -53,6 +53,8 @@ ResponseMode = Literal[
     "leaderboard",        # a ranking over several subjects
     "comparison",         # subjects set side by side
     "breakdown",          # a group split into its parts
+    "filtered_list",      # the members matching a constraint, ranked by a measure
+    "population",         # the members matching a constraint, with no measure
     "trend",              # movement over time
     "profile",            # everything about one subject
     "hierarchy_summary",  # a group's headline figures
@@ -84,6 +86,24 @@ DISPATCH_MODES: dict[str, str] = {
     "leaderboard": "leaderboard",
     "comparison": "comparison",
     "breakdown": "breakdown",
+    # SEPARATE WIRE TYPES, and the separation is the point. Both of these
+    # used to report as "breakdown", which already meant "a group split
+    # into its parts" and carries a NESTED OBJECT (level_label, teams[],
+    # mtd_cleared) built by hierarchy_service.get_level_breakdown. These
+    # two carry a flat ARRAY of rows instead.
+    #
+    # One wire type over two incompatible data shapes is not something a
+    # client can consume: the frontend's BreakdownCard reads b.teams and
+    # b.level_label, got an array, rendered an empty shell, and the reply
+    # text was suppressed because a card was assumed present — so a fully
+    # correct backend answer displayed as a blank message.
+    #
+    # `population` is kept distinct from `filtered_list` because it has NO
+    # measure: rendering it as a ranking would print "no data" beside
+    # every name, which is the regression plan_response's own comment
+    # below warns about.
+    "filtered_list": "filtered_list",
+    "population": "population",
     "profile": "advisor",
     "advisor_metric": "advisor_metric",
     "hierarchy_summary": "team",
@@ -110,6 +130,8 @@ _MODE_TO_SHAPE: dict[str, Shape] = {
     "leaderboard": "ranked_list",
     "comparison": "comparison_table",
     "breakdown": "filtered_table",
+    "filtered_list": "filtered_table",
+    "population": "filtered_table",
     "no_data": "empty",
 }
 
@@ -263,17 +285,31 @@ def plan_response(ir: QueryIR, rows: list[dict]) -> ResponsePlan:
     # there is no metric, which is exactly right here. Without this the
     # rows fell through to the leaderboard and printed "no data" beside
     # every name.
+    # A HIERARCHY READ returns PEOPLE beneath a subject with no measure
+    # to rank them by — the same answer shape a population has. Without
+    # this it fell through to the leaderboard branch and printed "no
+    # data" beside every name, which is the regression the population
+    # branch below exists to prevent.
+    if ir.is_hierarchy_read():
+        return ResponsePlan(
+            shape="filtered_table", show_insights=False, show_explanation=False,
+            mode="population",
+            why="the query enumerates one level beneath a subject, with no "
+                "measure to rank by",
+        )
+
     if operation == "population":
         return ResponsePlan(
             shape="filtered_table", show_insights=False, show_explanation=False,
-            mode="breakdown",
+            mode="population",
             why="the query asks WHO, with no measure to rank by",
         )
 
     if operation == "filtered_list":
         return ResponsePlan(
             shape="filtered_table", show_insights=len(rows) >= 3,
-            mode="breakdown", why="the query asks for the members matching a constraint",
+            mode="filtered_list",
+            why="the query asks for the members matching a constraint",
         )
 
     # ---- leaderboard vs a single value -------------------------------

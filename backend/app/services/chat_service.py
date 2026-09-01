@@ -217,7 +217,13 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
     if resolution.kind == "clarify":
         return respond("clarification", resolution.clarify_message, None, options=resolution.clarify_options or [])
 
-    if resolution.kind == "ir" and resolution.ir.intent == "breakdown":
+    # THE AUTHORITATIVE FIELD, not the legacy one. This read `ir.intent`
+    # directly — the last consumer that did — so an IR whose `operation`
+    # was correct could still be diverted here by a stale or mismatched
+    # intent, discarding a metric the parser had resolved correctly and
+    # answering with an entity summary instead. Every other consumer goes
+    # through resolved_operation(); this one now does too.
+    if resolution.kind == "ir" and resolution.ir.resolved_operation() == "breakdown":
         # Never a metric-ranking operation (no compile_and_run/count_ir/
         # pagination) — ir_validator.validate_ir guarantees >= 1 grounded
         # subject before this IR is ever valid, so subjects[0] is safe here.

@@ -112,10 +112,35 @@ class TestCapabilityGate:
         assert nlu_pipeline._names_several_entities({"teams": ["Alpha", "Bravo"]})
         assert not nlu_pipeline._names_several_entities({"teams": ["Alpha"]})
 
-    def test_plan_only_is_derived_not_restated(self):
-        """An action added to _RULE_BASED_ACTIONS cannot fall out of the
-        capability reasoning by being forgotten here."""
-        assert nlu_pipeline._PLAN_ONLY_ACTIONS == frozenset(nlu_pipeline._RULE_BASED_ACTIONS)
+    def test_plan_only_is_derived_from_the_operation_registry(self):
+        """The capability gate reads the one place that RECORDS the
+        capability.
+
+        It used to be derived from _RULE_BASED_ACTIONS, a tuple in
+        nlu_pipeline — which is a second copy of a fact operations.py
+        already owns. The two agreed, and nothing forced them to: marking
+        an operation IR-expressible in the registry would not route it to
+        the LLM, and no test would fail.
+
+        `comparison` is the one deliberate addition. The registry marks
+        it IR-expressible and a single-metric comparison genuinely is,
+        but a comparison naming NO measure or SEVERAL answers with the
+        multi-KPI table QueryIR cannot hold — _is_rule_based() owns that
+        split and runs first.
+        """
+        from app.llm import operations
+
+        expected = frozenset(
+            name for name, op in operations.OPERATIONS.items()
+            if not op.expressible_in_ir
+        ) | {"comparison"}
+        assert nlu_pipeline._PLAN_ONLY_ACTIONS == expected
+
+        # Every action the rule planner can serve is still accounted for,
+        # so the switch of source cannot have dropped one.
+        unaccounted = (frozenset(nlu_pipeline._RULE_BASED_ACTIONS)
+                       - nlu_pipeline._PLAN_ONLY_ACTIONS)
+        assert not unaccounted, f"rule-servable but not plan-only: {sorted(unaccounted)}"
 
 
 # ================================================== the LLM leads

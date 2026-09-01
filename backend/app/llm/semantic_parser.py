@@ -25,6 +25,7 @@ import re
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.core import tracing
 from app.core.config import settings
 from app.llm import conversation_memory, hierarchy, semantic_retrieval
 from app.llm.entity_extractor import (
@@ -34,7 +35,7 @@ from app.llm.entity_extractor import (
 from app.llm.fallback_reasoning import fuzzy_resolve_metric
 from app.llm.ir_validator import validate_ir
 from app.llm.llm_client import call_llm_structured, QUERY_IR_JSON_SCHEMA
-from app.llm.prompt_builder import build_ir_prompt
+from app.llm.prompt_builder import build_ir_prompt, prompt_fingerprint
 from app.llm.query_ir import QueryIR, plan_to_ir
 from app.llm.query_planner import QueryPlan, build_query_plan
 from app.core.logger import get_logger
@@ -71,7 +72,13 @@ class ParseOutcome:
 
 def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | None) -> QueryIR | None:
     """One LLM round trip -> QueryIR, or None on any failure (no key,
-    provider error, schema-invalid output)."""
+    provider error, schema-invalid output).
+
+    Records the attempt to the request trace either way — see
+    tracing.record_llm_parse. "The model was asked and could not answer"
+    and "the model was never asked" produce the same absent IR here, and
+    without this they produced the same absent trace too.
+    """
     prior_ir = conversation_memory.get(session_id)
     prompt = build_ir_prompt(
         text,
@@ -84,14 +91,34 @@ def _call_llm_for_ir(text: str, entities: dict, db: Session, session_id: str | N
         known_zonal_heads=get_known_zonal_heads(db),
         known_bcms=get_known_bcms(db),
     )
+    def _trace(succeeded: bool, reason: str | None = None) -> None:
+        tracing.record_llm_parse(
+            attempted=True,
+            succeeded=succeeded,
+            model=settings.openai_model,
+            prompt_hash=prompt_fingerprint(),
+            prompt_tokens=len(prompt) // 4,
+            fallback_used=not succeeded,
+            fallback_reason=reason,
+        )
+
     raw = call_llm_structured(prompt, QUERY_IR_JSON_SCHEMA, schema_name="query_ir")
+    # The model's output BEFORE pydantic and before validate_ir touches
+    # it. This is the only point where "the LLM got it wrong" and "we
+    # lost it afterwards" are still distinguishable — every later log
+    # shows an IR that something downstream may already have rewritten.
+    log.info("RAW LLM QueryIR: %s", raw)
     if not raw:
+        _trace(False, "provider returned nothing (unreachable, timeout, or refused)")
         return None
     try:
-        return QueryIR.model_validate(raw)
+        ir = QueryIR.model_validate(raw)
     except ValidationError as e:
         log.warning(f"LLM returned a QueryIR that failed validation: {e}")
+        _trace(False, f"schema validation failed: {type(e).__name__}")
         return None
+    _trace(True)
+    return ir
 
 
 # Plan actions the rule planner can turn into a complete QueryIR.
@@ -127,7 +154,8 @@ def _rule_based_ir(text: str, entities: dict, plan: QueryPlan) -> QueryIR | None
     return None
 
 
-def _finish(ir: QueryIR, db: Session, session_id: str | None, used_llm: bool) -> ParseOutcome:
+def _finish(ir: QueryIR, db: Session, session_id: str | None, used_llm: bool,
+            entities: dict | None = None) -> ParseOutcome:
     """Validate and return. Deliberately does NOT store the IR.
 
     Phase 4: this used to write conversation_memory itself, making four
@@ -137,7 +165,13 @@ def _finish(ir: QueryIR, db: Session, session_id: str | None, used_llm: bool) ->
     differ. nlu_pipeline.resolve() owns conversation state now and stores
     the merged IR once, after conversation_context has run.
     """
-    result = validate_ir(ir, db)
+    # THE EXTRACTOR'S FINDINGS TRAVEL WITH THE IR. They already reach the
+    # model as prompt text, but text is advice: for "revenue of AMD year
+    # to date" the prompt said AMD was a team and the model typed it
+    # `company` anyway. Handing the same dict to the validator is what
+    # makes deterministic grounding a constraint rather than a suggestion
+    # — see ir_validator._authoritative_levels.
+    result = validate_ir(ir, db, entities=entities)
     result.ir.nlu_mode = settings.nlu_mode
     return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=used_llm)
 
@@ -163,7 +197,7 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
     if settings.nlu_mode == "llm_first":
         ir = _call_llm_for_ir(text, entities, db, session_id)
         if ir is not None:
-            return _finish(ir, db, session_id, used_llm=True)
+            return _finish(ir, db, session_id, used_llm=True, entities=entities)
         # P0 SAFETY: do not degrade a question the plan cannot hold.
         #
         # plan_to_ir builds from ONE metric and a flat conjunction, so
@@ -178,7 +212,7 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
             return ParseOutcome(ir=None, missing=["understanding"], used_llm=False)
         degraded = _rule_based_ir(text, entities, plan)
         if degraded is not None:
-            return _finish(degraded, db, session_id, used_llm=False)
+            return _finish(degraded, db, session_id, used_llm=False, entities=entities)
         return ParseOutcome(ir=None, missing=["intent"], used_llm=False)
 
     # ---- rules_first: pre-inversion behavior, kept as the rollback path ----
@@ -195,13 +229,14 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
     # sides. Without the exemption every comparison would take an LLM
     # round trip to arrive at the IR the rule planner already had.
     if plan.action in _IR_ACTIONS and (plan.action == "comparison" or not compound):
-        return _finish(plan_to_ir(plan, entities), db, session_id, used_llm=False)
+        return _finish(plan_to_ir(plan, entities), db, session_id, used_llm=False,
+                       entities=entities)
 
     # 2. widen via fuzzy metric match before reaching for the LLM
     if plan.action == "unresolved" and not compound:
         degraded = _rule_based_ir(text, entities, plan)
         if degraded is not None:
-            return _finish(degraded, db, session_id, used_llm=False)
+            return _finish(degraded, db, session_id, used_llm=False, entities=entities)
 
     # 3. LLM semantic parser — compound query, or nothing else worked
     ir = _call_llm_for_ir(text, entities, db, session_id)
@@ -212,4 +247,4 @@ def parse(text: str, entities: dict, db: Session, session_id: str | None,
             return ParseOutcome(ir=None, missing=["intent"], used_llm=False)
         ir = plan_to_ir(plan, entities)
 
-    return _finish(ir, db, session_id, used_llm=True)
+    return _finish(ir, db, session_id, used_llm=True, entities=entities)

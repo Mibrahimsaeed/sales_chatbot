@@ -16,8 +16,16 @@ const keysOf = (rows) => Object.keys(cellsOf(rows[0]) || {})
 
 export default function LeaderboardCard({
   rows, metric, totalCount, hasMore, onShowMore, isLoadingMore,
+  title = 'Leaderboard',
 }) {
   if (!rows || !rows.length) return null
+
+  // A POPULATION carries names with no measure — "who matches this",
+  // with nothing to rank by. Rendering a value column for it would print
+  // "-" beside every name, which is the exact regression the backend's
+  // response planner warns about. Detected from the data rather than
+  // from the response type, so any valueless row set is handled.
+  const hasValues = rows.some((r) => r.value !== null && r.value !== undefined)
 
   // Part 8 (pagination): "Showing X of Y" once the result was actually
   // truncated; the plain "{N} shown" tag otherwise — a <=15 result never
@@ -46,7 +54,7 @@ export default function LeaderboardCard({
     return (
       <div className="card">
         <div className="card-title">
-          Leaderboard <span className="tag">{countTag}</span>
+          {title} <span className="tag">{countTag}</span>
         </div>
         {rows.map((item, i) => (
           <div className="leader" key={item.wid ?? item.name ?? i}>
@@ -55,7 +63,9 @@ export default function LeaderboardCard({
               <div className="nm">{item.name}</div>
               <div className="sub">{[item.company, item.team].filter(Boolean).join(' · ')}</div>
             </div>
-            <div className="val">{formatMetricValue(metric, item.value)}</div>
+            {hasValues && (
+              <div className="val">{formatMetricValue(metric, item.value)}</div>
+            )}
           </div>
         ))}
         {showMore}
@@ -68,7 +78,7 @@ export default function LeaderboardCard({
   return (
     <div className="card">
       <div className="card-title">
-        Leaderboard <span className="tag">{countTag}</span>
+        {title} <span className="tag">{countTag}</span>
       </div>
       {/* Scrolls sideways rather than wrapping: three measures beside a
           long name is wider than a narrow chat column, and wrapping a

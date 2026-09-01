@@ -341,3 +341,307 @@ Your logs explicitly show:
 You exceeded your current quota, please check your plan and billing details.
 
 Until that is fixed, you cannot meaningfully evaluate LLM-first behavior. Your current 9 live failures are largely artificial because the LLM literally cannot respond.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Task: Surgical fix to `prompt_builder.py` semantic guardrails
+
+We need to make a **small, targeted correction** to `app/llm/prompt_builder.py`.
+
+This is a sensitive semantic layer. **Do not redesign the architecture, rewrite the prompt, change routing, change QueryIR schema, change grounding, change validator behavior, or alter unrelated hierarchy semantics.**
+
+The Phase 5 audit identified a regression caused by the prompt builder: two previously protected hierarchy fields (`target_level` / `subject_of`) can now become populated for ordinary metric queries.
+
+### Primary objective
+
+Restore the missing semantic guardrails so the LLM does NOT invent hierarchy-read semantics for ordinary entity metric queries.
+
+The intended distinction is:
+
+```text
+"answered calls percentage for Blue Area"
+```
+
+is a metric query about Blue Area.
+
+It is NOT automatically a hierarchy read.
+
+Therefore it must not acquire hierarchy fields merely because Blue Area is a known organizational entity.
+
+Conceptually:
+
+```text
+subject = Blue Area
+metric = answered_calls_rate
+
+subject_of = null
+target_level = null
+relation = null
+```
+
+unless the user's actual wording establishes a hierarchy relationship/read.
+
+---
+
+## 1. Restore the NULL guardrail
+
+Inspect `_ir_schema()` and restore an explicit, strong instruction covering:
+
+* `subject_of`
+* `target_level`
+* `relation`
+
+These fields must remain `null` unless the user's wording actually expresses a hierarchy scope/read or hierarchy relationship.
+
+Examples that legitimately justify these fields include:
+
+```text
+advisors under Faisal
+BCMs under Faisal
+which zonals are under Faisal
+who reports directly to Faisal
+which advisors directly report to Faisal
+```
+
+Examples that do NOT justify populating them merely because the subject is organizational:
+
+```text
+revenue of Blue Area
+connects of AMD
+answered calls percentage for Blue Area
+meeting rate for Blue Area
+performance of Team AMD
+```
+
+Do not make the rule keyword-only. The LLM must interpret the COMPLETE semantic structure.
+
+The key rule is:
+
+> A named organizational entity being the subject of a metric query does not by itself create `subject_of`, `target_level`, or `relation`.
+
+---
+
+## 2. Protect ordinary metric queries
+
+Add explicit examples demonstrating the distinction.
+
+At minimum include examples equivalent to:
+
+```text
+"what is the answered calls percentage for Blue Area"
+```
+
+and
+
+```text
+"what is the meeting rate for Blue Area"
+```
+
+These must remain ordinary metric/entity queries and must not acquire spurious hierarchy-read fields.
+
+Do NOT hard-code Blue Area as a special case.
+
+The examples must teach the general semantic distinction.
+
+---
+
+## 3. Clarify hierarchy-read activation
+
+Strengthen the existing hierarchy instructions rather than replacing them.
+
+Hierarchy fields should be populated when the query actually asks for a hierarchy relationship/scope, for example:
+
+```text
+"advisors under Faisal"
+"BCMs under Faisal"
+"teams under Faisal"
+"who reports directly to Faisal"
+```
+
+For such queries, preserve the existing semantics:
+
+```text
+subject_of = scope person's level
+target_level = requested answer level
+relation = direct/subtree
+```
+
+Do NOT change the existing definitions of:
+
+* `under`
+* `direct`
+* `subtree`
+* `subject_level`
+* `subject_of`
+* `target_level`
+
+unless a change is strictly necessary to restore the guardrail.
+
+---
+
+## 4. Add the required "team under person" semantic clarification
+
+Add a carefully worded rule covering this ambiguity:
+
+When the user uses population/hierarchy wording such as:
+
+```text
+"team under Person A"
+```
+
+do NOT automatically interpret `team` as a literal Team entity named after Person A.
+
+In this hierarchy context, the phrase means the requested population/entity relationship within Person A's organizational scope.
+
+The requested target level must be determined from the user's wording and the existing hierarchy semantics.
+
+Preserve the existing rule:
+
+* `under` = subtree/broad scope
+* `directly reporting` = strict direct relationship
+
+Do not change the meaning of ordinary phrases such as:
+
+```text
+"Team AMD"
+"AMD's revenue"
+"revenue for AMD"
+```
+
+Those must continue to resolve according to existing entity grounding and subject semantics.
+
+This is a semantic clarification, **not a special-case parser rule**.
+
+---
+
+## 5. Do NOT weaken deterministic grounding
+
+The existing code says:
+
+> "Entities already found by rule-based grounding (use these, don't re-derive)"
+
+Do not remove this.
+
+Do not change the deterministic grounding mechanism.
+
+Do not replace high-confidence grounding with prompt-only behavior.
+
+The LLM prompt should provide semantic guidance, while the existing grounding/validator layers remain authoritative according to the Phase 5 architecture.
+
+---
+
+## 6. Do NOT introduce broad changes
+
+Do NOT:
+
+* rewrite `BUSINESS_MODEL`
+* restructure the entire prompt
+* modify QueryIR fields
+* modify the grammar
+* modify routing
+* modify `_fill_pending_slot`
+* modify `_reground_scope_subject`
+* modify validator repair logic
+* modify hierarchy registry
+* add special cases for individual names
+* hard-code `Blue Area`
+* hard-code `AMD`
+* change metric grounding
+* change operation selection globally
+* change existing direct-reporting semantics
+
+Only make the minimum prompt-builder changes necessary.
+
+---
+
+## 7. Tests
+
+First inspect the existing Phase 5 tests and prompt-builder tests.
+
+Add regression coverage if there is an appropriate existing test location.
+
+At minimum verify that the prompt generated for:
+
+```text
+what is the answered calls percentage for Blue Area
+```
+
+contains the restored semantic guardrail/examples and does not contain contradictory instructions.
+
+If there are tests that exercise the actual LLM parse, add/extend them only if practical and consistent with the existing test architecture.
+
+Also ensure existing hierarchy examples/tests remain unchanged and passing.
+
+---
+
+## 8. Validate against the Phase 5 regression
+
+Run the smallest relevant test set first.
+
+Then run the existing prompt/LLM tests.
+
+Specifically verify that the two Phase 5 regression cases are addressed:
+
+```text
+what is the answered calls percentage for Blue Area
+what is the meeting rate for Blue Area
+```
+
+The desired result is that these remain ordinary metric queries and do not receive spurious:
+
+```text
+target_level
+subject_of
+relation
+```
+
+---
+
+## 9. Important: inspect before editing
+
+Before changing anything:
+
+1. Inspect the current `prompt_builder.py`.
+2. Inspect the Phase 5 test(s) covering the two regressions.
+3. Identify exactly which guardrail was removed by the external edit.
+4. Compare the current prompt behavior with the Phase 5 report.
+5. Make the smallest possible patch.
+
+Do not assume the report is sufficient; verify the actual current code and tests.
+
+---
+
+## Exit condition
+
+Stop when:
+
+1. The missing NULL guardrail is restored.
+2. Ordinary metric/entity queries do not acquire spurious hierarchy semantics.
+3. The `"team under Person A"` semantic distinction is explicitly represented.
+4. Existing hierarchy semantics remain intact.
+5. Relevant regression tests pass.
+6. No unrelated files/architecture were changed.
+
+Finally report:
+
+* exact files changed
+* exact semantic guardrails added/restored
+* tests run and results
+* whether the two Phase 5 regression cases now pass
+
+**Do not proceed to Phase 6. Stop after this task.**

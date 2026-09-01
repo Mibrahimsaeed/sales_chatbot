@@ -27,13 +27,32 @@ from app.services import chat_service
 # Phase 17 named the Answered Calls tab authoritative for the connects
 # family. Seeding the CCMC columns instead is how a fixture ends up
 # asserting against a metric that reads 0.
+# `answered` IS A COUNT; `answered_rate` IS A PERCENTAGE.
+#
+# Both end up in the same column, because answered_calls_rate is derived
+# from the count — but the DENOMINATOR is the number of working days
+# elapsed this month, which moves every day. A test that filters on
+# `answered_calls_rate < 50` and seeds a raw count is therefore pinned to
+# whatever the calendar said on the day it was written: the counts here
+# (38, 44, 10, 20) sat comfortably under 50% through most of a month and
+# read as 380%, 440%, 100% and 200% on its first working day, at which
+# point four tests selected nobody.
+#
+# Naming the two units separately is what stops the next fixture making
+# the same mistake silently.
 def _seed(db, wid, name, *, cleared=None, target=100, connects=None,
-          answered=None, bcm=None, adv_name=None):
+          answered=None, answered_rate=None, bcm=None, adv_name=None):
     db.add(Advisor(wid=wid, name=adv_name or name, team="Alpha", company="IMARAT",
                    management_lead=bcm, in_master_sheet=True))
     if cleared is not None:
         db.add(Performance(wid=wid, period=PerformancePeriod.MTD,
                            cleared=cleared, target=target))
+    if answered_rate is not None:
+        from app.llm import working_days
+
+        # Invert the metric's own formula, so the RATE is the same on
+        # every date. Float column, so the conversion is exact.
+        answered = answered_rate * working_days.month_to_date() / 10.0
     if connects is not None or answered is not None:
         db.add(Calls(wid=wid, connects_mtd=connects or 0,
                      answered_calls_mtd=answered or 0))
@@ -79,9 +98,9 @@ def test_one_percentage_condition_shows_that_percentage_column(db_session):
 
 # ---------------------------------------------------------------- 2
 def test_two_percentage_conditions_show_both_columns(db_session):
-    _seed(db_session, 1, "Person A", cleared=42.3, answered=38)
-    _seed(db_session, 2, "Person B", cleared=35.7, answered=44)
-    _seed(db_session, 3, "Passes Neither", cleared=95.0, answered=900)
+    _seed(db_session, 1, "Person A", cleared=42.3, answered_rate=14.6)
+    _seed(db_session, 2, "Person B", cleared=35.7, answered_rate=16.9)
+    _seed(db_session, 3, "Passes Neither", cleared=95.0, answered_rate=346.0)
     db_session.commit()
 
     ir = _ir(metric=MetricRef(key="achievement_pct"),
@@ -212,7 +231,7 @@ def test_displayed_value_matches_the_metric_engine(db_session):
 
 
 def test_advisor_column_matches_the_wid_keyed_engine(db_session):
-    _seed(db_session, 7, "Solo", cleared=42.3, answered=38)
+    _seed(db_session, 7, "Solo", cleared=42.3, answered_rate=14.6)
     db_session.commit()
 
     ir = _ir(metric=MetricRef(key="achievement_pct"),
@@ -363,8 +382,8 @@ def test_duplicate_advisor_names_are_valued_by_wid(db_session):
     """Names are not identifiers (238 duplicate-name groups in
     production). Two people called "Same Name" with different figures
     must each get their own."""
-    _seed(db_session, 1, "x", adv_name="Same Name", cleared=40.0, answered=10)
-    _seed(db_session, 2, "x", adv_name="Same Name", cleared=30.0, answered=20)
+    _seed(db_session, 1, "x", adv_name="Same Name", cleared=40.0, answered_rate=3.8)
+    _seed(db_session, 2, "x", adv_name="Same Name", cleared=30.0, answered_rate=7.7)
     db_session.commit()
 
     ir = _ir(metric=MetricRef(key="achievement_pct"),
@@ -389,8 +408,8 @@ def test_duplicate_advisor_names_are_valued_by_wid(db_session):
 
 # ------------------------------------------------- Change 2: formatting
 def test_filtered_list_renders_the_columns_as_a_table(db_session):
-    _seed(db_session, 1, "Person A", cleared=42.3, answered=38)
-    _seed(db_session, 2, "Person B", cleared=35.7, answered=44)
+    _seed(db_session, 1, "Person A", cleared=42.3, answered_rate=14.6)
+    _seed(db_session, 2, "Person B", cleared=35.7, answered_rate=16.9)
     db_session.commit()
 
     ir = _ir(metric=MetricRef(key="achievement_pct"),

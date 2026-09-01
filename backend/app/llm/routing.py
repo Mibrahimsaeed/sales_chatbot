@@ -461,12 +461,29 @@ def validate_route(ir) -> Optional[str]:
     which reads to the user as "no data" rather than "that isn't a
     measure I have".
     """
+    from app.llm.ir_validator import _NON_METRIC_FILTER_FIELDS
     from app.llm.metric_ontology import METRICS
 
-    metric_key = (ir.metric.key if ir.metric else None) or (
-        ir.sort.metric if ir.sort else None
-    )
-    if metric_key and metric_key not in METRICS:
+    # EVERY measure the IR names, not just the primary two fields. The
+    # narrower read let an invented key reach the compiler unchallenged
+    # whenever it sat in `metrics[]` or in a filter — the compiler then
+    # found no binding and returned an empty result, which reads as "no
+    # data" rather than "that isn't a measure I have". That is the same
+    # gap this gate exists to close, one field over.
+    candidates = list(ir.metric_keys())
+    if ir.sort and ir.sort.metric:
+        candidates.append(ir.sort.metric)
+    candidates.extend(f.field for f in ir.filter_leaves())
+
+    for metric_key in dict.fromkeys(candidates):
+        # A filter field may legitimately be an ENTITY level rather than
+        # a measure ("team = Blue Area"); those are validated separately
+        # by ir_validator against the hierarchy, so only reject a name
+        # that is neither.
+        if not metric_key or metric_key in METRICS:
+            continue
+        if metric_key in _NON_METRIC_FILTER_FIELDS:
+            continue
         return (
             f"I don't have a measure called \"{metric_key}\". Ask me for one of "
             "the metrics I track by name, and I'll pull it for whoever you need."

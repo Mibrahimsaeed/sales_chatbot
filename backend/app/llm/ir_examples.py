@@ -1,284 +1,1080 @@
 """
 Few-shot examples for the LLM semantic parser (P2 of the NLU rework).
+
 Kept in their own module — not inline strings in prompt_builder — so
 test_ir_examples.py can validate every example against the real QueryIR
 model and ir_validator, meaning an example can never silently drift from
 the schema the model is being asked to produce.
 
-Entity names used here (Blue Area, Downtown, Graana) are fictional
-few-shot scaffolding — the prompt separately grounds the model in the
-REAL team/company gazetteer, and ir_validator re-grounds every subject
+Entity names used here (Blue Area, Downtown, Graana, etc.) are fictional
+few-shot scaffolding. The prompt separately grounds the model in the REAL
+team/company/person gazetteers, and ir_validator re-grounds every subject
 regardless of what the model saw here.
 
-Each example: utterance, optional prior_ir (for the follow-up-patch
-example), the expected IR dict (exactly the keys of the strict output
-schema in llm_client.QUERY_IR_JSON_SCHEMA), and expect_valid=False for
-the deliberately-ambiguous example whose low-confidence filter is
-SUPPOSED to trip the validator into a clarification.
+The examples deliberately cover the compositional QueryIR shapes that the
+LLM must learn to produce. They are semantic templates, NOT query-specific
+answer mappings.
+
+IMPORTANT:
+- Do not add production/test queries merely because they fail.
+- Examples must teach reusable semantic structures.
+- Never encode query -> answer mappings here.
 """
 
 EXAMPLES: list[dict] = [
     {
-        # the canonical multi-filter + explicit-sort query
-        "utterance": "Show Graana advisors with attendance above 90% and achievement above 80%, sorted by meetings",
+        # ---------------------------------------------------------------
+        # MULTI-FILTER + EXPLICIT SORT
+        # ---------------------------------------------------------------
+        "utterance": (
+            "Show Graana advisors with attendance above 90% and "
+            "achievement above 80%, sorted by meetings"
+        ),
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "total_meetings", "confidence": 0.95},
-            "filters": [
-                {"field": "company", "operator": "=", "value": "Graana", "confidence": 0.95},
-                {"field": "attendance_rate", "operator": ">", "value": 90, "confidence": 0.9},
-                {"field": "achievement_pct", "operator": ">", "value": 80, "confidence": 0.9},
+            "metric": {
+                "key": "total_meetings",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "attendance_rate",
+                    "confidence": 0.9,
+                },
+                {
+                    "key": "achievement_pct",
+                    "confidence": 0.9,
+                },
+                {
+                    "key": "total_meetings",
+                    "confidence": 0.95,
+                },
             ],
-            # no period mentioned — MTD is a default guess, not a stated fact
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "total_meetings", "direction": "desc"},
+            "filters": [
+                {
+                    "field": "company",
+                    "operator": "=",
+                    "value": "Graana",
+                    "confidence": 0.95,
+                },
+                {
+                    "field": "attendance_rate",
+                    "operator": ">",
+                    "value": 90,
+                    "confidence": 0.9,
+                },
+                {
+                    "field": "achievement_pct",
+                    "operator": ">",
+                    "value": 80,
+                    "confidence": 0.9,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_meetings",
+                "direction": "desc",
+            },
             "limit": None,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.9,
             "intent_confidence": 0.95,
         },
     },
+
     {
+        # ---------------------------------------------------------------
+        # COMPARISON
+        # ---------------------------------------------------------------
         "utterance": "compare Blue Area with Downtown on revenue",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "comparison",
+            "operation": "comparison",
             "subject_level": "team",
             "subjects": [
-                {"type": "team", "value": "Blue Area", "match_confidence": 1.0},
-                {"type": "team", "value": "Downtown", "match_confidence": 1.0},
+                {
+                    "type": "team",
+                    "value": "Blue Area",
+                    "match_confidence": 1.0,
+                },
+                {
+                    "type": "team",
+                    "value": "Downtown",
+                    "match_confidence": 1.0,
+                },
             ],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
             "limit": None,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.9,
             "intent_confidence": 0.95,
         },
     },
+
     {
+        # ---------------------------------------------------------------
+        # BEST PERFORMER
+        # ---------------------------------------------------------------
         "utterance": "who is the best performer",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "achievement_pct", "confidence": 0.85},
+            "metric": {
+                "key": "achievement_pct",
+                "confidence": 0.85,
+            },
+            "metrics": [
+                {
+                    "key": "achievement_pct",
+                    "confidence": 0.85,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "achievement_pct", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "achievement_pct",
+                "direction": "desc",
+            },
             "limit": 1,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.85,
             "intent_confidence": 0.9,
         },
     },
+
     {
-        # "underperforming" = bottom of the achievement ranking, ascending
+        # ---------------------------------------------------------------
+        # UNDERPERFORMING
+        # ---------------------------------------------------------------
         "utterance": "show me the underperforming advisors",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "achievement_pct", "confidence": 0.8},
+            "metric": {
+                "key": "achievement_pct",
+                "confidence": 0.8,
+            },
+            "metrics": [
+                {
+                    "key": "achievement_pct",
+                    "confidence": 0.8,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "achievement_pct", "direction": "asc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "achievement_pct",
+                "direction": "asc",
+            },
             "limit": 10,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.8,
             "intent_confidence": 0.9,
         },
     },
+
     {
-        # "almost achieved" = a band, expressed as two AND-combined filters
+        # ---------------------------------------------------------------
+        # ALMOST ACHIEVED TARGET
+        # ---------------------------------------------------------------
         "utterance": "advisors who almost achieved their target",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "filtered_list",
+            "operation": "filtered_list",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "achievement_pct", "confidence": 0.85},
-            "filters": [
-                {"field": "achievement_pct", "operator": ">=", "value": 80, "confidence": 0.75},
-                {"field": "achievement_pct", "operator": "<", "value": 100, "confidence": 0.75},
+            "metric": {
+                "key": "achievement_pct",
+                "confidence": 0.85,
+            },
+            "metrics": [
+                {
+                    "key": "achievement_pct",
+                    "confidence": 0.85,
+                },
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "achievement_pct", "direction": "desc"},
+            "filters": [
+                {
+                    "field": "achievement_pct",
+                    "operator": ">=",
+                    "value": 80,
+                    "confidence": 0.75,
+                },
+                {
+                    "field": "achievement_pct",
+                    "operator": "<",
+                    "value": 100,
+                    "confidence": 0.75,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "achievement_pct",
+                "direction": "desc",
+            },
             "limit": None,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.8,
             "intent_confidence": 0.85,
         },
     },
+
     {
-        # typo'd team name — emit the CORRECTED gazetteer value with a
-        # slightly reduced confidence, don't echo the typo
+        # ---------------------------------------------------------------
+        # TYPO / GAZETTEER CORRECTION
+        # ---------------------------------------------------------------
         "utterance": "top revenue in blue aera",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
-            "filters": [
-                {"field": "team", "operator": "=", "value": "Blue Area", "confidence": 0.85},
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "filters": [
+                {
+                    "field": "team",
+                    "operator": "=",
+                    "value": "Blue Area",
+                    "confidence": 0.85,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
             "limit": 10,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.85,
             "intent_confidence": 0.95,
         },
     },
+
     {
+        # ---------------------------------------------------------------
+        # YTD
+        # ---------------------------------------------------------------
         "utterance": "top 5 advisors by ytd revenue",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "ytd_cleared", "confidence": 0.95},
+            "metric": {
+                "key": "ytd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "ytd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            # "ytd" is stated explicitly — high time confidence, unlike the
-            # defaulted-MTD examples above
-            "time_range": {"mode": "snapshot", "period": "YTD", "compare_to": None, "confidence": 0.95},
-            "sort": {"metric": "ytd_cleared", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "YTD",
+                "compare_to": None,
+                "confidence": 0.95,
+            },
+            "sort": {
+                "metric": "ytd_cleared",
+                "direction": "desc",
+            },
             "limit": 5,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.95,
             "intent_confidence": 0.95,
         },
     },
+
     {
+        # ---------------------------------------------------------------
+        # TEAM RANKING
+        # ---------------------------------------------------------------
         "utterance": "which teams have the best attendance rate",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "team",
             "subjects": [],
-            "metric": {"key": "attendance_rate", "confidence": 0.95},
+            "metric": {
+                "key": "attendance_rate",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "attendance_rate",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "attendance_rate", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "attendance_rate",
+                "direction": "desc",
+            },
             "limit": 10,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.95,
             "intent_confidence": 0.95,
         },
     },
+
     {
-        # follow-up patch: keep everything from the prior IR, add the filter
+        # ---------------------------------------------------------------
+        # FOLLOW-UP PATCH
+        # ---------------------------------------------------------------
         "utterance": "only Graana",
         "prior_ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
             "limit": 10,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.95,
             "intent_confidence": 0.95,
         },
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "advisor",
             "subjects": [],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
-            "filters": [
-                {"field": "company", "operator": "=", "value": "Graana", "confidence": 0.95},
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
             ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "filters": [
+                {
+                    "field": "company",
+                    "operator": "=",
+                    "value": "Graana",
+                    "confidence": 0.95,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
             "limit": 10,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.9,
             "intent_confidence": 0.95,
         },
     },
+
     {
-        # new hierarchy level (Part: hierarchy rework) — subject_level is
-        # "unit_head", NOT "team"; "unit head" must never be inferred from
-        # a bare team mention, only from the literal phrase.
+        # ---------------------------------------------------------------
+        # UNIT HEAD RANKING
+        # ---------------------------------------------------------------
         "utterance": "top 5 unit heads by connects",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "unit_head",
             "subjects": [],
-            "metric": {"key": "total_connects", "confidence": 0.95},
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "total_connects", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
             "limit": 5,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.9,
             "intent_confidence": 0.9,
         },
     },
+
     {
-        # new hierarchy level comparison — same "comparison" intent shape
-        # as the team example above, just at subject_level "zonal_head".
-        "utterance": "compare zonal head Ahmed Ali with zonal head Bilal Khan on revenue",
+        # ---------------------------------------------------------------
+        # ZONAL HEAD COMPARISON
+        # ---------------------------------------------------------------
+        "utterance": (
+            "compare zonal head Ahmed Ali with zonal head Bilal Khan "
+            "on revenue"
+        ),
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "comparison",
+            "operation": "comparison",
             "subject_level": "zonal_head",
             "subjects": [
-                {"type": "zonal_head", "value": "Ahmed Ali", "match_confidence": 1.0},
-                {"type": "zonal_head", "value": "Bilal Khan", "match_confidence": 1.0},
+                {
+                    "type": "zonal_head",
+                    "value": "Ahmed Ali",
+                    "match_confidence": 1.0,
+                },
+                {
+                    "type": "zonal_head",
+                    "value": "Bilal Khan",
+                    "match_confidence": 1.0,
+                },
             ],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
             "limit": None,
             "group_by": None,
+            "flat": False,
             "overall_confidence": 0.9,
             "intent_confidence": 0.95,
         },
     },
+
     {
-        # "breakdown" intent (Part: hierarchy rework phase 2) — a question
-        # about ONE named entity, nested by team. The utterance deliberately
-        # includes "performance" (a metric synonym) — this is exactly the
-        # phrasing that used to get mis-parsed as an unfiltered leaderboard
-        # (or with the subject dropped) before "breakdown" existed as its
-        # own intent; it is NOT a ranking, so no metric/sort is needed.
-        "utterance": "give me a breakdown of unit head Zeeshan Tariq's performance",
+        # ---------------------------------------------------------------
+        # GROUP_METRIC — ONE NAMED ENTITY'S OWN FIGURE
+        #
+        # The single most ordinary analytical question there is, and the
+        # corpus had NO example of it. `group_metric` is one of only three
+        # plan actions that reach the model at all, so the shape it sees
+        # most often was the one shape it was never shown.
+        #
+        # This slot held a `breakdown` example. `breakdown` is declared
+        # expressible_in_ir=False and is served entirely by the rule
+        # planner, so it is absent from the operation enum and the model
+        # could not emit it however well it imitated the example — and
+        # nlu_pipeline never routes a breakdown-shaped query here anyway.
+        #
+        # WHAT IT TEACHES: the answer is about the entity that was NAMED,
+        # so subject_level equals the subject's own type, and there is
+        # nothing to rank — one row, no sort metric.
+        # ---------------------------------------------------------------
+        "utterance": "what is unit head Zeeshan Tariq's revenue",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
-            "intent": "breakdown",
+            "intent": "filtered_list",
+            "operation": "group_metric",
             "subject_level": "unit_head",
             "subjects": [
-                {"type": "unit_head", "value": "Zeeshan Tariq", "match_confidence": 1.0},
+                {
+                    "type": "unit_head",
+                    "value": "Zeeshan Tariq",
+                    "match_confidence": 1.0,
+                },
             ],
-            "metric": None,
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": None, "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # GROUP_METRIC — A TEAM, NOT A RANKING OF ITS MEMBERS
+        #
+        # The distinction group_metric exists for. "Blue Area's connects"
+        # is ONE number for the team; it is not a leaderboard of the
+        # people in it, and it is not a filtered_list of anything.
+        # ---------------------------------------------------------------
+        "utterance": "how many connects does Blue Area have",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "group_metric",
+            "subject_level": "team",
+            "subjects": [
+                {
+                    "type": "team",
+                    "value": "Blue Area",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # GROUP_METRIC — AN ATTRIBUTE-LEVEL ENTITY
+        #
+        # `company` is an ATTRIBUTE, not a step in the chain, and this is
+        # the shape that proves the two facts are compatible: an attribute
+        # cannot be traversed through, but it is a perfectly good thing to
+        # ask about. Answer it at the level the user named.
+        # ---------------------------------------------------------------
+        "utterance": "what is Graana's revenue this month",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "group_metric",
+            "subject_level": "company",
+            "subjects": [
+                {
+                    "type": "company",
+                    "value": "Graana",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.9,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # AMBIGUOUS BUSINESS LANGUAGE
+        # ---------------------------------------------------------------
+        "utterance": "who is struggling this month",
+        "prior_ir": None,
+        "expect_valid": False,
+        "ir": {
+            "intent": "clarify",
+            # THE OPERATION IS "clarify_metric". `clarify` alone is the
+            # legacy INTENT name and is not an operation the registry
+            # knows, so this example asked the model to emit a value the
+            # grammar rejects — on the one example whose whole purpose is
+            # to show how to decline.
+            "operation": "clarify_metric",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": None,
+            "metrics": [],
+            "filters": [
+                {
+                    "field": "achievement_pct",
+                    "operator": "<",
+                    "value": 50,
+                    "confidence": 0.4,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.9,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": 10,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.4,
+            "intent_confidence": 0.4,
+        },
+    },
+
+    # =================================================================
+    # LEVEL COVERAGE
+    # =================================================================
+
+    {
+        # ---------------------------------------------------------------
+        # BCM
+        # ---------------------------------------------------------------
+        "utterance": "top 5 bcms by connects",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "operation": "leaderboard",
+            "subject_level": "bcm",
+            "subjects": [],
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
+            "limit": 5,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.94,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # OFFICE
+        # ---------------------------------------------------------------
+        "utterance": "top business centers by revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "operation": "leaderboard",
+            "subject_level": "office",
+            "subjects": [],
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
+            "limit": 10,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.94,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # REGION ATTRIBUTE AS FILTER
+        # ---------------------------------------------------------------
+        "utterance": "top advisors in North/KPK region by revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "operation": "leaderboard",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [
+                {
+                    "field": "region",
+                    "operator": "=",
+                    "value": "North/KPK",
+                    "confidence": 0.9,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
+            "limit": 10,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.92,
+            "intent_confidence": 0.93,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # COMPANY AS SUBJECT
+        # ---------------------------------------------------------------
+        "utterance": "compare Graana and IMARAT by revenue",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "comparison",
+            "operation": "comparison",
+            "subject_level": "company",
+            "subjects": [
+                {
+                    "type": "company",
+                    "value": "Graana",
+                    "match_confidence": 0.98,
+                },
+                {
+                    "type": "company",
+                    "value": "IMARAT",
+                    "match_confidence": 0.98,
+                },
+            ],
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
+            "limit": 10,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.94,
+            "intent_confidence": 0.96,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # DAILY
+        # ---------------------------------------------------------------
+        "utterance": "top advisors by connects today",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "operation": "leaderboard",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "DAILY",
+                "compare_to": None,
+                "confidence": 0.95,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
+            "limit": 10,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    # =================================================================
+    # COMPOSITIONAL SHAPES
+    # =================================================================
+
+    {
+        # ---------------------------------------------------------------
+        # OR FILTER TREE
+        # ---------------------------------------------------------------
+        "utterance": "Show advisors in Blue Area or DownTown",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": {
+                "op": "or",
+                "children": [
+                    {
+                        "field": "team",
+                        "operator": "=",
+                        "value": "Blue Area",
+                        "confidence": 0.95,
+                    },
+                    {
+                        "field": "team",
+                        "operator": "=",
+                        "value": "Downtown",
+                        "confidence": 0.95,
+                    },
+                ],
+            },
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
             "limit": None,
             "group_by": None,
             "flat": False,
@@ -286,156 +1082,850 @@ EXAMPLES: list[dict] = [
             "intent_confidence": 0.9,
         },
     },
+
     {
-        # ambiguous business language — clarify with a low-confidence guess,
-        # never an invented metric key. The low confidence intentionally
-        # trips the validator into asking a targeted question.
-        "utterance": "who is struggling this month",
+        # ---------------------------------------------------------------
+        # NOT FILTER TREE
+        # ---------------------------------------------------------------
+        "utterance": "List all advisors excluding Blue Area",
         "prior_ir": None,
-        "expect_valid": False,
+        "expect_valid": True,
         "ir": {
-            "intent": "clarify",
+            "intent": "filtered_list",
+            "operation": "population",
             "subject_level": "advisor",
             "subjects": [],
             "metric": None,
-            "filters": [
-                {"field": "achievement_pct", "operator": "<", "value": 50, "confidence": 0.4},
-            ],
-            # "this month" IS explicit — the ambiguity here is entirely
-            # about the metric/intent, not the period, which is why
-            # time_range.confidence stays high even though overall_confidence
-            # (and intent_confidence, tracking it) are both low
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.9},
-            "sort": {"metric": None, "direction": "desc"},
-            "limit": 10,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": {
+                "op": "not",
+                "children": [
+                    {
+                        "field": "team",
+                        "operator": "=",
+                        "value": "Blue Area",
+                        "confidence": 0.95,
+                    },
+                ],
+            },
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
             "group_by": None,
-            "overall_confidence": 0.4,
-            "intent_confidence": 0.4,
+            "flat": False,
+            "overall_confidence": 0.9,
+            "intent_confidence": 0.9,
         },
     },
-    # ------------------------------------------------------------------
-    # Phase 5.2: the levels no example demonstrated. The schema accepted
-    # bcm/office/region, the prompt described them, and every worked
-    # example still showed only advisor/team/unit_head/zonal_head — so
-    # the shapes the model actually imitates never included them.
-    # ------------------------------------------------------------------
+
     {
-        # BCM — a level of the verified chain, previously undemonstrated.
-        "utterance": "top 5 bcms by connects",
+        # ---------------------------------------------------------------
+        # MULTIPLE METRICS
+        # ---------------------------------------------------------------
+        "utterance": "Show connects and answered calls for all BCMs",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
+            "operation": "leaderboard",
             "subject_level": "bcm",
             "subjects": [],
-            "metric": {"key": "total_connects", "confidence": 0.95},
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+                {
+                    "key": "answered_calls",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "total_connects", "direction": "desc"},
-            "limit": 5,
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
+            "limit": None,
             "group_by": None,
-            "overall_confidence": 0.94,
+            "flat": False,
+            "overall_confidence": 0.92,
             "intent_confidence": 0.95,
         },
     },
+
     {
-        # office — an ATTRIBUTE level. Rankable as a subject_level even
-        # though it does not nest in the chain.
-        "utterance": "top business centers by revenue",
-        "prior_ir": None,
-        "expect_valid": True,
-        "ir": {
-            "intent": "leaderboard",
-            "subject_level": "office",
-            "subjects": [],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
-            "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
-            "limit": 10,
-            "group_by": None,
-            "overall_confidence": 0.93,
-            "intent_confidence": 0.94,
-        },
-    },
-    {
-        # region as a FILTER rather than a subject — the shape "advisors
-        # in North Region" takes.
-        "utterance": "top advisors in North/KPK region by revenue",
-        "prior_ir": None,
-        "expect_valid": True,
-        "ir": {
-            "intent": "leaderboard",
-            "subject_level": "advisor",
-            "subjects": [],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
-            "filters": [
-                {"field": "region", "operator": "=", "value": "North/KPK", "confidence": 0.9},
-            ],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
-            "limit": 10,
-            "group_by": None,
-            "overall_confidence": 0.92,
-            "intent_confidence": 0.93,
-        },
-    },
-    {
-        # company as a subject_level — the schema forbade this entirely
-        # before Phase 5.2's predecessor widened HIERARCHY_LEVELS.
-        "utterance": "compare Graana and IMARAT by revenue",
+        # ---------------------------------------------------------------
+        # METRIC PER SUBJECT
+        # ---------------------------------------------------------------
+        "utterance": "Blue Area's connects and Downtown's revenue",
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "comparison",
-            "subject_level": "company",
+            "operation": "comparison",
+            "subject_level": "team",
             "subjects": [
-                {"type": "company", "value": "Graana", "match_confidence": 0.98},
-                {"type": "company", "value": "IMARAT", "match_confidence": 0.98},
+                {
+                    "type": "team",
+                    "value": "Blue Area",
+                    "match_confidence": 1.0,
+                    "metric": {
+                        "key": "total_connects",
+                        "confidence": 0.95,
+                    },
+                },
+                {
+                    "type": "team",
+                    "value": "Downtown",
+                    "match_confidence": 1.0,
+                    "metric": {
+                        "key": "mtd_cleared",
+                        "confidence": 0.95,
+                    },
+                },
             ],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.8,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None, "confidence": 0.6},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
-            "limit": 10,
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
+            "limit": None,
             "group_by": None,
-            "overall_confidence": 0.94,
-            "intent_confidence": 0.96,
+            "flat": False,
+            "overall_confidence": 0.88,
+            "intent_confidence": 0.9,
         },
     },
+
     {
-        # A DAILY question (Phase 5.1 vocabulary): name the period the
-        # user used, do not substitute MTD.
-        "utterance": "top advisors by connects today",
+        # ---------------------------------------------------------------
+        # TWO DIFFERENT METRIC CONDITIONS
+        # ---------------------------------------------------------------
+        "utterance": (
+            "Show BCMs with connects above 1200 and "
+            "achievement below 50%"
+        ),
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "filtered_list",
+            "subject_level": "bcm",
+            "subjects": [],
+            "metric": None,
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+                {
+                    "key": "achievement_pct",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [
+                {
+                    "field": "total_connects",
+                    "operator": ">",
+                    "value": 1200,
+                    "confidence": 0.95,
+                },
+                {
+                    "field": "achievement_pct",
+                    "operator": "<",
+                    "value": 50,
+                    "confidence": 0.95,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # TEAM SIZE CONDITION
+        # ---------------------------------------------------------------
+        "utterance": "Which BCMs have more than five advisors in their teams?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "filtered_list",
+            "subject_level": "bcm",
+            "subjects": [],
+            "metric": None,
+            "metrics": [
+                {
+                    "key": "team_size",
+                    "confidence": 0.9,
+                },
+            ],
+            "filters": [
+                {
+                    "field": "team_size",
+                    "operator": ">",
+                    "value": 5,
+                    "confidence": 0.9,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.9,
+            "intent_confidence": 0.9,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # PURE METRIC FILTER
+        # ---------------------------------------------------------------
+        "utterance": "advisors with connects above 1000",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "filtered_list",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": None,
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [
+                {
+                    "field": "total_connects",
+                    "operator": ">",
+                    "value": 1000,
+                    "confidence": 0.95,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # TWO CONDITIONS WITHOUT RANKING
+        # ---------------------------------------------------------------
+        "utterance": (
+            "advisors with achievement below 50% and "
+            "answered calls % below 50%"
+        ),
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "filtered_list",
+            "subject_level": "advisor",
+            "subjects": [],
+            "metric": None,
+            "metrics": [
+                {
+                    "key": "achievement_pct",
+                    "confidence": 0.95,
+                },
+                {
+                    "key": "answered_calls_rate",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [
+                {
+                    "field": "achievement_pct",
+                    "operator": "<",
+                    "value": 50,
+                    "confidence": 0.95,
+                },
+                {
+                    "field": "answered_calls_rate",
+                    "operator": "<",
+                    "value": 50,
+                    "confidence": 0.95,
+                },
+            ],
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.93,
+            "intent_confidence": 0.95,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # PARAPHRASE
+        # ---------------------------------------------------------------
+        "utterance": (
+            "Which business centers have the highest number of connects?"
+        ),
         "prior_ir": None,
         "expect_valid": True,
         "ir": {
             "intent": "leaderboard",
-            "subject_level": "advisor",
+            "operation": "leaderboard",
+            "subject_level": "office",
             "subjects": [],
-            "metric": {"key": "total_connects", "confidence": 0.95},
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+            ],
             "filters": [],
-            "time_range": {"mode": "snapshot", "period": "DAILY", "compare_to": None, "confidence": 0.95},
-            "sort": {"metric": "total_connects", "direction": "desc"},
+            "filter_tree": None,
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
             "limit": 10,
             "group_by": None,
-            "overall_confidence": 0.93,
+            "flat": False,
+            "overall_confidence": 0.92,
             "intent_confidence": 0.95,
+        },
+    },
+
+    # =================================================================
+    # HIERARCHY READS
+    #
+    # THESE ARE THE IMPORTANT NEW EXAMPLES.
+    #
+    # The previous examples taught leaderboard/filter/comparison shapes
+    # but did not demonstrate:
+    #
+    #   subject_of
+    #   target_level
+    #   relation
+    #
+    # Those fields encode the meaning of:
+    #
+    #   "reports to"
+    #   "directly reports to"
+    #   "under"
+    #   "beneath"
+    #   "within their organisation"
+    #
+    # These examples deliberately use fictional names and different
+    # hierarchy levels so the model learns the semantic structure rather
+    # than memorizing one failing query.
+    # =================================================================
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ — DIRECT REPORTS
+        #
+        # Explicitly says "directly", therefore relation = direct.
+        # The question asks for advisors, so target_level = advisor.
+        # The named manager is the scope/subject_of.
+        # ---------------------------------------------------------------
+        "utterance": "How many advisors directly report to Unit Head Ahmed?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "unit_head",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "unit_head",
+            "relation": "direct",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.96,
+            "intent_confidence": 0.98,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ — SUBTREE
+        #
+        # "under" does NOT mean direct. It means the complete subtree.
+        # ---------------------------------------------------------------
+        "utterance": "How many advisors are under Unit Head Ahmed?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "unit_head",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "unit_head",
+            "relation": "subtree",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.96,
+            "intent_confidence": 0.98,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ — DIRECT REPORTS FROM A LOWER MANAGER
+        #
+        # The same shape as the Unit Head example, one rung down, so the
+        # scope level is learned as a variable rather than as the single
+        # value every hierarchy example happened to use.
+        #
+        # This example previously read "Which teams directly report to BCM
+        # Ahmed?" with target_level="team". `team` is the ROOT of the
+        # chain (team -> unit_head -> zonal_head -> bcm -> advisor), so
+        # nothing is beneath a BCM at team level: it described a traversal
+        # running upwards. The validator refuses that pairing outright,
+        # so the example could never have been imitated successfully — it
+        # taught an org chart this business does not have.
+        # ---------------------------------------------------------------
+        "utterance": "Which advisors directly report to BCM Ahmed?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "bcm",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "bcm",
+            "relation": "direct",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.96,
+            "intent_confidence": 0.98,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ — SUBTREE AT AN INTERMEDIATE LEVEL
+        #
+        # "teams under" means all teams in the subtree, not only immediate
+        # reports.
+        # ---------------------------------------------------------------
+        "utterance": "Show all advisors under BCM Ahmed",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "bcm",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "bcm",
+            "relation": "subtree",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.96,
+            "intent_confidence": 0.98,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ + METRIC
+        #
+        # A hierarchy relation determines WHO is in scope.
+        # The metric determines WHAT is returned for those entities.
+        #
+        # This prevents the model from treating "under" as a filter and
+        # dropping the hierarchy relationship.
+        # ---------------------------------------------------------------
+        "utterance": "Show connects of advisors directly reporting to Unit Head Ahmed",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "operation": "leaderboard",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "unit_head",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": {
+                "key": "total_connects",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "total_connects",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "unit_head",
+            "relation": "direct",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "total_connects",
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.96,
+            "intent_confidence": 0.98,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ + METRIC + SUBTREE
+        # ---------------------------------------------------------------
+        "utterance": "What is the revenue of advisors under Unit Head Ahmed?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "leaderboard",
+            "operation": "leaderboard",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "unit_head",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": {
+                "key": "mtd_cleared",
+                "confidence": 0.95,
+            },
+            "metrics": [
+                {
+                    "key": "mtd_cleared",
+                    "confidence": 0.95,
+                },
+            ],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "unit_head",
+            "relation": "subtree",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": "mtd_cleared",
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.97,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ — TARGET LEVEL INFERRED FROM GENERIC PEOPLE WORD
+        #
+        # "people" means the leaf population according to the semantic
+        # rules. This example teaches that generic population language
+        # can still require target_level resolution.
+        # ---------------------------------------------------------------
+        "utterance": "How many people directly report to Unit Head Ahmed?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [
+                {
+                    "type": "unit_head",
+                    "value": "Ahmed",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "unit_head",
+            "relation": "direct",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.97,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # HIERARCHY READ — NO DEPTH WORD
+        #
+        # This teaches the intended default: when the user asks for the
+        # entities beneath a manager without specifying "directly", the
+        # relation is subtree.
+        # ---------------------------------------------------------------
+        "utterance": "Which BCMs are under Zonal Head Bilal?",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "bcm",
+            "subjects": [
+                {
+                    "type": "zonal_head",
+                    "value": "Bilal",
+                    "match_confidence": 1.0,
+                },
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "bcm",
+            "subject_of": "zonal_head",
+            "relation": "subtree",
+            "time_range": {
+                "mode": "snapshot",
+                "period": "MTD",
+                "compare_to": None,
+                "confidence": 0.6,
+            },
+            "sort": {
+                "metric": None,
+                "direction": "desc",
+            },
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.96,
+            "intent_confidence": 0.98,
         },
     },
 ]
 
 
 def render_examples() -> str:
-    """The examples block injected into the parser prompt.
+    """
+    Render the few-shot examples compactly.
 
-    Rendered COMPACTLY: a field whose value equals the schema default is
-    omitted. Every field is `required` in llm_client.QUERY_IR_JSON_SCHEMA,
-    so grammar-constrained decoding emits all of them no matter what these
-    examples show — spelling out `"subjects": [], "filters": [], "limit":
-    null, ...` on all 18 examples repeated ~1,200 tokens of nothing per
-    call. What differs between examples is what carries the teaching
-    signal; what is constant is what the grammar already guarantees.
+    A field whose value equals the schema default is omitted. The grammar
+    constrained output schema still requires the model to emit all fields.
+
+    The examples intentionally preserve the semantic fields that carry
+    teaching signal, especially the hierarchy-read fields:
+        target_level
+        subject_of
+        relation
     """
     import json
 
@@ -446,22 +1936,52 @@ def render_examples() -> str:
         "metrics": [],
         "filters": [],
         "filter_tree": None,
+        "target_level": None,
+        "subject_of": None,
+        "relation": "subtree",
         "limit": None,
         "group_by": None,
         "flat": False,
-        "sort": {"metric": None, "direction": "desc"},
+        "sort": {
+            "metric": None,
+            "direction": "desc",
+        },
     }
 
     def compact(ir: dict) -> dict:
-        return {k: v for k, v in ir.items() if k not in defaults or v != defaults[k]}
+        return {
+            key: value
+            for key, value in ir.items()
+            if key not in defaults or value != defaults[key]
+        }
 
     lines = [
-        "Examples (follow these exactly in style and strictness).",
-        "Fields omitted from an example are the defaults — you must still emit every field.",
+        "Examples (follow these exactly — they are semantic structures to "
+        "imitate, never query-to-answer mappings).",
+        (
+            "Fields omitted from an example are defaults — "
+            "you must still emit every field required by the output schema."
+        ),
+        (
+            "IMPORTANT HIERARCHY RULE: when an example contains "
+            "target_level, subject_of, or relation, preserve all three "
+            "together. They form one hierarchy-read relationship."
+        ),
     ]
-    for i, ex in enumerate(EXAMPLES, 1):
-        lines.append(f'Example {i} — User: "{ex["utterance"]}"')
-        if ex["prior_ir"]:
-            lines.append(f"  (Previous turn's query was: {json.dumps(compact(ex['prior_ir']))})")
-        lines.append(f"  -> {json.dumps(compact(ex['ir']))}")
+
+    for index, example in enumerate(EXAMPLES, 1):
+        lines.append(
+            f'Example {index} — User: "{example["utterance"]}"'
+        )
+
+        if example["prior_ir"]:
+            lines.append(
+                "  (Previous turn's query was: "
+                f"{json.dumps(compact(example['prior_ir']))})"
+            )
+
+        lines.append(
+            f"  -> {json.dumps(compact(example['ir']))}"
+        )
+
     return "\n".join(lines)

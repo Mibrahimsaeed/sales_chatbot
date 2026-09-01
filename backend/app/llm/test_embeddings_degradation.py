@@ -192,7 +192,7 @@ def test_probe_never_raises_and_reports_status(monkeypatch):
     assert status.ready is False
     # The CONFIGURED provider, not a literal: hardcoding "openai" here is
     # what made this test stale the moment inference moved to Ollama.
-    assert status.provider == settings.llm_provider
+    assert status.provider == llm_client.PROVIDER
     assert status.reason == embeddings.REASON_AUTH
 
 
@@ -222,7 +222,7 @@ def test_health_endpoint_exposes_embedding_status(client, monkeypatch):
     body = client.get("/health").json()
     assert body["status"] == "ok", "an optional tier being down must not mark the service unhealthy"
     assert body["embeddings"]["ready"] is False
-    assert body["embeddings"]["provider"] == settings.llm_provider
+    assert body["embeddings"]["provider"] == llm_client.PROVIDER
     assert body["embeddings"]["reason"] == "invalid_api_key"
 
 

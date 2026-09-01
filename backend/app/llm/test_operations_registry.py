@@ -178,21 +178,47 @@ class TestSchemaAndPrompt:
         invite it to emit something uncompilable."""
         from app.llm.llm_client import QUERY_IR_JSON_SCHEMA as schema
 
-        offered = set(schema["properties"]["operation"]["anyOf"][1]["enum"])
-        assert offered == operations.IR_EXPRESSIBLE
+        offered = set(schema["properties"]["operation"]["enum"])
+        assert offered <= operations.IR_EXPRESSIBLE
         assert not offered & operations.PLAN_ONLY
 
     def test_the_enum_is_derived_from_the_registry(self):
-        from app.llm.llm_client import _ir_operations
+        """TWO conditions now, both read from the registry: the IR must be
+        able to EXPRESS the operation and the dispatcher must be able to
+        EXECUTE it. `trend` (dispatch "unsupported" — there is no earlier
+        snapshot to diff against) and `clarify_metric` (dispatch
+        "clarification" — it IS the question) satisfy the first and fail
+        the second, so they were selectable values the system could never
+        answer. Still derived, never listed."""
+        from app.llm.llm_client import _ir_operations, _NON_EXECUTABLE_DISPATCH
 
-        assert set(_ir_operations()) == operations.IR_EXPRESSIBLE
+        offered = set(_ir_operations())
+        assert offered == {
+            name for name in operations.IR_EXPRESSIBLE
+            if operations.OPERATIONS[name].dispatch_mode not in _NON_EXECUTABLE_DISPATCH
+        }
+        assert not any(
+            operations.OPERATIONS[n].dispatch_mode in _NON_EXECUTABLE_DISPATCH
+            for n in offered
+        )
+
+    def test_the_operation_field_is_required_and_never_null(self):
+        """It is the authoritative field: the prompt used to invite a null
+        here so the model could "communicate uncertainty" through the
+        legacy `intent` instead, and on exactly the queries it was least
+        sure about it did."""
+        from app.llm.llm_client import QUERY_IR_JSON_SCHEMA as schema
+
+        assert "operation" in schema["required"]
+        assert schema["properties"]["operation"]["type"] == "string"
+        assert "anyOf" not in schema["properties"]["operation"]
 
     def test_the_prompt_documents_the_field(self):
         from app.llm.prompt_builder import _ir_schema
 
         text = _ir_schema()
         assert '"operation"' in text
-        assert "OPERATION." in text
+        assert "OPERATION" in text
 
     def test_the_schema_still_forbids_sql(self):
         from app.llm.llm_client import QUERY_IR_JSON_SCHEMA as schema

@@ -41,21 +41,43 @@ def org(db_session):
     rather than the same one by luck.
 
     answered_calls_rate is answered calls against a target of 10 per
-    advisor per working day, so these counts land A and B under 20% and
-    "Low Ach High Calls" far above it.
+    advisor per working day, so the RATE each person lands on is
+    `answered * 100 / (10 * working_days)`.
+
+    THE COUNTS ARE DERIVED FROM THE RATES, NOT WRITTEN DIRECTLY. They used
+    to be literal counts (9, 11, 300, 5) chosen to land either side of 20%
+    at one particular denominator. The denominator is the number of
+    working days ELAPSED THIS MONTH, so it moves every single day: those
+    counts put A and B under 20% through most of August 2026 and put
+    everybody far above it on the 1st of September, when the month is one
+    working day old. Four tests here then selected nobody at all — a
+    fixture that had quietly become a calendar dependency, not a defect in
+    the threshold binding they exist to guard.
+
+    Inverting the metric's own formula keeps each person on the same side
+    of the boundary on every date. `answered_calls_mtd` is a Float column,
+    so the conversion is exact and nobody drifts across 20%.
     """
+    from app.llm import working_days
+
+    def _answered(rate):
+        """The answered-call count that yields `rate` today."""
+        return rate * working_days.month_to_date() / 10.0
+
+    #    wid, name,                achievement, ANSWERED-CALLS RATE
     people = [
-        (1, "Person A", 42.3, 9),             # both conditions
-        (2, "Person B", 35.7, 11),            # both conditions
-        (3, "Low Ach High Calls", 40.0, 300),  # achievement only
-        (4, "High Ach Low Calls", 92.0, 5),    # calls only
+        (1, "Person A", 42.3, 3.5),             # both conditions
+        (2, "Person B", 35.7, 4.2),             # both conditions
+        (3, "Low Ach High Calls", 40.0, 115.0),  # achievement only
+        (4, "High Ach Low Calls", 92.0, 1.9),    # calls only
     ]
-    for wid, name, pct, answered in people:
+    for wid, name, pct, rate in people:
         db_session.add(Advisor(wid=wid, name=name, team="Alpha", company="Graana",
                                in_master_sheet=True))
         db_session.add(Performance(wid=wid, period=PerformancePeriod.MTD,
                                    target=100, cleared=pct, pct=pct))
-        db_session.add(Calls(wid=wid, connects_mtd=1000 + wid, answered_calls_mtd=answered))
+        db_session.add(Calls(wid=wid, connects_mtd=1000 + wid,
+                             answered_calls_mtd=_answered(rate)))
     db_session.commit()
     entity_extractor._cache["loaded_at"] = 0
     return db_session

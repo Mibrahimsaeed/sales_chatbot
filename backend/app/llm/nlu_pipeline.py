@@ -198,9 +198,35 @@ _COMPOUND_EXEMPT_ACTIONS = ("comparison", "comparison_incomplete")
 # the LLM first, unconditionally, with the rule plan kept as the fallback
 # for when it cannot be reached (see the tail of resolve()).
 #
-# Derived from _RULE_BASED_ACTIONS rather than restated, so an action
-# added there cannot be silently dropped from this reasoning.
-_PLAN_ONLY_ACTIONS = frozenset(_RULE_BASED_ACTIONS)
+# DERIVED FROM THE OPERATION REGISTRY, which is the one place that
+# records whether an operation's ANSWER SHAPE has a QueryIR
+# representation (operations.Operation.expressible_in_ir).
+#
+# It used to be derived from _RULE_BASED_ACTIONS — a hand-maintained
+# tuple in this file, which is a second copy of a fact operations.py
+# already owns. The two agreed today and had nothing forcing them to:
+# marking an operation IR-expressible in the registry would not route it
+# to the LLM, and the query would keep being consumed by the rule plan
+# with no test failing. That is the exact drift operations.py was
+# introduced to end, so the reasoning now reads from it.
+#
+# "comparison" is added back explicitly because it is the one CONDITIONAL
+# case: the registry marks it IR-expressible (and a single-metric
+# comparison genuinely is), but a comparison naming NO measure or SEVERAL
+# answers with the multi-KPI table comparison_service builds and QueryIR
+# cannot hold. _is_rule_based() owns that distinction and is consulted
+# first in _plan_is_authoritative, so listing it here keeps the gate's
+# behaviour identical while the rest of the set becomes single-sourced.
+def _plan_only_actions() -> frozenset[str]:
+    from app.llm import operations
+
+    return frozenset(
+        name for name, op in operations.OPERATIONS.items()
+        if not op.expressible_in_ir
+    ) | {"comparison"}
+
+
+_PLAN_ONLY_ACTIONS = _plan_only_actions()
 
 
 def _names_several_entities(entities: dict) -> bool:
@@ -228,6 +254,21 @@ def _names_several_entities(entities: dict) -> bool:
 _UNREPRESENTABLE_IN_A_PLAN = (
     (re.compile(r"\b(except|excluding|other than|apart from|but not|"
                 r"without|besides)\b", re.I), "an exclusion"),
+    # NEGATED MEMBERSHIP is the same exclusion in the plainest possible
+    # words, and it was the one wording this list did not cover. "which
+    # advisors are not in Blue Area" grounds Blue Area, plans as an entity
+    # `summary`, and a plan has no negation — so it answered with Blue
+    # Area's own summary: the EXACT OPPOSITE population, stated
+    # confidently, with no gap recorded and no clarification.
+    #
+    # Deliberately anchored on a following preposition rather than on
+    # "not" alone. This predicate decides whether the plan may answer at
+    # all, so an over-firing pattern degrades every outage: "who is not
+    # marked today" and "advisors with no more than 50%" are ordinary
+    # plan-servable questions that merely contain the word.
+    (re.compile(r"\b(?:not|aren'?t|isn'?t|weren'?t)\s+"
+                r"(?:in|on|from|within|under|part of)\b|\boutside(?:\s+of)?\b",
+                re.I), "an exclusion"),
     (re.compile(r"\b(either|or)\b", re.I), "an either/or"),
 )
 
@@ -509,28 +550,54 @@ def _fill_pending_slot(
             filled = True
 
     if any(m.startswith("subject") for m in pending.missing):
+        # EVERY GROUPABLE LEVEL, derived from the hierarchy rather than
+        # listed. This read `teams` and `companies` only, so a
+        # clarification about any other level could not be answered at
+        # all: asked "which unit head did you mean?", the user's reply
+        # named one, extraction grounded it, and nothing here looked at
+        # `unit_heads` — so `filled` stayed False, the message fell
+        # through as a brand-new query, and the same question was asked
+        # again next turn.
+        #
+        # hierarchy.LEVEL_ENTITY_KEYS maps each level to the plural key
+        # extraction emits for it, so a level added there arrives here
+        # without a second edit — which is what let these two drift out
+        # of step with the five levels the extractor already grounded.
         existing = {s.value for s in ir.subjects}
-        for team in entities.get("teams", []):
-            if team not in existing:
-                ir.subjects.append(Subject(type="team", value=team, match_confidence=1.0))
-                filled = True
-        for company in entities.get("companies", []):
-            if company not in existing:
-                ir.subjects.append(Subject(type="company", value=company, match_confidence=1.0))
-                filled = True
+        for level, plural in hierarchy.LEVEL_ENTITY_KEYS.items():
+            for value in entities.get(plural, []) or []:
+                if value not in existing:
+                    ir.subjects.append(
+                        Subject(type=level, value=value, match_confidence=1.0))
+                    existing.add(value)
+                    filled = True
 
     if not filled:
         return None
 
     # the gap that made the parser punt to "clarify" is now filled —
-    # promote to an executable intent so revalidation can pass
+    # promote to an executable intent so revalidation can pass.
+    #
+    # ONLY FROM "clarify", and only into the shape the filled IR now IS.
+    # A population that asked which group the user meant is still a
+    # population once they say: promoting it to a ranking would attach a
+    # measure it never had, and every measure is read through its own
+    # table — so the join drops the people with no row in it and the list
+    # comes back shorter than the truth, which is the exact regression
+    # the population operation exists to prevent.
     if ir.intent == "clarify":
-        ir.intent = "comparison" if len(ir.subjects) >= 2 else "leaderboard"
-        # Both names, or they disagree — see the same pairing in
-        # conversation_context. resolved_operation() prefers `operation`,
-        # so promoting only the intent would leave the filled slot
-        # answering as the clarification it no longer is.
-        ir.operation = ir.intent
+        if ir.primary_metric() is None:
+            # Nothing to rank by, so this is a question about WHO. The
+            # subject the user just supplied is the scope of it.
+            ir.intent = "filtered_list"
+            ir.operation = "population"
+        else:
+            ir.intent = "comparison" if len(ir.subjects) >= 2 else "leaderboard"
+            # Both names, or they disagree — see the same pairing in
+            # conversation_context. resolved_operation() prefers
+            # `operation`, so promoting only the intent would leave the
+            # filled slot answering as the clarification it no longer is.
+            ir.operation = ir.intent
 
     # Part 10: overall_confidence/intent_confidence reflected doubt about
     # WHAT the user wanted before they answered directly — a slot the user
@@ -1736,7 +1803,22 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
             "(_PLAN_ONLY_ACTIONS) and the plan holds the whole question"
         )
 
+    # The LLM-first decision, recorded where it is made. Both branches
+    # are traced, because "the model was not consulted" is the fact that
+    # explains a rule-shaped answer and it was previously only visible in
+    # the audit log (off by default).
+    routing.decide(
+        "Understanding",
+        "rule plan (LLM not consulted)" if serve_plan else "LLM semantic parser",
+        gate_reason if serve_plan else
+        f"{plan.action!r} has a QueryIR representation, so the model parses it "
+        "first and the rule plan is kept as the fallback",
+    )
     if serve_plan:
+        tracing.record_llm_parse(
+            attempted=False, succeeded=False,
+            fallback_used=True, fallback_reason=gate_reason,
+        )
         audit.mark_rule_path(
             f"plan.action={plan.action!r}: {gate_reason}"
             " — returned before semantic_parser.parse(), so NO LLM call is made "

@@ -45,6 +45,13 @@ from app.llm.entity_extractor import (
 from app.llm.query_ir import ConfidenceLevel, QueryIR, Subject
 
 _MATCH_FLOOR = 0.55
+# The score at which a pre-LLM gazetteer hit OUTRANKS the level the model
+# declared. Deliberately near-exact: this is the difference between "the
+# extractor recognised this name" and "the extractor found something
+# vaguely like it", and only the first may overrule a parse. A fuzzy hit
+# at 0.6 competing with the model's reading would be two guesses, and
+# picking the deterministic one is not obviously better.
+_AUTHORITATIVE_FLOOR = 0.95
 _CONFIDENCE_FLOOR = 0.5     # below this, treat an LLM-supplied field as if it weren't provided
 # Every hierarchy group level (team/company/unit_head/zonal_head/business_
 # center) is a valid non-metric filter field, plus "advisor" and
@@ -67,6 +74,35 @@ _SUBJECT_GAZETTEERS = {
     "office": get_known_offices,
     "region": get_known_regions,
 }
+# Operations whose answer IS a measure: a ranking, a comparison, one
+# group's own figure, or a list reported with one. Keyed on the operation
+# rather than on `intent` for the same reason every other consumer is —
+# `intent` is the legacy name and, for an operation that declares none
+# (population, group_metric), it is not normalised and therefore says
+# nothing. Reading it here meant a `group_metric` carrying no measure at
+# all could skip this check entirely.
+#
+# `population` is the deliberate omission: query_compiler documents that
+# operation="population" marks the ABSENCE of a measure as intended,
+# which is what separates it from an IR that failed to resolve one. A
+# hierarchy read is the structural omission — it enumerates people, with
+# nothing to rank them by.
+# Operations where `subject_level` names the level being ENUMERATED and
+# the subject is the SCOPE it is enumerated within — "the teams IN <a
+# company>", "the advisors IN <a team>". The subject is not the thing
+# being reported there, so copying its level over `subject_level`
+# collapses a ranking of the members into the single figure of the
+# container: "top teams in <company> by revenue" answered with that
+# company's own total instead of its teams.
+#
+# The other operations report the subject's OWN figure, which is the case
+# the normalization exists for. Measured cleanly across both families —
+# a scope-shaped question arrives as `leaderboard`, an own-figure one as
+# `filtered_list`/`group_metric`.
+_SUBJECT_IS_A_SCOPE = ("leaderboard", "population")
+
+_MEASURED_OPERATIONS = ("leaderboard", "comparison", "filtered_list", "group_metric")
+
 _UNSUPPORTED_INTENTS = {
     # "lookup" is intentionally handled by the pre-existing rule-based
     # query_planner.py path (nlu_pipeline.py never routes a plain single-
@@ -94,6 +130,26 @@ _UNSUPPORTED_INTENTS = {
 }
 
 
+def _repair(ir: QueryIR, field: str, before, after, why: str) -> None:
+    """Record a meaning-changing rewrite, once, to BOTH sinks.
+
+    `ir.repairs` is the structured record — {field, from, to, why} — which
+    persists with the IR into ChatLog.resolved_ir, so a production answer
+    can be replayed backwards to the model's raw parse months later. The
+    routing trace is the human-readable one, in line with every other
+    decision the request made.
+
+    Written from here rather than at each site for the reason
+    routing.decide() exists: a repair that lands in one sink and not the
+    other is how "the model got it wrong" and "we rewrote it afterwards"
+    became indistinguishable in the first place.
+    """
+    from app.llm import routing
+
+    ir.repairs.append({"field": field, "from": before, "to": after, "why": why})
+    routing.decide(f"Repair:{field}", f"{before!r} -> {after!r}", why)
+
+
 @dataclass
 class ValidationResult:
     ir: QueryIR
@@ -106,6 +162,138 @@ class ValidationResult:
     @property
     def confidence_level(self) -> ConfidenceLevel:
         return classify_confidence(self.ir, self.missing)
+
+
+def _authoritative_levels(entities: dict | None) -> dict[str, tuple[str, float]]:
+    """What deterministic extraction already PROVED about each name.
+
+    Entity extraction runs before the model and matches against the live
+    gazetteers. Its output reached the model as advisory prompt text
+    ("Entities already found by rule-based grounding — use these, don't
+    re-derive"), and advice is all it was: for "revenue of AMD year to
+    date" extraction grounded AMD as a TEAM at 1.0, the prompt said so,
+    and the model typed it `company` anyway. Grounding then failed at the
+    declared level, the subject was DROPPED, and the user was asked which
+    company they meant by a name that is not one.
+
+    This turns that advice into a constraint the validator can act on.
+
+    ONLY UNAMBIGUOUS NAMES. A value that grounds at more than one level is
+    exactly the case the pipeline already asks the user about
+    (`clarify_ambiguous`), and forcing a level here would answer a
+    question it is entitled to ask — "Haseeb Arslan" is a unit_head, a
+    zonal_head, a bcm and an advisor, and which one is meant is not
+    extraction's to decide. Those are skipped, so the model keeps its
+    reading and the existing clarification still fires.
+
+    `portfolio_lead` / `management_lead` are extraction's older names for
+    `zonal_head` / `bcm`, so counting them would make every manager look
+    ambiguous with themselves. Only the levels the validator actually
+    grounds against are counted.
+    """
+    if not entities:
+        return {}
+
+    by_value: dict[str, set[str]] = {}
+    scores: dict[tuple[str, str], float] = {}
+    for level in list(_SUBJECT_GAZETTEERS) + ["advisor"]:
+        for match in entities.get(f"{level}_matches") or []:
+            value, score = match.get("value"), match.get("score", 0.0)
+            if not value or score < _AUTHORITATIVE_FLOOR:
+                continue
+            key = value.strip().lower()
+            by_value.setdefault(key, set()).add(level)
+            scores[(key, level)] = max(scores.get((key, level), 0.0), score)
+
+    return {
+        value: (next(iter(levels)), scores[(value, next(iter(levels)))])
+        for value, levels in by_value.items()
+        if len(levels) == 1
+    }
+
+
+def _grounds_here(subject: Subject, db: Session) -> float:
+    """How well `subject.value` matches at its OWN declared level, 0.0 if
+    not at all. Read through the same matcher `_ground_subject` uses, so
+    "does the model's reading hold up" is answered exactly once."""
+    fetch = _SUBJECT_GAZETTEERS.get(subject.type)
+    if fetch is None:
+        # An advisor subject: resolution, not a gazetteer scan.
+        resolution = advisor_resolver.resolve_by_name(subject.value, db)
+        return 1.0 if resolution.is_resolved else 0.0
+    match = best_match(subject.value, fetch(db),
+                       kind=hierarchy.match_kind_for(subject.type), floor=_MATCH_FLOOR)
+    return match[1] if match else 0.0
+
+
+def _apply_extraction_identity(subject: Subject, db: Session,
+                               authoritative: dict, ir: QueryIR) -> Subject:
+    """Re-type a subject the extractor identified more reliably.
+
+    THE TEST IS COMPARATIVE, not a blanket override. Extraction's level
+    wins only when it is near-exact AND the model's declared level does
+    not hold up at least as well — so a name the model typed correctly is
+    never touched, and a name that genuinely reads as two different
+    entities is left to the clarification that already exists.
+
+    That ordering is what keeps "top advisors in Graana by connects"
+    working: Graana grounds as a company AND as an office, so it is not
+    in `authoritative` at all and the model's reading stands.
+    """
+    known = authoritative.get((subject.value or "").strip().lower())
+    if known is None:
+        return subject
+    level, score = known
+    if level == subject.type:
+        return subject
+    if _grounds_here(subject, db) >= score:
+        # The model's reading is at least as good a match as the
+        # extractor's. Two defensible readings, and the parse is the one
+        # that saw the whole sentence.
+        return subject
+
+    _repair(ir, "subjects[].type", subject.type, level,
+            f"deterministic extraction matched {subject.value!r} at {level!r} "
+            f"with confidence {score:.2f} against the live gazetteer, and it "
+            f"does not match at {subject.type!r} — the level was a guess about "
+            "a name the extractor had already identified")
+    return subject.model_copy(update={"type": level})
+
+
+def _retyped_subject(subject: Subject, db: Session, authoritative: dict,
+                     ir: QueryIR) -> Subject:
+    """The level this name actually belongs to, or the declared one.
+
+    TWO SOURCES, in order, and both are evidence rather than a guess:
+
+      1. What deterministic extraction PROVED about the name, when it is
+         near-exact and unambiguous and the declared level does not hold
+         up as well (_apply_extraction_identity).
+      2. Failing that, what the other gazetteers say — asked only when the
+         declared level does not claim the name at all
+         (_reground_scope_subject).
+
+    Never invents a level for a name nothing claims: an unknown value
+    keeps its declared type and is refused downstream, exactly as before.
+    """
+    subject = _apply_extraction_identity(subject, db, authoritative, ir)
+    if _SUBJECT_GAZETTEERS.get(subject.type) is None:
+        # An advisor subject is resolved by identity, not by gazetteer
+        # scan; _ground_subject owns that and never rejects on existence.
+        return subject
+    if _grounds_here(subject, db) > 0.0:
+        return subject
+    retyped = _reground_scope_subject(subject, db)
+    if retyped is None:
+        return subject
+    _repair(ir, "subjects[].type", subject.type, retyped.type,
+            f"no {subject.type} called {subject.value!r} exists, and the "
+            f"{retyped.type} gazetteer claims it — the level was the parser's "
+            "guess, and the value is what the user actually named")
+    # The TYPE is corrected here; the VALUE is left alone so the grounding
+    # loop below still resolves it through the one path that records a
+    # match confidence and a resolved_id.
+    return subject.model_copy(update={"type": retyped.type})
 
 
 def _ground_subject(subject: Subject, db: Session) -> tuple[Subject, str | None]:
@@ -149,7 +337,59 @@ def _ground_subject(subject: Subject, db: Session) -> tuple[Subject, str | None]
     return Subject(type=subject.type, value=name, resolved_id=name, match_confidence=score), None
 
 
-def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
+def _reground_scope_subject(subject: Subject, db: Session) -> Subject | None:
+    """Find the level a subject actually belongs to, when its declared one
+    does not claim it.
+
+    A parser can attach a value to the wrong level in two ways. A
+    hierarchy read names two levels at once — the role and the scope it
+    sits in ("the Unit Head in <team>") — and the scope's VALUE can land
+    on the role's level. An ordinary query needs no such excuse: the model
+    simply guesses, and "revenue of AMD" arrives with AMD typed
+    `company`. Both end the same way — grounding fails at the declared
+    level and the user is asked which company they meant by a team name
+    they never claimed was one.
+
+    So when a subject does not ground where it was declared, ask the other
+    gazetteers what the name IS. This is the same question entity
+    extraction already answers for free text, asked here for a value the
+    parser typed optimistically.
+
+    NO LONGER HIERARCHY-ONLY. It was gated on `is_hierarchy_read()`, which
+    described where the defect had been OBSERVED rather than where it can
+    occur — the guess is a property of the parser, not of the query shape,
+    and outside that gate the subject was simply dropped.
+
+    Still only reached AFTER the declared level has failed, which is what
+    keeps it safe: a subject the model typed correctly never gets here, so
+    a legitimate reading cannot be overridden by a fuzzy match at some
+    other level.
+
+    Returns a re-typed Subject, or None when no level claims the name.
+    """
+    for level, fetch in _SUBJECT_GAZETTEERS.items():
+        if level == subject.type:
+            continue
+        match = best_match(subject.value, fetch(db),
+                           kind=hierarchy.match_kind_for(level), floor=_MATCH_FLOOR)
+        if match:
+            name, score = match
+            return Subject(type=level, value=name, resolved_id=name,
+                           match_confidence=score)
+    return None
+
+
+def validate_ir(ir: QueryIR, db: Session,
+                entities: dict | None = None) -> ValidationResult:
+    """`entities` is deterministic extraction's output for the same
+    message, when the caller has it.
+
+    OPTIONAL, so the deterministic callers that build their own IRs
+    (ir_patcher, the pending-slot fill) and every existing test keep
+    working unchanged. It matters for one thing: a subject whose level the
+    model guessed, where extraction had already identified the name
+    against the live gazetteer. See _authoritative_levels.
+    """
     missing: list[str] = []
 
     if ir.intent in _UNSUPPORTED_INTENTS:
@@ -159,9 +399,168 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
         ir.confidence_level = classify_confidence(ir, missing)
         return ValidationResult(ir=ir, missing=missing)
 
+    # ---- ONE AUTHORITATIVE FIELD ------------------------------------
+    #
+    # `operation` decides what this query IS: resolved_operation() is what
+    # the compiler, the response planner and chat_service._dispatch all
+    # read. `intent` is the legacy second name for the same thing, and
+    # nothing made the two agree — so a model could satisfy the schema
+    # with a coherent operation and an intent that meant something else,
+    # and whichever field a given consumer happened to read decided the
+    # answer. That is how a correctly-parsed "what is X's <measure>?" —
+    # right metric, right subject, right level — was answered with a
+    # generic entity summary: `intent` said "breakdown" and the dispatcher
+    # believed it.
+    #
+    # The registry already declares the correspondence, so it is READ here
+    # rather than restated. An operation with no `ir_intent` (population,
+    # group_metric) has no compatibility name to derive and keeps whatever
+    # it arrived with — those two are unreachable from the intent
+    # vocabulary by construction, which is precisely why the LLM-facing
+    # enum is derived from the operations on offer.
+    from app.llm import operations
+
+    declared = operations.OPERATIONS.get(ir.resolved_operation())
+    if declared is not None and declared.ir_intent and ir.intent != declared.ir_intent:
+        _repair(ir, "intent", ir.intent, declared.ir_intent,
+                f"the operation registry declares {declared.name!r} as intent "
+                f"{declared.ir_intent!r}; the parse said otherwise, and every "
+                "consumer reads resolved_operation()")
+        ir.intent = declared.ir_intent
+    elif declared is not None and declared.ir_intent:
+        ir.intent = declared.ir_intent
+
+    # ---- A LIST WITH NOTHING TO RANK BY *IS* A POPULATION ------------
+    #
+    # `population` and `filtered_list` are the same answer shape with and
+    # without a measure, and the model was the only thing deciding which
+    # name a metric-free list got. It decided on WORDING, not on meaning:
+    #
+    #   "advisors in Blue Area or DownTown"   -> population    (answered)
+    #   "all advisors excluding Blue Area"    -> filtered_list (refused)
+    #
+    # Two queries with identical structure — an entity constraint, no
+    # measure anywhere — and opposite outcomes, because `filtered_list`
+    # is in _MEASURED_OPERATIONS and the second one therefore failed the
+    # metric check. The user was asked "which metric would you like?"
+    # about a question that correctly named none, and the boolean filter
+    # machinery this shape exists for never ran.
+    #
+    # Strengthening the prompt is not the fix, though it is worth doing
+    # and was: it moved the "or" phrasing and left the "excluding" one,
+    # which is the same failure one wording along. A decision the IR's own
+    # content already determines must not be left to a sampled label.
+    #
+    # THE RULE, structural like the subject_level one below: an operation
+    # that reports members rather than a figure, naming NO measure in any
+    # of the four places one can live, and carrying at least one thing it
+    # was constrained by, is a population. Nothing failed to resolve — the
+    # question asked WHO.
+    #
+    # WHAT THIS DELIBERATELY DOES NOT TOUCH. `leaderboard`, `comparison`
+    # and `group_metric` all keep the metric requirement, because for
+    # those the measure IS the answer: a ranking with nothing to rank by,
+    # or a group's "figure" with no figure named, is a genuinely
+    # incomplete parse and must still be refused. So must a filtered_list
+    # that constrains nothing at all — "show me the advisors" with no
+    # filter, no subject and no measure is an empty parse wearing a
+    # label, and the clarifying question is the right answer to it.
+    #
+    # Ordered BEFORE the subject_level block below on purpose:
+    # _SUBJECT_IS_A_SCOPE lists `population`, so a re-labelled query must
+    # be re-labelled first or its named group is read as the ANSWER's
+    # level rather than as the scope — "advisors in Blue Area" would
+    # report Blue Area instead of listing the people in it.
+    if (ir.resolved_operation() == "filtered_list"
+            and not ir.is_hierarchy_read()
+            and ir.primary_metric() is None
+            and (ir.filter_leaves() or ir.subjects)):
+        _repair(ir, "operation", ir.resolved_operation(), "population",
+                "the query constrains who is in the list but names no measure "
+                "in metric, sort, metrics or any filter — that is a question "
+                "about WHO, and attaching a measure would join a fact table "
+                "and silently drop everyone with no row in it")
+        ir.operation = "population"
+
+    # ---- WHAT LEVEL IS THIS NAME, ACTUALLY? --------------------------
+    #
+    # Runs as a PRE-PASS, before anything downstream reads a subject's
+    # type, because two later steps do: `subject_level` is copied from
+    # `subjects[0].type` immediately below, and the metric block then asks
+    # whether the measure is answerable AT that level.
+    #
+    # Correcting the type inside the grounding loop further down — where
+    # this started — left `subject_level` holding the type the model
+    # guessed while `subjects` held the corrected one. For "revenue of AMD
+    # year to date" that meant subject_level="company" with a `team`
+    # subject: the compiler filters by team and GROUPS BY company, so the
+    # answer is AMD's revenue reported under a company's name. A wrong
+    # answer in place of a wrong question is not an improvement.
+    ir.subjects = [_retyped_subject(s, db, _authoritative_levels(entities), ir)
+                   for s in ir.subjects]
+
+    # ---- THE ANSWER IS ABOUT THE SUBJECT THAT WAS NAMED --------------
+    #
+    # Same class of defect as the one above, in the other pair of fields.
+    # The parser states WHAT the question is about in `subjects[].type`
+    # and states WHERE the answer is reported in `subject_level`, and
+    # nothing made those agree either — so it emitted
+    # `subjects=[<a group>]` with `subject_level="advisor"` and the
+    # compiler faithfully answered about one arbitrary member instead of
+    # the group that was asked for. The parse was right; only the pairing
+    # was wrong, and the prompt alone did not hold it: the violation rate
+    # tracked surface phrasing rather than meaning.
+    #
+    # PURELY STRUCTURAL. It reads no metric, no wording and no entity —
+    # only the shape of the IR — which is exactly why it fixes a failure
+    # that varied by phrasing.
+    #
+    # The three exclusions are the cases where the answer is deliberately
+    # NOT at the subject's own level, and each is a different question:
+    #   group_by      reports one level's figures broken out at another
+    #                 ("<group>'s advisors by connects").
+    #   target_level  is a hierarchy read: it enumerates a level BENEATH
+    #                 the subject, so the subject's own level is the one
+    #                 level it must not be.
+    #   2+ subjects   is a comparison; the sides carry their own levels
+    #                 and may legitimately differ from each other.
+    # A subject whose type is not a real level is left alone rather than
+    # copied in, so a malformed parse cannot write a bad level here.
+    #
+    # Ordered BEFORE the metric block on purpose: the degrade there
+    # (`is_answerable` -> primary_level) exists to rescue a level the
+    # compiler cannot serve, so it must keep the last word over this.
+    if (len(ir.subjects) == 1
+            and ir.group_by is None
+            and ir.target_level is None
+            and ir.resolved_operation() not in _SUBJECT_IS_A_SCOPE
+            and hierarchy.is_valid_level(ir.subjects[0].type)):
+        if ir.subject_level != ir.subjects[0].type:
+            _repair(ir, "subject_level", ir.subject_level, ir.subjects[0].type,
+                    f"the query names one subject and it is a "
+                    f"{ir.subjects[0].type}, so that is the level the answer is "
+                    "about; the two fields disagreed and the compiler believes "
+                    "subject_level")
+        ir.subject_level = ir.subjects[0].type
+
     # ---- metric (sort/primary) — presence AND confidence floor ----
-    if ir.intent in ("leaderboard", "comparison", "filtered_list"):
-        metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    # A POPULATION is metric-free BY DEFINITION — "who matches this", with
+    # nothing to rank by. The prompt instructs the model to emit
+    # `metric: null` for it, so requiring one here rejected the exact
+    # output the prompt asked for and answered a valid question with a
+    # clarifying one.
+    # A HIERARCHY READ enumerates people beneath a subject and has no
+    # measure to rank by, exactly as a population does. Requiring one
+    # would refuse the shape the IR was just widened to express.
+    if (ir.resolved_operation() in _MEASURED_OPERATIONS
+            and not ir.is_hierarchy_read()):
+        # ONE READING of "which measure is this query about", shared with
+        # query_compiler._effective_metric. Reading `sort`/`metric` alone
+        # missed the two shapes the parser legitimately produces —
+        # several measures in `metrics[]`, and a measure used as a
+        # CONDITION ("advisors with connects above 1000") — so a query
+        # that named its metric plainly was reported as having none.
+        metric_key = ir.primary_metric()
         metric_confidence = ir.metric.confidence if ir.metric else 1.0
 
         if metric_key and metric_key not in METRICS:
@@ -176,10 +575,21 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
             # themselves for something this unambiguous.
             corrected = fuzzy_resolve_metric(metric_key)
             if corrected:
+                _repair(ir, "metric.key", metric_key, corrected,
+                        f"{metric_key!r} is not an ontology key; it was recovered "
+                        "by the same synonym match a user's typo goes through, "
+                        "rather than asking about a measure this unambiguous")
                 metric_key = corrected
+                # Write back only to fields that were ALREADY set. The
+                # correction fixes a spelling; it must not also decide
+                # that a filtered list is a ranking. Assigning
+                # `sort.metric` on an IR that deliberately had none would
+                # do exactly that — response_planner reads the operation,
+                # but every other consumer reads the sort.
                 if ir.metric:
                     ir.metric.key = corrected
-                ir.sort.metric = corrected
+                if ir.sort and ir.sort.metric:
+                    ir.sort.metric = corrected
 
         if not metric_key:
             missing.append("metric")
@@ -206,14 +616,42 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
             # genuinely uncomputable, and records that it did, so a
             # degraded level is visible rather than looking like the
             # planner's choice.
-            from app.llm import routing
-
-            routing.decide(
-                "Level", METRICS[metric_key].primary_level,
-                f"DEGRADED from {ir.subject_level!r}: {metric_key} has no resolver "
-                f"at that level, so the metric's own level is the nearest answerable one",
-            )
+            _repair(ir, "subject_level", ir.subject_level,
+                    METRICS[metric_key].primary_level,
+                    f"DEGRADED: {metric_key} has no resolver at "
+                    f"{ir.subject_level!r}, so the metric's own level is the "
+                    "nearest answerable one")
             ir.subject_level = METRICS[metric_key].primary_level
+
+    # ---- an unstated sort direction is the MEASURE'S, not "asc" ------
+    #
+    # `sort.metric` is null exactly when the query expressed no ranking of
+    # its own — a filtered list, a population, one group's figure. The
+    # direction beside it is then a placeholder the model still had to
+    # emit, and gpt-4o-mini emits "asc" for it (4 of 6 sampled parses).
+    #
+    # The compiler does not treat it as a placeholder. `_run_advisor_
+    # rooted` orders by `ir.sort.direction` unconditionally, and
+    # `primary_metric()` falls back to a measure named in a FILTER — so
+    # "advisors with connects above 1000" ranked the qualifying advisors
+    # WORST-FIRST and presented that as the answer.
+    #
+    # The rule path never had this: plan_to_ir calls `default_direction`,
+    # which reads the metric's own `lower_is_better`. This is the same
+    # call, applied to the path that was missing it, and only where the
+    # query said nothing — an explicit "bottom 5 by X" sets `sort.metric`
+    # and keeps its direction untouched.
+    if ir.sort is not None and not ir.sort.metric:
+        from app.llm.query_compiler import default_direction
+
+        wanted = default_direction(ir.primary_metric())
+        if ir.sort.direction != wanted:
+            _repair(ir, "sort.direction", ir.sort.direction, wanted,
+                    "the query named no ranking of its own (sort.metric is "
+                    f"null), so the direction it carried was a placeholder — "
+                    f"{ir.primary_metric()!r} orders {wanted} by its own polarity, "
+                    "and the compiler applies this value literally")
+            ir.sort.direction = wanted
 
     # ---- filters — presence, validity, AND confidence floor ----
     grounded_filters = []
@@ -228,6 +666,10 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
             grounded_filters.append(f)
             continue
         missing.append(f"filter:{f.field}")
+        _repair(ir, "filters", f.field, None,
+                f"{f.field!r} is neither a metric nor an entity field, so the "
+                "condition could not be grounded and was dropped — which can "
+                "only WIDEN the result, never narrow it")
     ir.filters = grounded_filters
 
     # ---- filter tree — validated, never PRUNED ----
@@ -253,14 +695,64 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
         if s.match_confidence < _CONFIDENCE_FLOOR:
             missing.append(f"subject_low_confidence:{s.type}:{s.value}")
             continue
+        # Types were corrected in the pre-pass above, so this grounds at
+        # the level the name actually belongs to and only has to resolve
+        # the VALUE — the canonical spelling, its match confidence, and
+        # (for an advisor) the wid.
         grounded, problem = _ground_subject(s, db)
         if problem:
             missing.append(problem)
+            _repair(ir, "subjects", f"{s.type}:{s.value}", None,
+                    "no entity of that name and level exists, so the subject was "
+                    "removed — the query is refused rather than run unscoped, "
+                    "which would answer about everybody")
         else:
             grounded_subjects.append(grounded)
     ir.subjects = grounded_subjects
 
-    if ir.intent == "comparison" and len(ir.subjects) < 2:
+    # ---- hierarchy read: the levels must be real, and ordered ----
+    if ir.is_hierarchy_read():
+        for field, value in (("target_level", ir.target_level),
+                             ("subject_of", ir.subject_of)):
+            if value and not hierarchy.is_valid_level(value):
+                missing.append(f"filter:{field}:{value}")
+        # The target must sit BELOW the level it is scoped beneath.
+        # Inverting them ("the unit heads under an advisor") is not a
+        # narrower question, it is an unanswerable one, and the scope
+        # filters would silently return nothing.
+        if (ir.subject_of and ir.target_level
+                and hierarchy.is_chain_level(ir.subject_of)
+                and hierarchy.is_chain_level(ir.target_level)
+                and hierarchy.depth(ir.target_level) is not None
+                and hierarchy.depth(ir.subject_of) is not None
+                and hierarchy.depth(ir.target_level) <= hierarchy.depth(ir.subject_of)):
+            # ITS OWN SLOT, not a sentence smuggled into the subject
+            # slot. This read
+            #
+            #     f"subject:{ir.subject_of}:{ir.target_level} is not beneath it"
+            #
+            # and `_ask_for` splits a "subject:" entry on ":" into a LEVEL
+            # and a VALUE — so the value became the literal string "team
+            # is not beneath it" and the user was asked:
+            #
+            #     "which zonal head you meant by 'team is not beneath it'?"
+            #
+            # for the ordinary question "How many people are in ZH1's
+            # team?". A structural contradiction in the parse was rendered
+            # as a question about a name nobody typed.
+            missing.append(f"inverted_hierarchy:{ir.subject_of}:{ir.target_level}")
+        if not ir.subjects:
+            missing.append("subjects")
+
+    # THE AUTHORITATIVE FIELD, here too. These two checks are structural
+    # requirements OF AN OPERATION — a comparison needs two things to
+    # compare, a breakdown needs something to break down — so they must
+    # read the field that says which operation this is. Keyed on `intent`
+    # they fired on operations they do not describe: `population` and
+    # `group_metric` declare no ir_intent, so nothing normalises their
+    # intent, and a stale "comparison" left there by the parser demanded
+    # two subjects of a query that correctly has none.
+    if ir.resolved_operation() == "comparison" and len(ir.subjects) < 2:
         missing.append("subjects")
 
     # "breakdown" (Part: hierarchy rework phase 2) is about exactly ONE
@@ -268,7 +760,7 @@ def validate_ir(ir: QueryIR, db: Session) -> ValidationResult:
     # compiler operation (see chat_service._dispatch_breakdown), so no
     # metric/is_answerable check applies here, only that the subject itself
     # is present and grounded.
-    if ir.intent == "breakdown" and len(ir.subjects) < 1:
+    if ir.resolved_operation() == "breakdown" and len(ir.subjects) < 1:
         missing.append("subjects")
 
     # intent="clarify" is the parser explicitly saying "ask the user" — it
@@ -319,7 +811,15 @@ def classify_confidence(ir: QueryIR, missing: list[str]) -> ConfidenceLevel:
 # One slot per turn (P6): asking for three things at once gets zero of
 # them answered. Highest-priority unresolved slot wins; the rest get
 # asked on subsequent turns once this one is filled.
-_CLARIFY_PRIORITY = ("unsupported_intent:", "metric", "subject", "filter")
+# `inverted_hierarchy:` outranks everything answerable. The other slots
+# ask the user to SUPPLY something; this one says the two levels they
+# named do not nest, which no answer of theirs can fix — and asking "which
+# metric?" about a query whose shape is impossible sends them round a loop
+# they cannot exit. It is also raised above "subject" because the same
+# parse sets `subjects` as well, and "which two things would you like to
+# compare?" is a worse question still.
+_CLARIFY_PRIORITY = ("inverted_hierarchy:", "unsupported_intent:", "metric",
+                     "subject", "filter")
 
 
 def _ask_for(item: str) -> str:
@@ -336,6 +836,17 @@ def _ask_for(item: str) -> str:
     if item.startswith("subject_low_confidence:"):
         _, s_type, s_value = item.split(":", 2)
         return f"which {s_type} you meant by '{s_value}' — I wasn't confident enough to assume that"
+    if item.startswith("inverted_hierarchy:"):
+        _, scope, target = item.split(":", 2)
+        # Addressed to the person asking, in their words, and WITHOUT the
+        # internal level names or the rule that was broken: "target_level
+        # must sit below subject_of" is true and useless to them. What
+        # they can act on is that the two things they named do not nest
+        # in that direction, and which direction does.
+        return (
+            f"which way round you meant — {hierarchy.label_for(scope)}s sit under "
+            f"{hierarchy.label_for(target)}s, not the other way round"
+        )
     if item.startswith("subject:"):
         parts = item.split(":", 2)
         if len(parts) == 3:

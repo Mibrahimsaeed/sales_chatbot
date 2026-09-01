@@ -57,18 +57,40 @@ from app.services.chat_service import PAGE_SIZE, handle_chat_message, handle_sho
 ADVISORS = 40
 
 
-def _answered(wid):
-    """A spread that straddles 60 at EVERY level.
+def _rate(wid):
+    """The RATE each advisor should land on: 39 to 79, straddling 60.
 
-    For one advisor the denominator is 10 x working_days = 100, so this
-    number IS the rate — which is what puts values either side of 60 and,
-    for wid % 5 == 4 combined with wid % 3 == 0, exactly ON it. The
-    per-level moduli below (8 / 5 / 3) then give each of BCM, Zonal Head
-    and Unit Head groups on both sides too; a fixture where one level sat
-    entirely above the threshold would let a broken `<` pass by returning
-    nothing.
+    The per-level moduli (8 / 5 / 3) in the fixture below then give each
+    of BCM, Zonal Head and Unit Head groups on both sides too; a fixture
+    where one level sat entirely above the threshold would let a broken
+    `<` pass by returning nothing.
     """
     return (wid % 5) * 4 + (wid % 3) * 12 + 39
+
+
+def _answered(wid):
+    """`_rate(wid)`, converted into the answered-call COUNT that produces
+    it today.
+
+    THE DENOMINATOR MOVES WITH THE CALENDAR. This returned `_rate(wid)`
+    directly, on the stated assumption that "the denominator is
+    10 x working_days = 100" — i.e. that the month is exactly ten working
+    days old. That is true on ONE day of each month (the 12th of August
+    2026; the month-to-date count is 26 by the 31st), so every rate the
+    engine computed on any other day was `_rate(wid) * 10 / working_days`
+    and the whole population fell below 60. Eight tests here then failed
+    with `min() iterable argument is empty` — a fixture that had silently
+    become time-dependent, not a defect in the filter they exist to
+    guard.
+
+    Inverting the metric's own formula keeps the rates — and therefore
+    every boundary this file exercises — identical on every date.
+    `answered_calls_mtd` is a Float column, so the conversion is exact
+    and no value drifts across the threshold through rounding.
+    """
+    from app.llm import working_days
+
+    return _rate(wid) * working_days.month_to_date() / 10.0
 
 
 @pytest.fixture()
@@ -139,6 +161,42 @@ def _walk(db, text):
         response = handle_show_more(db, session)
         rows += list(response["data"])
     return first, rows, total
+
+
+# ---------------------------------------------------------------------
+# The fixture's own contract
+# ---------------------------------------------------------------------
+
+
+def test_the_fixture_lands_on_the_rates_it_claims_whatever_the_date_is(db):
+    """The spread this file is built on must be the spread the engine
+    computes — on every day of the month, not just one.
+
+    Guards the defect this test was added for: `_answered` returned the
+    intended RATE as a raw COUNT, which is only the same number when the
+    month happens to be ten working days old. Everywhere else the whole
+    population sat below 60 and eight tests below failed on an empty
+    result — the filter they guard was never involved.
+
+    Asserted against `aggregation.metric_value`, the engine that answers
+    the queries, so a change to the rate's formula fails HERE with a
+    readable message instead of surfacing as eight empty result sets.
+    """
+    for wid in range(1, ADVISORS + 1):
+        assert advisor_service.get_advisor_metric(db, wid, RATE) == pytest.approx(
+            _rate(wid)
+        ), f"advisor {wid} does not land on its intended rate"
+
+
+def test_the_intended_spread_straddles_the_threshold_at_every_level(db):
+    """A fixture where one level sat entirely on one side of 60 would let
+    a broken comparator pass by returning nothing — which is exactly how
+    the date bug hid. Asserted rather than assumed."""
+    for _noun, level in LEVELS:
+        _ir, rows = _rows(db, f"answered calls % of all {_noun}")
+        values = [r["value"] for r in rows]
+        assert any(v > 60 for v in values), f"{level}: nothing above 60"
+        assert any(v < 60 for v in values), f"{level}: nothing below 60"
 
 
 # ---------------------------------------------------------------------

@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # The evaluation job below is expensive and non-deterministic, so it is
+  # never attached to a push. It runs on a schedule and on demand.
+  schedule:
+    - cron: "0 6 * * 1"      # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  # =====================================================================
+  # The gate. Hermetic by construction: no provider credential is present
+  # in this job's environment, and backend/conftest.py's
+  # `_hermetic_llm_provider` fixture blanks the key regardless, so a test
+  # cannot reach the network even if a secret leaks into scope. `-m "not
+  # benchmark and not live"` (pytest.ini) keeps both live markers out.
+  # =====================================================================
+  tests:
+    name: hermetic test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: pytest (offline, deterministic)
+        working-directory: backend
+        env:
+          # The suite never reaches a real database or provider; these
+          # satisfy Settings' required fields and nothing more.
+          #
+          # A POSTGRES URL, not sqlite://, even though nothing connects:
+          # app/database/session.py builds its engine at import time with
+          # pool_size/max_overflow, which SQLite's SingletonThreadPool
+          # rejects outright. create_engine is lazy, so no connection is
+          # ever opened — conftest.py builds its own in-memory engines.
+          DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/unused
+          GOOGLE_SERVICE_ACCOUNT: unused
+          CCMC_SHEET_ID: unused
+          BIOMETRIC_SHEET_ID: unused
+          JWT_SECRET: ci-only-not-a-real-secret
+          # Deliberately absent: OPENAI_API_KEY.
+        run: python -m pytest -q
+
+  # =====================================================================
+  # The measurement. NOT a gate — it reports where meaning is lost, and a
+  # regression in it is a conversation, not a red X on someone's PR.
+  #
+  # It preserves run_eval's LIVE-vs-ORACLE split, which is the whole point
+  # of the harness: stage 1 is the running system, stages 2-5 are a
+  # hand-built correct IR. Scoring only the final answer would make an LLM
+  # outage indistinguishable from a validator defect.
+  #
+  # Skipped automatically when the secrets are absent, so a fork or a
+  # contributor without credentials sees a skip rather than a failure.
+  # =====================================================================
+  evaluation:
+    name: complex-query evaluation (live)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check credentials are configured
+        id: creds
+        env:
+          DATABASE_URL: ${{ secrets.EVAL_DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$DATABASE_URL" ] || [ -z "$OPENAI_API_KEY" ]; then
+            echo "EVAL_DATABASE_URL / OPENAI_API_KEY not set — skipping." >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: run_eval (read-only against the eval database)
+        if: steps.creds.outputs.ready == 'true'
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ secrets.EVAL_DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: unused
+          CCMC_SHEET_ID: unused
+          BIOMETRIC_SHEET_ID: unused
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          python -m tests.eval.run_eval | tee eval-report.txt
+          {
+            echo '## Complex-query evaluation'
+            echo '```'
+            sed -n '/^TOTALS/,$p' eval-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Live LLM tests
+        if: steps.creds.outputs.ready == 'true'
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ secrets.EVAL_DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: unused
+          CCMC_SHEET_ID: unused
+          BIOMETRIC_SHEET_ID: unused
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        # `-m live` is the only way these are collected; see pytest.ini.
+        run: python -m pytest -q -m live
+      - uses: actions/upload-artifact@v4
+        if: steps.creds.outputs.ready == 'true'
+        with:
+          name: eval-report
+          path: backend/eval-report.txt

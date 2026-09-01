@@ -1,17 +1,18 @@
 """
-Builds the prompt for the LLM Semantic Parser (Part 5.3). The LLM's job
-changed from "classify an intent into a fixed flat schema" to "author a
-structured, composable QueryIR" — so the schema below is the full IR
-shape (query_ir.py), not the old {intent, advisor_name, team, company,
-metric, period, limit} struct. This is the actual fix for Root Cause #4
-in the redesign brief: the old schema had nowhere to put a second filter,
-a comparator, or a boolean condition — this one does.
+Builds the prompt for the LLM Semantic Parser (Part 5.3).
 
-The metric ontology is included as grounding context (same idea this file
-already used for teams/companies, extended to metrics) so the model can't
-invent a metric key that has no compiler binding — ir_validator.py double
-checks this regardless, but grounding it in the prompt cuts down on wasted
-round trips.
+The LLM is responsible for understanding the user's natural-language query
+and authoring a structured, composable QueryIR.
+
+The business model below is the authoritative semantic layer for the LLM.
+It explains what the organisation's hierarchy, sales funnel, performance,
+attendance, metrics, and business terminology mean.
+
+The LLM must use this business model to interpret the query, but it must
+NEVER access the database directly. The generated QueryIR is validated and
+compiled by downstream deterministic layers before database execution.
+
+Bookings are NOT part of the sales funnel.
 """
 
 import re
@@ -20,287 +21,2272 @@ from app.llm import hierarchy, metric_aliases, periods
 from app.llm.ir_examples import render_examples
 from app.llm.metric_ontology import METRICS, metric_catalog_for_prompt
 
-# Business phrases that don't literally name a metric but have one
-# conventional meaning in this domain. Anything NOT on this list and not a
-# catalog synonym should produce intent="clarify", not a guess.
-BUSINESS_PHRASE_GLOSSARY = """How to read common business phrases:
-- "best performer" / "top performer" / "star" -> sort desc by achievement_pct
-- "underperforming" / "weak" / "bottom performers" -> sort asc by achievement_pct
-- "almost achieved target" / "close to target" -> two filters: achievement_pct >= 80 AND achievement_pct < 100
-- "highest closer" / "biggest closer" -> sort desc by mtd_cleared
-- "doing well" -> sort desc by achievement_pct
-- "punctual" / "shows up on time" -> attendance_rate high (sort desc or filter >)
-- "never on time" / "always late" -> late_count high or attendance_rate low"""
+
+# ---------------------------------------------------------------------------
+# BUSINESS MODEL
+# ---------------------------------------------------------------------------
+
+BUSINESS_MODEL = """
+BUSINESS MODEL — read this before anything else in the prompt.
+
+You are parsing natural-language queries for a real-estate sales
+operations chatbot. Every query is about ONE underlying organisation.
+
+This business model is authoritative for the meaning of the
+organisational hierarchy and business terminology.
+
+Do not assume any structure, relationship, identifier, or metric that is
+not stated here or in the metric catalog supplied elsewhere in this
+prompt.
+
+=======================================================================
+1. FUNDAMENTAL ORGANIZATIONAL DATA STRUCTURE
+=======================================================================
+
+The organisational hierarchy is stored as a DENORMALIZED,
+ADVISOR-CENTRIC hierarchy table.
+
+EVERY ROW REPRESENTS EXACTLY ONE ADVISOR.
+
+Each row contains that Advisor's complete organisational path:
+
+    Team
+      ->
+    Unit Head
+      ->
+    Zonal Head/Manager
+      ->
+    BCM
+      ->
+    Advisor
+      ->
+    Advisor SAP ID
+
+The Advisor SAP ID belongs ONLY to the Advisor represented by that row.
+
+Unit Heads, Zonal Heads/Managers, and BCMs do NOT have separate SAP ID
+fields in this hierarchy table.
+
+Their identity is represented by their NAME appearing in the
+corresponding hierarchy column.
+
+CORE DATA PRINCIPLE:
+
+    ONE ROW = ONE ADVISOR + ONE COMPLETE REPORTING PATH
+
+Do NOT assume that Unit Heads, Zonal Heads/Managers, or BCMs exist as
+separate employee records in this hierarchy table.
+
+The hierarchy table should therefore be interpreted primarily as a map
+of Advisors and the management path associated with each Advisor.
+
+=======================================================================
+2. MEANING OF A HIERARCHY ROW
+=======================================================================
+
+A row such as:
+
+    Team = AMD
+    Unit Head = Faisal Hussain Naqvi
+    Zonal Head/Manager = Faisal Hussain Naqvi
+    BCM = Faisal Hussain Naqvi
+    Advisor = Ahmed Raza
+    SAP ID = 100001
+
+means:
+
+    AMD
+    └── Faisal Hussain Naqvi
+        ├── Unit Head
+        ├── Zonal Head/Manager
+        └── BCM
+            └── Ahmed Raza
+                SAP ID: 100001
+
+The same person appearing in multiple hierarchy columns represents the
+SAME PERSON occupying multiple hierarchy levels.
+
+Do NOT treat those appearances as different employees.
+
+For example:
+
+    Unit Head = Faisal
+    Zonal Head = Faisal
+    BCM = Faisal
+
+does NOT mean there are three Faisals.
+
+It means ONE person, Faisal, occupies all three hierarchy positions.
+
+=======================================================================
+3. HIERARCHY CONTAINMENT
+=======================================================================
+
+The organisational hierarchy is:
+
+{chain}
+
+Read this as a containment relationship.
+
+Each level contains the organisational entities beneath it.
+
+However, the underlying table is Advisor-centric: each physical row is
+still one Advisor and contains the full path leading to that Advisor.
+
+The hierarchy levels therefore describe the REPORTING PATH represented
+by each Advisor row.
+
+The hierarchy is:
+
+    Team
+    ->
+    Unit Head
+    ->
+    Zonal Head/Manager
+    ->
+    BCM
+    ->
+    Advisor
+
+Advisor is the leaf.
+
+Advisor SAP ID identifies the Advisor represented by the row.
+
+=======================================================================
+4. HIGHEST-LEVEL PERSON RULE
+=======================================================================
+
+A person may appear in multiple hierarchy columns.
+
+When a person's name appears at multiple hierarchy levels, determine
+their PRIMARY organisational position using the highest hierarchy level.
+
+Hierarchy priority:
+
+    Unit Head > Zonal Head/Manager > BCM > Advisor
+
+For example, if:
+
+    Faisal Hussain Naqvi
+        appears as Unit Head
+        appears as Zonal Head/Manager
+        appears as BCM
+
+then Faisal's PRIMARY organisational position is:
+
+    Unit Head
+
+Do NOT treat Faisal as primarily a BCM merely because his name also
+appears in the BCM column.
+
+Do NOT treat Faisal's organisational scope as being determined by his
+lower-level occurrences when a higher-level occurrence exists.
+
+This highest-level rule is authoritative for person identification,
+scope resolution, team resolution, and organisational questions.
+
+=======================================================================
+5. FINDING A PERSON
+=======================================================================
+
+When a user asks about a named person, search the person's name across
+ALL hierarchy columns:
+
+    Unit Head
+    Zonal Head/Manager
+    BCM
+    Advisor
+
+Do NOT search SAP ID for Unit Heads, Zonal Heads/Managers, or BCMs,
+because their SAP IDs are not stored in those hierarchy columns.
+
+For Advisors, the Advisor SAP ID is the authoritative identifier for the
+Advisor represented by that row.
+
+A person's name appearing in multiple columns is still one person.
+
+Always determine the person's highest hierarchy level before resolving
+their organisational scope.
+
+=======================================================================
+6. PERSON'S ORGANIZATIONAL SCOPE
+=======================================================================
+
+A person's organisational scope depends on their HIGHEST hierarchy level.
+
+-----------------------------------------------------------------------
+UNIT HEAD
+-----------------------------------------------------------------------
+
+If the person is a Unit Head:
+
+    Unit Head = Person
+
+defines that person's complete organisational scope.
+
+All rows satisfying:
+
+    Unit Head = Person
+
+belong to that Unit Head's scope.
+
+Those rows may contain:
+
+    Zonal Heads/Managers
+    BCMs
+    Advisors
+
+within that Unit Head's organisation.
+
+-----------------------------------------------------------------------
+ZONAL HEAD / MANAGER
+-----------------------------------------------------------------------
+
+If the person's highest level is Zonal Head/Manager:
+
+    Zonal Head/Manager = Person
+
+defines that person's scope.
+
+-----------------------------------------------------------------------
+BCM
+-----------------------------------------------------------------------
+
+If the person's highest level is BCM:
+
+    BCM = Person
+
+defines that person's scope.
+
+-----------------------------------------------------------------------
+ADVISOR
+-----------------------------------------------------------------------
+
+If the person's highest level is Advisor:
+
+    Advisor = Person
+
+or the Advisor SAP ID identifies the Advisor's row.
+
+IMPORTANT:
+
+Do not determine scope by merely finding every occurrence of the
+person's name anywhere in the table.
+
+First determine the person's highest hierarchy level.
+
+Then use the corresponding hierarchy column to establish scope.
+
+=======================================================================
+7. HIGHEST-ROLE EXAMPLE
+=======================================================================
+
+Suppose the table contains:
+
+    Team = AMD
+    Unit Head = Faisal Hussain Naqvi
+    Zonal Head = Faisal Hussain Naqvi
+    BCM = Faisal Hussain Naqvi
+    Advisor = Ahmed Raza
+    SAP ID = 100001
+
+and additional rows with:
+
+    Team = AMD
+    Unit Head = Faisal Hussain Naqvi
+    Zonal Head = Ahmed Khan
+    BCM = Ahmed Khan
+    Advisor = Bilal
+    SAP ID = 100002
+
+Faisal appears at:
+
+    Unit Head
+    Zonal Head
+    BCM
+
+Therefore Faisal's highest role is:
+
+    Unit Head
+
+His organisational scope is:
+
+    Unit Head = Faisal
+
+This scope includes both Ahmed and Bilal.
+
+Do NOT resolve Faisal's team or organisation using:
+
+    Zonal Head = Faisal
+
+or:
+
+    BCM = Faisal
+
+because his Unit Head occurrence is higher.
+
+=======================================================================
+8. TEAM RESOLUTION
+=======================================================================
+
+If a person appears at multiple hierarchy levels, resolve their Team
+using their HIGHEST hierarchy occurrence.
+
+If Faisal's highest role is Unit Head, then:
+
+    "Faisal's team"
+    "Which team does Faisal belong to?"
+    "What team is Faisal in?"
+
+should resolve using:
+
+    Unit Head = Faisal
+
+and return the corresponding Team value(s).
+
+Do NOT search for:
+
+    Zonal Head = Faisal
+
+or:
+
+    BCM = Faisal
+
+when Faisal's highest role is Unit Head.
+
+If multiple Team values are associated with the person's highest-level
+occurrence, preserve the resulting ambiguity rather than inventing one.
+
+=======================================================================
+9. ZONAL RESOLUTION
+=======================================================================
+
+If the user asks:
+
+    "Which zonals are under Faisal?"
+
+and Faisal's highest role is Unit Head:
+
+Find unique Zonal Head/Manager values from rows satisfying:
+
+    Unit Head = Faisal
+
+Do NOT simply search the entire Zonal Head/Manager column for Faisal.
+
+The phrase "under Faisal" means descendants within Faisal's
+highest-level organisational scope.
+
+=======================================================================
+10. BCM RESOLUTION
+=======================================================================
+
+If the user asks:
+
+    "Which BCMs are under Faisal?"
+
+and Faisal is a Unit Head:
+
+Find unique BCM values from rows satisfying:
+
+    Unit Head = Faisal
+
+If the user asks:
+
+    "Which advisors are under Faisal's BCM Ahmed Khan?"
+
+then the scope must preserve BOTH relationships:
+
+    Unit Head = Faisal
+    AND
+    BCM = Ahmed Khan
+
+Do not discard the outer Unit Head scope merely because the BCM is also
+named.
+
+=======================================================================
+11. DIRECT REPORTING — STRICT RULE
+=======================================================================
+
+"Directly reporting to", "reports directly to", "direct reports",
+"directly under", "immediately under", or equivalent wording represents
+a STRICT hierarchy relationship.
+
+Because every hierarchy row represents one Advisor and the row contains
+the complete reporting path, an Advisor is a DIRECT REPORT of a person
+only when that person's name occupies EVERY MANAGEMENT LEVEL BETWEEN
+THAT PERSON AND THE ADVISOR.
+
+For a Unit Head such as Faisal:
+
+    Unit Head = Faisal
+    AND
+    Zonal Head/Manager = Faisal
+    AND
+    BCM = Faisal
+    AND
+    Advisor = specific Advisor
+
+Only rows satisfying ALL of those hierarchy conditions represent
+Advisors directly reporting to Faisal.
+
+This is NOT the same as Faisal's complete Unit Head scope.
+
+=======================================================================
+12. DIRECT REPORTING EXAMPLE
+=======================================================================
+
+Row 1:
+
+    Team = AMD
+    Unit Head = Faisal Hussain Naqvi
+    Zonal Head/Manager = Faisal Hussain Naqvi
+    BCM = Faisal Hussain Naqvi
+    Advisor = Ahmed
+    SAP ID = 100001
+
+Ahmed directly reports to Faisal.
+
+Row 2:
+
+    Team = AMD
+    Unit Head = Faisal Hussain Naqvi
+    Zonal Head/Manager = Ahmed Khan
+    BCM = Ahmed Khan
+    Advisor = Bilal
+    SAP ID = 100002
+
+Bilal does NOT directly report to Faisal.
+
+Bilal is inside Faisal's overall Unit Head scope, but Faisal is not the
+complete reporting-path manager immediately above Bilal.
+
+Therefore:
+
+    "under Faisal"
+
+may include Bilal.
+
+But:
+
+    "directly reporting to Faisal"
+
+must NOT include Bilal.
+
+=======================================================================
+13. DIRECT REPORTING QUERIES
+=======================================================================
+
+"How many advisors report directly to Faisal?"
+
+means:
+
+    Unit Head = Faisal
+    AND
+    Zonal Head/Manager = Faisal
+    AND
+    BCM = Faisal
+
+Then count UNIQUE Advisor SAP IDs.
+
+"Who reports directly to Faisal?"
+
+uses the same strict hierarchy condition and returns the Advisors from
+those rows.
+
+"Which advisors directly report to Faisal?"
+
+uses the same strict hierarchy condition.
+
+Do NOT broaden a direct-report query into the person's entire scope.
+
+=======================================================================
+14. "UNDER" VS "DIRECTLY REPORTING"
+=======================================================================
+
+The chatbot MUST distinguish these concepts.
+
+-----------------------------------------------------------------------
+UNDER
+-----------------------------------------------------------------------
+
+"Under Faisal"
+
+means Faisal's complete organisational scope according to his highest
+hierarchy level.
+
+If Faisal is a Unit Head:
+
+    Unit Head = Faisal
+
+Return descendants represented by those rows.
+
+-----------------------------------------------------------------------
+DIRECTLY REPORTING
+-----------------------------------------------------------------------
+
+"Directly reporting to Faisal"
+
+means the strict complete-path condition:
+
+    Unit Head = Faisal
+    AND
+    Zonal Head/Manager = Faisal
+    AND
+    BCM = Faisal
+
+Only Advisors satisfying the complete direct-reporting path qualify.
+
+The word "directly" MUST NOT be ignored.
+
+=======================================================================
+15. "FAISAL'S ADVISORS" DEFAULT SEMANTICS
+=======================================================================
+
+The following are NOT automatically direct-report questions:
+
+    "Show me Faisal's advisors"
+    "How many advisors does Faisal have?"
+    "What are Faisal's advisors?"
+
+If Faisal's highest role is Unit Head, these mean Faisal's COMPLETE
+Unit Head scope:
+
+    Unit Head = Faisal
+
+Only interpret them as direct reports when the user explicitly uses
+direct-reporting language such as:
+
+    directly
+    direct reports
+    report directly
+    directly reporting
+    immediately reports
+    immediately under
+
+Therefore:
+
+    "How many advisors does Faisal have?"
+
+means:
+
+    Unit Head = Faisal
+
+not:
+
+    Unit Head = Faisal
+    AND Zonal Head = Faisal
+    AND BCM = Faisal
+
+=======================================================================
+16. TARGET LEVEL VS SCOPE PERSON
+=======================================================================
+
+The person defining a scope is NOT necessarily the entity the answer is
+about.
+
+Example:
+
+    "advisors under Faisal"
+
+Faisal is the SCOPE PERSON.
+
+Advisors are the ANSWER SUBJECTS.
+
+Therefore:
+
+    subject_of = unit_head
+    target_level = advisor
+    subject_level = advisor
+
+Do NOT set subject_level = unit_head merely because Faisal is named.
+
+Conversely:
+
+    "Faisal's connects"
+
+asks for Faisal's own metric.
+
+Therefore:
+
+    subject_level = unit_head
+
+The scope entity and answer entity may legitimately have different
+levels.
+
+=======================================================================
+17. HIERARCHY READS
+=======================================================================
+
+Hierarchy language identifies WHO belongs to a scope.
+
+It does not itself determine which metric is requested.
+
+Examples:
+
+    "advisors under Faisal"
+        -> hierarchy population query
+
+    "how many advisors under Faisal"
+        -> hierarchy population/count query
+
+    "connects of advisors under Faisal"
+        -> hierarchy-scoped metric query
+
+    "top advisors under Faisal by connects"
+        -> hierarchy-scoped ranking query
+
+For hierarchy reads:
+
+    target_level = level being requested
+    subject_of = level of the scope person
+    relation = direct or subtree
+    subjects = scope entity
+
+The target level must come from the user's wording when explicitly
+named.
+
+If the target level is NOT explicitly named, use the immediate child
+level of the scope level rather than automatically jumping to Advisor.
+
+=======================================================================
+18. RELATION: DIRECT VS SUBTREE
+=======================================================================
+
+Use:
+
+    relation = direct
+
+when the user explicitly means immediate/direct reporting, including:
+
+    directly
+    directly reports
+    reports directly
+    direct reports
+    directly reporting
+    immediately under
+    immediately reports to
+    personally manages
+    straight to
+
+Use:
+
+    relation = subtree
+
+for broad scope language such as:
+
+    under
+    beneath
+    within
+    in their organisation
+    reporting structure
+    people under them
+
+When wording does NOT explicitly restrict the relationship to immediate
+or direct reports, use subtree.
+
+IMPORTANT:
+
+"under" does NOT mean direct.
+
+"under Faisal" may include Advisors managed through another Zonal
+Head/Manager or BCM.
+
+"directly reporting to Faisal" requires the strict direct condition.
+
+=======================================================================
+19. HIERARCHY LEVELS AND ROLES
+=======================================================================
+
+The verified hierarchy is:
+
+{chain}
+
+The hierarchy levels are authoritative.
+
+{role_meanings}
+
+A management role is a PERSON.
+
+A team is a GROUPING of Advisors.
+
+Do NOT treat:
+
+    team = manager
+
+Do NOT infer a management role from a bare team, company, or region
+mention.
+
+Only map a role when the user's wording actually names that role or uses
+an established synonym.
+
+=======================================================================
+20. ATTRIBUTES ARE NOT HIERARCHY TRAVERSAL
+=======================================================================
+
+The organisational attributes are:
+
+{attributes}
+
+Attributes describe entities but do NOT create reporting relationships.
+
+An attribute is never automatically:
+
+    a parent
+    a child
+    a hierarchy traversal step
+    subject_of
+    target_level of a hierarchy read
+
+For example:
+
+    "advisors in North Region"
+
+is a filter on the region attribute.
+
+It does NOT mean:
+
+    region -> something -> advisor
+
+However, an attribute can still be the subject_level when the user
+explicitly asks for an attribute-level grouping or result, such as:
+
+    "revenue by region"
+    "top regions by revenue"
+
+=======================================================================
+21. NAME COLLISION
+=======================================================================
+
+Several Teams may be named after regions, while the region attribute may
+contain shorter values.
+
+For example:
+
+    Team:
+        North/KPK Region
+        Center Region
+        South Region
+
+while:
+
+    Region attribute:
+        North
+        Center
+        South
+
+These are different fields.
+
+If the user's words match a known Team name, interpret them as a Team
+reference.
+
+Use region when the user is referring to the region attribute.
+
+Never collapse a Team name into a region attribute or vice versa.
+
+=======================================================================
+22. ADVISOR IDENTITY
+=======================================================================
+
+The Advisor SAP ID identifies the Advisor represented by a hierarchy row.
+
+For example:
+
+    Advisor = Ahmed Raza
+    SAP ID = 100001
+
+means SAP ID 100001 belongs to Ahmed Raza.
+
+Do NOT assign that SAP ID to:
+
+    Unit Head
+    Zonal Head/Manager
+    BCM
+
+even if the same person's name appears in those hierarchy columns.
+
+For Advisor-level questions, prefer Advisor SAP ID as the reliable
+identifier when available.
+
+When counting Advisors from hierarchy rows, count UNIQUE Advisor SAP IDs
+rather than blindly counting rows.
+
+=======================================================================
+23. DUPLICATE PERSON NAMES
+=======================================================================
+
+Names may appear in multiple hierarchy columns.
+
+Therefore, interpret a person's name together with their hierarchy
+position.
+
+For example:
+
+    Faisal Hussain Naqvi
+
+may appear as:
+
+    Unit Head
+    Zonal Head/Manager
+    BCM
+
+These are NOT three employees.
+
+They are references to the SAME person.
+
+Use the highest occurrence:
+
+    Unit Head
+
+as Faisal's primary organisational identity.
+
+=======================================================================
+24. BUSINESS DATA FILTERING MODEL
+=======================================================================
+
+The hierarchy table establishes which Advisors belong to a Team,
+Unit Head, Zonal Head/Manager, or BCM.
+
+Business metrics should then be calculated using the Advisors identified
+by the hierarchy.
+
+The LLM does NOT calculate database values.
+
+For example:
+
+    "What were Faisal's sales this month?"
+
+Semantic process:
+
+    1. Identify Faisal.
+    2. Search Faisal across hierarchy columns.
+    3. Determine Faisal's highest hierarchy level.
+    4. Highest level = Unit Head.
+    5. Establish scope using:
+           Unit Head = Faisal
+    6. Extract the unique Advisor SAP IDs represented by those rows.
+    7. Use those Advisor IDs to scope the business dataset.
+    8. Calculate the requested metric downstream.
+    9. Return the result.
+
+The LLM only represents the semantic intent and hierarchy scope.
+
+It must NEVER invent or calculate the numeric database result.
+
+=======================================================================
+25. ADVISOR-LEVEL DATA JOINING
+=======================================================================
+
+Because SAP ID exists only for Advisors, business datasets should
+preferably connect to the organisational hierarchy through Advisor SAP ID.
+
+Example:
+
+Hierarchy Table:
+
+    Team
+    Unit Head
+    Zonal Head
+    BCM
+    Advisor
+    Advisor SAP ID
+    Advisor WID
+
+joins with:
+
+Performance Table:
+
+    Advisor SAP ID
+    Cleared
+    Target
+    %
+
+and may join with:
+
+CCMC Table:
+
+    Advisor WID
+    Connects
+    Answered Calls
+    Meetings
+    ...
+
+This provides the reliable connection between organisational hierarchy
+and business performance.
+
+=======================================================================
+26. CORE ORGANIZATIONAL QUERY LOGIC
+=======================================================================
+
+Every organisational question should conceptually follow:
+
+    IDENTIFY PERSON / ENTITY
+          ->
+    DETERMINE HIGHEST ROLE
+          ->
+    DETERMINE SCOPE
+          ->
+    IDENTIFY TARGET ENTITY LEVEL
+          ->
+    IDENTIFY ADVISOR SAP IDs WHEN NEEDED
+          ->
+    QUERY BUSINESS DATA
+          ->
+    CALCULATE RESULT
+          ->
+    RESPOND
+
+For hierarchy-only questions:
+
+    IDENTIFY PERSON / ENTITY
+          ->
+    DETERMINE HIGHEST ROLE
+          ->
+    TRAVERSE HIERARCHY
+          ->
+    RESPOND
+
+The LLM does not execute these database operations itself. It expresses
+the semantic structure in QueryIR for downstream deterministic layers.
+
+=======================================================================
+27. OPERATIONAL INTERPRETATION
+=======================================================================
+
+Determine the operation from the COMPLETE semantic structure.
+
+Do NOT select an operation from one keyword.
+
+For example:
+
+    "under"
+
+does NOT automatically mean population.
+
+Compare:
+
+    "advisors under Faisal"
+
+with:
+
+    "connects of advisors under Faisal"
+
+with:
+
+    "top advisors under Faisal by connects"
+
+These are different query shapes even though they contain the same
+hierarchy relationship.
+
+Similarly:
+
+    "how many advisors under Faisal"
+
+does not change the target entity type.
+
+It still targets Advisors; "how many" asks for the size of that
+population.
+
+=======================================================================
+28. METRIC-BEARING HIERARCHY QUERIES
+=======================================================================
+
+When a query contains BOTH hierarchy scope language AND a metric:
+
+    hierarchy fields determine WHO is in scope
+    metric determines WHAT is reported
+    filters determine WHICH scoped entities qualify
+    sort/ranking determines HOW results are ordered
+
+Never discard a metric because hierarchy language is also present.
+
+Example:
+
+    "connects of advisors under Faisal"
+
+means:
+
+    scope person = Faisal
+    scope level = unit_head
+    target level = advisor
+    relation = subtree
+    metric = total_connects
+
+Example:
+
+    "top advisors under Faisal by connects"
+
+means:
+
+    scope person = Faisal
+    scope level = unit_head
+    target level = advisor
+    relation = subtree
+    metric = total_connects
+    ranking = descending
+
+=======================================================================
+29. SALES FUNNEL AND BOOKINGS
+=======================================================================
+
+The sales funnel is defined ONLY by stages represented in the supplied
+metric ontology.
+
+Bookings are NOT part of the sales funnel.
+
+Never fold a booking metric into a funnel interpretation.
+
+Never invent a booking metric.
+
+If the user explicitly asks about bookings, resolve them only if a valid
+booking metric exists in the supplied metric catalog.
+
+=======================================================================
+30. ATTENDANCE VS PERFORMANCE
+=======================================================================
+
+Attendance concepts describe whether or when someone showed up:
+
+    attendance_rate
+    attendance_status
+    late counts
+    punctuality
+
+Performance/sales concepts describe what someone accomplished:
+
+    targets
+    achievement
+    revenue
+    connects
+    calls
+    related activity
+
+Do not silently convert an attendance query into a performance query.
+
+Do not silently convert a performance query into an attendance query.
+
+=======================================================================
+31. COUNTS VS RATES
+=======================================================================
+
+"team size" means the COUNT of Advisors in the relevant scope.
+
+A percentage metric is not interchangeable with its underlying count.
+
+A count/amount is not interchangeable with a percentage.
+
+A number in the user's message must be interpreted according to the
+metric it belongs to.
+
+=======================================================================
+32. SALES ACTIVITY TERMINOLOGY
+=======================================================================
+
+Use the metric catalog as the authoritative source for exact metric keys.
+
+Common distinctions must be preserved:
+
+    "connects"
+        -> total_connects
+
+    "called" / "answered calls"
+        -> answered-call count metric
+
+    "connect %"
+        -> answered-call/connect rate metric, represented as
+           answered_calls_rate when that key exists
+
+These are DIFFERENT measures.
+
+Never turn:
+
+    connects -> answered calls
+    answered calls -> connects
+    connect % -> count
+    count -> percentage
+
+Always use the supplied metric catalog as the final authority.
+
+=======================================================================
+33. GENERAL SEMANTIC RULES
+=======================================================================
+
+Use only hierarchy levels and metric keys defined in this prompt.
+
+Preserve EVERY condition and metric the user states.
+
+Silently dropping a condition or metric is incorrect.
+
+Multiple conditions are AND-combined unless the user explicitly signals
+OR or exclusion.
+
+Preserve the requested ranking metric exactly.
+
+Do not invent a ranking metric for a plain population query.
+
+Preserve every subject in a comparison.
+
+Preserve the requested time period exactly.
+
+Never silently substitute MTD for a stated period.
+
+=======================================================================
+34. SEMANTIC PARSING ORDER
+=======================================================================
+
+Before constructing QueryIR, reason in this order:
+
+A. WHO OR WHAT is the user asking about?
+
+Determine the answer entities.
+
+B. IS THERE A SCOPE?
+
+Determine whether the user names an entity and asks about entities
+beneath, within, under, reporting to, or belonging to that entity.
+
+C. WHAT METRIC OR METRICS ARE REQUESTED?
+
+Determine the actual measure being requested or used as a condition.
+
+D. WHAT QUERY SHAPE IS REQUESTED?
+
+Determine whether this is:
+
+    population
+    filtered list
+    ranking
+    single-entity metric
+    comparison
+    breakdown
+
+E. WHAT TIME PERIOD IS REQUESTED?
+
+Only after these semantic decisions should QueryIR fields be filled.
+
+=======================================================================
+35. REQUIRED INTERPRETATION EXAMPLES
+=======================================================================
+
+Question:
+
+    "Who is Faisal Hussain Naqvi?"
+
+Interpretation:
+
+    Faisal appears at multiple hierarchy levels.
+    Highest level = Unit Head.
+
+Therefore Faisal is primarily identified as a Unit Head.
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "What team is Faisal in?"
+
+Interpretation:
+
+    Find rows where:
+        Unit Head = Faisal
+
+Return the corresponding Team value(s).
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "How many advisors are under Faisal?"
+
+Interpretation:
+
+    Find rows where:
+        Unit Head = Faisal
+
+Count UNIQUE Advisor SAP IDs.
+
+This is a subtree/scope question.
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "How many advisors report directly to Faisal?"
+
+Interpretation:
+
+    Find rows where:
+        Unit Head = Faisal
+        AND Zonal Head/Manager = Faisal
+        AND BCM = Faisal
+
+Count UNIQUE Advisor SAP IDs.
+
+This is a strict direct-report question.
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "Who reports directly to Faisal?"
+
+Interpretation:
+
+    Same strict direct-report condition.
+
+Return Advisor names.
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "Who are Faisal's zonals?"
+
+Interpretation:
+
+    Find unique Zonal Head/Manager values where:
+        Unit Head = Faisal
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "Who are Faisal's BCMs?"
+
+Interpretation:
+
+    Find unique BCM values where:
+        Unit Head = Faisal
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "How many advisors does Faisal have?"
+
+Interpretation:
+
+    By default:
+        Unit Head = Faisal
+
+Do NOT interpret this as direct reporting unless the user explicitly
+uses direct-reporting language.
+
+-----------------------------------------------------------------------
+
+Question:
+
+    "Which advisors directly report to the Unit Head in AMD?"
+
+Interpretation:
+
+    AMD identifies the Team scope.
+
+    "directly report" requires strict direct-report semantics.
+
+    "Unit Head" identifies the management level.
+
+    Do NOT invent a specific Unit Head person merely because a known
+    Unit Head happens to belong to AMD.
+
+    Preserve the Team scope and direct-report requirement in QueryIR.
+
+    If the QueryIR schema cannot represent an unspecified Unit Head
+    within a Team while preserving direct-report semantics, use the
+    valid clarification mechanism rather than inventing a person.
+
+=======================================================================
+36. CORE PRINCIPLE
+=======================================================================
+
+The hierarchy table is fundamentally an ADVISOR-CENTRIC ORGANIZATIONAL MAP.
+
+Each Advisor row describes the Advisor's complete reporting path.
+
+Therefore:
+
+    ONE ROW = ONE ADVISOR + ONE COMPLETE REPORTING PATH
+
+The chatbot must use COLUMN-BASED HIERARCHY FILTERING.
+
+Do NOT assume separate employee records exist for:
+
+    Unit Heads
+    Zonal Heads/Managers
+    BCMs
+
+The SAP ID is the unique identifier for the Advisor represented by each
+row.
+
+The name in the Unit Head, Zonal Head/Manager, and BCM columns is the
+person's hierarchy reference.
+
+When the same name appears in multiple hierarchy columns, it refers to
+the same person.
+
+The person's highest hierarchy occurrence determines their primary
+organisational identity.
+
+Most importantly:
+
+    "under" and "directly reporting to" are NOT equivalent.
+
+    "under" means the complete scope of the person's highest role.
+
+    "directly reporting to" requires the complete direct reporting path
+    through every intervening management column.
+
+The LLM must preserve these distinctions in QueryIR rather than
+approximating them.
+"""
+
 
 def _period_union() -> str:
-    """The period enum, from app/llm/periods.py — the same list
-    llm_client's grammar-constrained schema enforces. Hardcoded here as
-    "MTD"|"YTD"|"3M" until Phase 5.1, which is how the prompt came to
-    offer a vocabulary the schema had already outgrown."""
     return " | ".join(f'"{period}"' for period in periods.PERIODS)
 
 
 def _period_glossary() -> str:
     return "\n".join(
-        f"    {period}: {periods.label_for(period)}" for period in periods.PERIODS
+        f"    {period}: {periods.label_for(period)}"
+        for period in periods.PERIODS
     )
 
 
 def _level_union() -> str:
-    """The addressable levels as a JSON-schema-style union.
-
-    Generated from hierarchy.HIERARCHY_LEVELS so the prompt and the
-    grammar-constrained enum in llm_client.QUERY_IR_JSON_SCHEMA are
-    literally the same list. They were hand-written separately, and had
-    drifted badly: the prompt offered `unit` and `business_center`, which
-    the schema REJECTS, and never mentioned `bcm`, which is a real chain
-    level. With strict decoding the model could not comply with the
-    instructions it was given.
-    """
-    return " | ".join(f'"{level}"' for level in hierarchy.HIERARCHY_LEVELS)
+    return " | ".join(
+        f'"{level}"'
+        for level in hierarchy.HIERARCHY_LEVELS
+    )
 
 
 def _chain_description() -> str:
-    """The verified nesting chain, top to bottom, with business labels.
-
-    Phase 1 disproved the chain this prompt used to state and Phase 3
-    replaced it; the prompt was never updated, so the model reasoned
-    about an org chart that does not exist — team at the BOTTOM, a
-    non-existent `unit` level, and no BCM.
-    """
     return " -> ".join(
-        f"{level} ({hierarchy.label_for(level)})" for level in hierarchy.CHAIN
+        f"{level} ({hierarchy.label_for(level)})"
+        for level in hierarchy.CHAIN
     )
 
 
 def _attribute_description() -> str:
-    """The groupable attributes, which do NOT nest — see
-    hierarchy.ATTRIBUTE_LEVELS. Kept separate from the chain in the
-    prompt because conflating the two is what produced "company ->
-    region -> unit_head" as though those contained one another."""
     return ", ".join(
-        f"{level} ({hierarchy.label_for(level)})" for level in hierarchy.ATTRIBUTE_LEVELS
+        f"{level} ({hierarchy.label_for(level)})"
+        for level in hierarchy.ATTRIBUTE_LEVELS
     )
 
 
 def _role_vocabulary() -> str:
-    """Which words name which chain level, from the SAME relation
-    registry the rule-based planner reads (relations.role_aliases via
-    intent_catalog). Previously a hand-written gloss listing synonyms for
-    levels that no longer exist."""
     lines = []
+
     for level in hierarchy.CHAIN:
         if level == "advisor":
             continue
+
         keywords = hierarchy.LEVEL_KEYWORDS.get(level, [])
+
         if keywords:
-            lines.append(f'  {level}: say "{'", "'.join(keywords[:6])}"')
+            lines.append(
+                f'  {level}: say "{", ".join(keywords[:6])}"'
+            )
+
     return "\n".join(lines)
 
 
-def _operation_union() -> str:
-    """The operations the IR can express, from the one registry."""
-    from app.llm.operations import IR_EXPRESSIBLE
+def _role_meanings() -> str:
+    """Describe each hierarchy level using the authoritative registry."""
 
-    return " | ".join(f'"{name}"' for name in sorted(IR_EXPRESSIBLE))
+    lines = []
+
+    for level in hierarchy.CHAIN:
+        label = hierarchy.label_for(level)
+
+        if level == "advisor":
+            meaning = (
+                "one person, the individual sales agent — "
+                "the leaf of the hierarchy and the person represented "
+                "by each hierarchy-table row"
+            )
+        elif level == "team":
+            meaning = (
+                "a named GROUPING of Advisors — "
+                "NOT a manager and NOT a person"
+            )
+        else:
+            child = hierarchy.child_of(level)
+
+            meaning = (
+                f"a PERSON whose hierarchy position manages/oversees "
+                f"the {hierarchy.label_for(child)} level beneath them"
+                if child
+                else "a management/organisational level represented "
+                "by a person's name in the hierarchy path"
+            )
+
+        lines.append(
+            f"   - {level} ({label}): {meaning}"
+        )
+
+    lines.append(
+        "   A management name may appear in multiple hierarchy columns. "
+        "Those appearances refer to the same person. The highest "
+        "hierarchy occurrence determines that person's primary role."
+    )
+
+    lines.append(
+        "   'direct reports' means Advisors whose complete hierarchy path "
+        "contains the manager's name at every intervening management "
+        "level. 'under' means the broader subtree/scope."
+    )
+
+    return "\n".join(lines)
+
+
+def _business_model() -> str:
+    """
+    Build the authoritative business model dynamically from the hierarchy
+    registry.
+    """
+
+    return BUSINESS_MODEL.format(
+        chain=_chain_description(),
+        attributes=_attribute_description(),
+        roles=_role_vocabulary(),
+        role_meanings=_role_meanings(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# BUSINESS PHRASE GLOSSARY
+# ---------------------------------------------------------------------------
+
+BUSINESS_PHRASE_GLOSSARY = """
+COMMON BUSINESS PHRASES — how to read them:
+
+- "best performer" / "top performer" / "star"
+  -> sort desc by achievement_pct
+
+- "underperforming" / "weak" / "bottom performers"
+  -> sort asc by achievement_pct
+
+- "almost achieved target" / "close to target"
+  -> achievement_pct >= 80 AND achievement_pct < 100
+
+- "highest closer" / "biggest closer"
+  -> sort desc by mtd_cleared
+
+- "doing well"
+  -> sort desc by achievement_pct
+
+- "punctual" / "shows up on time"
+  -> attendance_rate high
+
+- "never on time" / "always late"
+  -> late_count high or attendance_rate low
+
+IMPORTANT:
+
+Do not treat these phrases as replacements for explicitly stated
+metrics when the user names a different metric.
+
+If a phrase is not in this glossary but clearly maps to a single metric
+synonym in the supplied catalog, use that metric with appropriate
+confidence.
+
+Use clarification only when the wording genuinely permits two or more
+different metric interpretations and the sentence provides no way to
+resolve the ambiguity.
+"""
+
+
+# ---------------------------------------------------------------------------
+# CONDITIONS
+# ---------------------------------------------------------------------------
+
+CONDITION_VOCABULARY = """
+CONDITIONS
+
+Map comparisons by MEANING, not only exact wording.
+
+> :
+above, over, more than, greater than, higher than, exceeding, beyond
+
+< :
+below, under, less than, lower than, fewer than, beneath, short of
+
+>= :
+at least, no less than, not below, or more, or higher
+
+<= :
+at most, no more than, not above, or fewer, or lower
+
+= :
+exactly, equal to, is
+
+AND:
+Multiple conditions are AND-combined by default.
+
+OR:
+Use filter_tree with op="or".
+
+NOT:
+Use filter_tree with op="not" for exclusions
+(excluding / except / other than / not in).
+
+A stated comparison MUST produce a filter.
+
+If you cannot determine which measure a number belongs to, lower the
+confidence of that filter rather than silently dropping the condition.
+
+Dropping a condition is incorrect because it can return records that the
+user explicitly excluded.
+"""
+
+
+# ---------------------------------------------------------------------------
+# METRIC TYPE
+# ---------------------------------------------------------------------------
+
+def _metric_kind(metric) -> str:
+    from app.llm.metric_ontology import Rollup
+
+    if metric.measures_target_attainment:
+        return "percentage 0-100, attainment of an assigned target"
+
+    if metric.rollup is Rollup.RATIO:
+        return "percentage 0-100"
+
+    if metric.label.strip().endswith("%"):
+        return "percentage 0-100"
+
+    return "count/amount"
+
+
+# ---------------------------------------------------------------------------
+# OPERATIONS
+# ---------------------------------------------------------------------------
+
+def _operation_union() -> str:
+    """Return the exact operations exposed to grammar-constrained decoding."""
+
+    from app.llm.llm_client import _ir_operations
+
+    return " | ".join(f'"{name}"' for name in _ir_operations())
+
+
+# ---------------------------------------------------------------------------
+# IR SEMANTIC RULES
+# ---------------------------------------------------------------------------
+
+def _required_fields() -> str:
+    """Render the schema's own required fields."""
+
+    from app.llm.llm_client import QUERY_IR_JSON_SCHEMA
+
+    return ",\n".join(QUERY_IR_JSON_SCHEMA["required"])
 
 
 def _ir_schema() -> str:
-    """Built at call time so a hierarchy change reaches the prompt without
-    anyone remembering to edit prose."""
     levels = _level_union()
-    # The field names, types and enums are NOT restated here. Ollama
-    # constrains decoding with llm_client.QUERY_IR_JSON_SCHEMA, which is
-    # sent alongside this prompt and lists all 15 fields as `required`, so
-    # the shape is already guaranteed by the grammar. Describing it again
-    # cost ~2,100 tokens a call to prevent mistakes the decoder cannot
-    # make. What remains below is only what a JSON schema cannot say:
-    # what the fields MEAN and when to use which.
-    return f"""Return ONLY a JSON object, no other text, no markdown fences.
+    required_fields = _required_fields()
 
-Emit every field: operation, intent, subject_level, subjects, metric, metrics, filters,
-filter_tree, time_range, sort, limit, group_by, flat, overall_confidence, intent_confidence.
+    return f"""
+Return ONLY a JSON object.
+Do not return markdown.
+Do not return explanations outside the JSON object.
 
-Valid operations: {_operation_union()}
-Valid levels: {levels}
-Valid periods: {_period_union()}
+Emit every field:
 
-OPERATION. "operation" names WHAT THE QUERY DOES, from the list above — it is the single field
-that decides the answer's shape. Set it and "intent" to the matching pair; when unsure, set
-"operation" to null and the intent alone is used.
+{required_fields}.
 
-POPULATION vs RANKING. Use "population" when the question asks WHO and names no measure to
-rank by — "list the advisors excluding Blue Area", "advisors in Blue Area or DownTown". Set
-"metric" to null for it. Do NOT invent a measure to rank a population by: every measure is read
-through its own table, and joining one drops the people who have no row in it, so the list comes
-back shorter than the truth. Use "leaderboard" only when the user actually named something to
-rank by.
+Every one of these is required by the output schema.
 
-TWO QUESTIONS IN ONE MESSAGE. If the message asks two INDEPENDENT things — "who is the top
-advisor in Blue Area and what is their team size" is a ranking and then a property of its winner
-— set "intent" to "clarify" and list what you could not combine in "missing". One structure
-answers one question, so answering half of it silently is worse than saying so. A single question
-that merely mentions two measures or two subjects is NOT this: "connects and answered calls of
-all BCMs" is one question.
+Valid operations:
+{_operation_union()}
 
-MULTIPLE MEASURES. "metric" is the ONE the answer is ranked and sorted by. "metrics" lists
-EVERY measure the question named, primary first — put both in it for "connects and answered
-calls of all BCMs". Leave "metrics" empty when the question names one measure.
+Valid levels:
+{levels}
 
-DIFFERENT MEASURES FOR DIFFERENT PEOPLE. When the question pairs a measure with each subject
-("Zainab's connects and Awais's answered calls"), set each subject's own "metric". Leave a
-subject's "metric" null when it shares the query's measure.
+IMPORTANT:
+The field named "operation" is mandatory.
 
-BOOLEAN FILTERS. "filters" is AND-combined and is the right place for almost everything. Use
-"filter_tree" ONLY for a disjunction or an exclusion the flat list cannot express:
-  "BCMs in Blue Area or Downtown"  -> filter_tree {{"op":"or","children":[team=Blue Area, team=Downtown]}}
-  "advisors excluding Blue Area"   -> filter_tree {{"op":"not","children":[team=Blue Area]}}
-Both are combined with AND, so a query can carry conjuncts in "filters" and one disjunction in
-"filter_tree" at the same time. Nesting is allowed to three levels. Set it to null otherwise.
+The operation must be one of the valid operations above.
+Do not invent an operation.
+Do not leave operation null.
 
-GROUPING. "group_by" changes the level the rows are grouped and reported at, when that differs
-from subject_level. Leave it null unless the question genuinely asks for a different grouping.
+Every operation listed above is one this system can act on.
 
-PERIOD COMPARISON. Set "compare_to" to the period being compared AGAINST ("this month vs last
-month" -> period MTD, compare_to the earlier one). Leave it null for a single-period question.
+WHEN YOU DO NOT KNOW — say so, do not guess.
 
-Org hierarchy, top to bottom — each level CONTAINS the next:
+Use "clarify_metric" when the message is genuinely ambiguous and the
+sentence gives you no way to settle it: two different measures fit the
+wording equally well, or the question names no measure and no subject at
+all.
+
+Do NOT use clarification merely because a query is complex.
+
+`intent` is a legacy compatibility field.
+It must never contradict `operation`.
+Do not use intent to express uncertainty.
+Do not use intent as a substitute for operation.
+
+SUBJECT LEVEL
+
+`subject_level` is the level THE ANSWER IS ABOUT.
+
+This is the level whose entities are being returned, ranked, grouped,
+or reported.
+
+ENTITY-OWN QUERY:
+
+    "Haseeb's connects"
+
+means:
+
+    subject_level = unit_head
+
+because Haseeb is the entity being reported.
+
+SCOPE QUERY:
+
+    "advisors under Haseeb"
+
+means:
+
+    subject_level = advisor
+    subject_of = unit_head
+    target_level = advisor
+
+because the answer is about Advisors, not Haseeb.
+
+Do NOT set subject_level to the scope entity merely because that entity
+is named first.
+
+SUBJECT_LEVEL AND SUBJECTS MUST AGREE.
+
+When exactly one named subject is NOT a scope and the question asks for
+that entity's own figure, subject_level and the subject type describe
+the same entity.
+
+The two may legitimately differ for:
+
+    - hierarchy reads
+    - group_by queries
+    - comparisons whose sides have their own levels
+
+A MEASURE'S OWN LEVEL IS A SEPARATE THING.
+
+The metric catalog says where a measure is stored/read from.
+
+It does NOT determine subject_level.
+
+"What is Agency21's revenue?" is a question about Agency21 even if the
+revenue metric is stored at Advisor level and aggregated downstream.
+
+Valid periods:
+{_period_union()}
+
+OPERATION SELECTION
+
+Determine the operation from the COMPLETE meaning of the query.
+
+Do not choose an operation from one keyword.
+
+Use:
+
+- Asking WHO belongs to a population
+  -> population
+
+- Asking HOW MANY entities belong to a population
+  -> population
+
+- Asking for entities satisfying measure conditions
+  -> filtered_list
+
+- Asking for a metric/value of one specifically named entity
+  -> group_metric
+
+- Asking for metrics of entities beneath a named scope
+  -> filtered_list
+
+- Asking for top/highest/lowest/best/worst entities by a metric
+  -> leaderboard
+
+- Asking to compare two or more subjects
+  -> comparison
+
+- Asking a question that genuinely cannot be settled
+  -> clarify_metric
+
+POPULATION VS FILTERED_LIST
+
+Use population when the user asks WHO belongs to a population and does
+not impose a measure-based condition.
+
+Examples:
+
+    "list the advisors in Blue Area"
+    "advisors under Haseeb"
+    "show all BCMs"
+
+A hierarchy or attribute scope is not automatically a metric filter.
+
+Use filtered_list when the user imposes conditions on measures.
+
+Examples:
+
+    "advisors with connects above 1000"
+    "advisors under Haseeb with connects above 100"
+
+HIERARCHY-SCOPED METRICS
+
+A query can contain:
+
+    1. a scope entity
+    2. a target entity level
+    3. a hierarchy relationship
+    4. a metric
+
+Do NOT collapse these concepts.
+
+Example:
+
+    "connects of advisors under Haseeb Arslan"
+
+means:
+
+    operation = filtered_list
+    subject_level = advisor
+    subject_of = unit_head
+    target_level = advisor
+    relation = subtree
+    metric = total_connects
+    metrics includes total_connects
+
+LEADERBOARD
+
+Use leaderboard when the user explicitly requests ranking/order.
+
+Signals include:
+
+    top
+    highest
+    lowest
+    best
+    worst
+    rank
+    ranked
+    sort by
+    highest by
+    lowest by
+
+Do not create a leaderboard merely because a metric is present.
+
+"connects of advisors under Haseeb"
+is NOT automatically a leaderboard.
+
+"top advisors under Haseeb by connects"
+IS a leaderboard.
+
+TWO QUESTIONS IN ONE MESSAGE
+
+If the message asks two INDEPENDENT questions, use the valid
+clarification mechanism rather than silently answering only one.
+
+A single question containing multiple metrics is NOT automatically two
+questions.
+
+Example:
+
+    "connects and answered calls of all BCMs"
+
+is one query with multiple metrics.
+
+MULTIPLE MEASURES
+
+`metric` is the ONE measure used for ranking/sorting/value when
+applicable.
+
+`metrics` lists EVERY measure explicitly named.
+
+Example:
+
+    "connects and answered calls of all BCMs"
+
+must preserve both:
+
+    metrics = [total_connects, answered_calls]
+
+Do not silently drop one.
+
+DIFFERENT MEASURES FOR DIFFERENT PEOPLE
+
+When a query explicitly pairs different metrics with different subjects,
+preserve those pairings in the subject-level metric fields if supported
+by the schema.
+
+FILTERS
+
+`filters` contains AND-combined conditions.
+
+A filter may use:
+
+    - metric key
+    - hierarchy level
+    - attendance_status
+
+A query may filter by one metric while sorting by another.
+
+Example:
+
+    "BCMs with team size greater than 1 sorted by connects"
+
+must preserve:
+
+    team size > 1
+
+AND:
+
+    sort by connects
+
+Do NOT replace the team-size condition with connects > 1.
+
+BOOLEAN FILTERS
+
+Use filter_tree for OR and NOT structures.
+
+Example:
+
+    "BCMs in Blue Area or Downtown"
+
+means:
+
+    OR(
+        team = Blue Area,
+        team = Downtown
+    )
+
+Example:
+
+    "advisors excluding Blue Area"
+
+means:
+
+    NOT(
+        team = Blue Area
+    )
+
+HIERARCHY READS
+
+Hierarchy reads use:
+
+    target_level
+    subject_of
+    relation
+
+`target_level` = level being asked for.
+
+`subject_of` = level of the scope entity.
+
+`relation`:
+
+    direct  = strict immediate/direct reporting
+    subtree = everyone beneath at any depth
+
+The scope entity goes in `subjects`.
+
+For a named Unit Head:
+
+    subjects = [{{"type":"unit_head","value":"<name>"}}]
+    subject_of = "unit_head"
+    target_level = "advisor"
+
+For a named Team:
+
+    subjects = [{{"type":"team","value":"<team>"}}]
+
+CHOOSE RELATION BY MEANING
+
+Use direct for:
+
+    directly
+    direct reports
+    reports directly
+    directly reporting
+    immediately under
+    immediately reports to
+    personally manages
+    straight to
+
+Use subtree for:
+
+    under
+    beneath
+    within
+    in their organisation
+    reporting structure
+    people under them
+
+IMPORTANT:
+
+For this data model, direct reporting of an Advisor to a manager is
+represented by the manager's name appearing at EVERY intervening
+management level in that Advisor's hierarchy row.
+
+For a Unit Head:
+
+    Unit Head = X
+    AND Zonal Head/Manager = X
+    AND BCM = X
+
+must all hold.
+
+Do NOT represent direct reporting as merely:
+
+    Unit Head = X
+
+when lower management columns can contain another person.
+
+CHOOSING TARGET_LEVEL
+
+Rule 1:
+
+If the question names the target level explicitly, use that level.
+
+Examples:
+
+    "advisors under Haseeb"
+        target_level = advisor
+
+    "teams under Agency21"
+        target_level = team
+
+    "BCMs under Unit Head X"
+        target_level = bcm
+
+Rule 2:
+
+If the question asks for entities beneath a subject but does NOT name
+the target level, use the immediate child level of subject_of.
+
+Do NOT automatically jump to Advisor.
+
+COUNTING
+
+"how many", "count", and "number of" ask for the SIZE of the requested
+set.
+
+Do not change target entity type merely because the user asks "how many".
+
+For:
+
+    "how many advisors under Haseeb"
+
+the target remains:
+
+    advisor
+
+SORT
+
+`sort.metric` names the measure by which rows are ordered.
+
+Leave it null for a population that is not ranked.
+
+`sort.direction`:
+
+    top/best/highest/most -> desc
+    bottom/worst/lowest/fewest -> asc
+
+When no direction is stated, use desc.
+
+"Worst" means least desirable, not necessarily numerically smallest.
+
+For measures where a higher value is worse, such as overdue or late
+arrivals, "worst" may therefore require descending order.
+
+GROUPING
+
+`group_by` changes the level at which results are grouped/reported.
+
+Leave it null unless grouping is explicitly requested.
+
+COMPARISON
+
+Use comparison when the user explicitly asks to compare two or more
+subjects.
+
+Preserve every subject named.
+
+FLAT
+
+For operations supporting flat semantics:
+
+    flat = false by default
+
+Set flat = true only when the user explicitly requests a flat or
+ungrouped list.
+
+HIERARCHY
+
+The verified hierarchy is:
+
 {_chain_description()}
 
-A Team is the widest grouping; an Advisor is one person. Unit Head, Zonal Head and BCM are
-PEOPLE who oversee the level below them — they are not synonyms for "team". Use one of them as
-subject_level (for rankings like "top 5 unit heads by connects") or as a filter field (for
-"advisors under zonal head X") only when the user's words actually name that role:
+The organisational attributes are:
+
+{_attribute_description()}
+
+Attributes do not become hierarchy traversal levels.
+
+ROLE INTERPRETATION
+
 {_role_vocabulary()}
-Never infer one of these from a bare team or company mention.
 
-These are ATTRIBUTES, not levels of the chain — an advisor has one, but they do not contain or
-nest inside each other: {_attribute_description()}.
-"advisors in North Region" filters region; "who is X's zonal head" asks for a person. Use an
-attribute only when the user says that word. A ranking over one ("top companies by revenue",
-"top business centers by connects") is valid and should use it as subject_level.
+Only map a role when the user actually uses that role or an established
+role synonym.
 
-Rules:
-- "filters" holds EVERY condition mentioned, AND-combined by default — a query can filter on
-  one metric while sorting by another (e.g. sort by revenue, filter attendance_status = Late).
-- "field" in a filter is either one of the metric keys below, or one of: {", ".join(hierarchy.HIERARCHY_LEVELS)}, attendance_status.
-- Use "comparison" intent with 2+ entries in "subjects" for "compare X with Y" style queries —
-  this applies at any subject_level, including "compare unit head A with unit head B".
-- Use "breakdown" intent for a question about ONE specific named entity at any level above advisor
-  ("tell me about unit head X", "give me a breakdown of zonal head Y", "show me business center
-  Z") — put that one entity in "subjects" (exactly one entry) at the matching subject_level. This
-  is NOT a ranking (no "metric"/"sort" needed) — it returns that one entity's advisors nested by
-  the level below it. Set "flat": true only if the user explicitly asks for a flat/ungrouped list
-  (e.g. "list all advisors under X, not grouped") — "flat" defaults to false and is ignored for
-  every intent other than "breakdown".
-- Use "filtered_list" when the user wants a list matching conditions but isn't asking for a
-  ranking (no explicit sort implied) — otherwise use "leaderboard".
-- If the user's business language is ambiguous ("struggling", "consistently performs well") and
-  isn't clearly one of the metrics below, set intent to "clarify" and explain your best guess as
-  a filter with a lower confidence rather than inventing a new field.
-- Only use metric keys from the catalog below — never invent one.
-- Every confidence number (including the two below) is 0-1 and scores ONLY its own dimension —
-  don't let one shaky field drag another field's score down.
-- "intent_confidence" scores whether you picked the right QUERY SHAPE (leaderboard vs comparison
-  vs filtered_list vs clarify), independent of whether any one metric/filter/subject value is
-  itself uncertain. A query can have a very confident shape (0.9+) even if the metric guess is
-  shaky, or vice versa.
-- "period" values, and what each means:
+Do not infer a management role from a generic Team/company/region
+mention.
+
+BUSINESS MODEL
+
+The organisation's business semantics are defined by the authoritative
+business model above.
+
+If a field is ambiguous, re-read the business model before deciding.
+
+BOOKINGS RULE
+
+Never add bookings to a sales-funnel interpretation.
+
+If the user asks for a funnel, use only the sales-funnel concepts
+represented by the metric ontology.
+
+If the user explicitly asks about bookings, resolve bookings only if a
+valid booking metric exists.
+
+Never manufacture a booking metric.
+
+METRIC RULE
+
+Only use metric keys from the supplied metric catalog.
+
+Never invent a metric key.
+
+Do not confuse:
+
+    count with rate
+    rate with count
+    activity with performance
+    attendance with sales
+    team size with sales activity
+    connects with answered calls
+    counts with percentage rates
+
+PERIOD COMPARISON
+
+`time_range.compare_to` names the period being compared AGAINST when the
+user asks for one.
+
+Example:
+
+    "this month vs last month"
+
+means:
+
+    period = MTD
+    compare_to = supported earlier-period representation
+
+Emit null for ordinary single-period queries.
+
+Never use compare_to to smuggle in an unsupported period.
+
+PERIOD RULES
+
+Valid periods:
+
 {_period_glossary()}
-  DAILY is for "today" / "right now" / "this morning". Use it when the user names
-  TODAY — do not substitute MTD. Most measures have no daily data and the query will be
-  refused, which is the correct outcome: answering a question about today with
-  month-to-date figures is a wrong answer, not a partial one.
-- Time windows this system cannot express at all (last month, yesterday, this week, a
-  custom date range) are NOT period values. Set intent to "clarify" rather than
-  choosing the nearest period.
-- "time_range.confidence" scores how sure you are about the period. The user not mentioning a
-  time period at all and you defaulting to MTD is a LOW-confidence guess (~0.5-0.6) even though
-  it's a common default — reserve high confidence (0.9+) for when the user's words actually imply
-  or state the period ("this month", "ytd", "year to date", "last 3 months")."""
 
+"today", "right now", or "this morning" means DAILY when DAILY exists.
+
+Do not substitute MTD for TODAY.
+
+Unsupported periods such as:
+
+    last month
+    yesterday
+    this week
+    custom date range
+
+must not be silently converted to another period.
+
+Use the valid clarification mechanism when the requested period cannot
+be represented.
+
+CONFIDENCE
+
+All confidence values are 0-1.
+
+`overall_confidence` is an execution gate.
+
+Emit >= 0.8 when the query is understood and the fields correctly
+represent the user's meaning.
+
+Emit < 0.8 only when you genuinely would not stand behind the parse.
+
+A single uncertain field belongs in that field's confidence rather than
+artificially lowering overall confidence when the rest of the query is
+clear.
+
+`intent_confidence` measures confidence in QUERY SHAPE only.
+
+It does not measure confidence in a metric, subject, or filter.
+
+`time_range.confidence` measures confidence in the selected period.
+
+If no period was stated and the system defaults to MTD, confidence should
+remain relatively low (~0.5-0.6).
+
+Only use high period confidence when the user's wording actually
+establishes the period.
+"""
+
+
+# ---------------------------------------------------------------------------
+# NAME GAZETTEERS
+# ---------------------------------------------------------------------------
 
 _NAME_PREFIX = 4
 
 
-def _mentions_a_name_from(text: str, names: list[str]) -> bool:
-    """Could this message be referring to anyone on this list?
+def _mentions_a_name_from(
+    text: str,
+    names: list[str],
+) -> bool:
 
-    A name is only recognisable in the message if some word in the message
-    is that name's word — so if the message shares no name-word with the
-    list, the list cannot help parse this message and is pure prompt
-    weight. Compared on a 4-character prefix rather than equality so an
-    inexact spelling ("Muhamad" for "Muhammad") still pulls the list in;
-    entity_extractor's fuzzy matcher is what ultimately resolves it.
-    """
-    words = {w for w in re.findall(r"[a-z]{%d,}" % _NAME_PREFIX, text.lower())}
+    words = {
+        w
+        for w in re.findall(
+            r"[a-z]{%d,}" % _NAME_PREFIX,
+            text.lower(),
+        )
+    }
+
     if not words:
         return False
-    prefixes = {w[:_NAME_PREFIX] for w in words}
+
+    prefixes = {
+        w[:_NAME_PREFIX]
+        for w in words
+    }
+
     for name in names:
-        for part in re.findall(r"[a-z]{%d,}" % _NAME_PREFIX, name.lower()):
+        for part in re.findall(
+            r"[a-z]{%d,}" % _NAME_PREFIX,
+            name.lower(),
+        ):
             if part[:_NAME_PREFIX] in prefixes:
                 return True
+
     return False
 
 
-def _person_gazetteer(label: str, names: list[str], text: str, already_grounded: bool) -> list[str]:
-    """One level's name list, included only when it can still do work.
+def _person_gazetteer(
+    label: str,
+    names: list[str],
+    text: str,
+    already_grounded: bool,
+) -> list[str]:
 
-    The 269 known people are ~1,100 tokens on EVERY call, including the
-    many analytical queries that name no person at all ("top 5 advisors by
-    connects"). Two conditions retire it (category B — conditionally
-    required): the level is already grounded, so the resolved value is
-    stated verbatim a few lines below and the list can only restate it; or
-    the message shares no word with any name on it, so no name on it is
-    reachable from this message.
-
-    The list is never truncated to "likely" names — it goes in whole or
-    not at all, so a name the model can reach is never a name the model
-    was shown half of.
-    """
     if not names or already_grounded:
         return []
+
     if not _mentions_a_name_from(text, names):
         return []
-    return [f"Known {label}: {', '.join(names[:200])}"]
+
+    return [
+        f"Known {label}: {', '.join(names[:200])}"
+    ]
 
 
-def _metric_catalog_block(text: str) -> list[str]:
-    """The metric grounding, sized to what the deterministic layer already knows.
+# ---------------------------------------------------------------------------
+# METRIC CATALOG
+# ---------------------------------------------------------------------------
 
-    The catalog's 44 synonym lists are ~1,400 tokens — 63% of the block —
-    and they are metric_aliases.ALIASES rendered as prose: the SAME table
-    the deterministic resolver matches against before the LLM is ever
-    called. When resolve_all() already matched a phrase, restating the
-    table asks the model to redo, less reliably, a string match that has
-    already been done exactly (category D — already resolved
-    deterministically). When it matched nothing, the phrasing is novel and
-    the table is the model's only phrasing-to-key bridge, so it is sent in
-    full (category B — conditionally required).
-
-    Either way EVERY metric key, label and level list is sent, so the model
-    can still choose a metric the resolver never considered, and the match
-    is offered as evidence rather than an instruction — the LLM is the
-    primary planner and has to be able to disagree with the alias table
-    when the sentence means something else.
-    """
-    matched = metric_aliases.resolve_all(text)
-    if not matched:
-        return ["Metric catalog (the ONLY valid metric keys):", metric_catalog_for_prompt()]
+def _metric_catalog_static() -> list[str]:
 
     terse = "\n".join(
-        f"- {m.key}: {m.label} (levels: {', '.join(m.entity_levels)})"
+        f"- {m.key}: {m.label} "
+        f"[{_metric_kind(m)}] "
+        f"(levels: {', '.join(m.entity_levels)})"
         for m in METRICS.values()
     )
-    found = "; ".join(f'"{m.phrase}" -> {m.metric}' for m in matched)
+
     return [
         "Metric catalog (the ONLY valid metric keys):",
         terse,
-        f"Phrases in this message the deterministic alias resolver already matched: {found}. "
-        "Use these unless the sentence clearly means a different measure.",
     ]
 
+
+def _metric_evidence(text: str) -> list[str]:
+
+    matched = metric_aliases.resolve_all(text)
+
+    if not matched:
+        return [
+            "No known metric phrasing matched this message.",
+            "Use the full synonym catalog below to identify the closest "
+            "matching metric key — never invent one:",
+            metric_catalog_for_prompt(),
+        ]
+
+    found = "; ".join(
+        f'"{m.phrase}" -> {m.metric}'
+        for m in matched
+    )
+
+    return [
+        "Deterministic metric evidence:",
+        f"{found}.",
+        (
+            "Treat this as grounding evidence, but interpret the user's "
+            "full sentence semantically. Do not discard a metric because "
+            "the query also contains hierarchy or scope language."
+        ),
+    ]
+
+
+def _metric_catalog_block(text: str) -> list[str]:
+
+    matched = metric_aliases.resolve_all(text)
+
+    if not matched:
+        return [
+            "Metric catalog (the ONLY valid metric keys):",
+            metric_catalog_for_prompt(),
+        ]
+
+    terse = "\n".join(
+        f"- {m.key}: {m.label} "
+        f"(levels: {', '.join(m.entity_levels)})"
+        for m in METRICS.values()
+    )
+
+    found = "; ".join(
+        f'"{m.phrase}" -> {m.metric}'
+        for m in matched
+    )
+
+    return [
+        "Metric catalog (the ONLY valid metric keys):",
+        terse,
+        (
+            "Phrases already matched by deterministic grounding: "
+            f"{found}. Use these as evidence unless the sentence clearly "
+            "means a different measure."
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# PROMPT BUILDER
+# ---------------------------------------------------------------------------
 
 def build_ir_prompt(
     text: str,
@@ -313,61 +2299,158 @@ def build_ir_prompt(
     known_zonal_heads: list[str] | None = None,
     known_bcms: list[str] | None = None,
 ) -> str:
-    # 200 is a generosity cap, not a truncation strategy — the real
-    # gazetteer is far smaller; the cap only guards against a pathological
-    # data load blowing up the prompt.
-    teams_sample = ", ".join(known_teams[:200])
-    companies = ", ".join(known_companies)
 
-    context_lines = [f"You are a query-understanding parser for a real-estate sales operations chatbot."]
-    context_lines.append(f"Known teams: {teams_sample}")
-    context_lines.append(f"Known companies: {companies}")
-    grounded_levels = {k for k, v in grounded_entities.items() if v and not k.startswith("_")}
+    teams_sample = ", ".join(
+        known_teams[:200]
+    )
+
+    companies = ", ".join(
+        known_companies
+    )
+
+    # ---------------------------------------------------------------
+    # STATIC PREFIX
+    # ---------------------------------------------------------------
+
+    context_lines = [
+        "You are a query-understanding parser for a real-estate sales "
+        "operations chatbot.",
+        "",
+        "AUTHORITATIVE BUSINESS MODEL:",
+        _business_model(),
+        "",
+        f"Known teams: {teams_sample}",
+        f"Known companies: {companies}",
+        "",
+    ]
+
+    context_lines.extend(
+        _metric_catalog_static()
+    )
+
+    context_lines.append(
+        CONDITION_VOCABULARY
+    )
+
+    context_lines.append(
+        BUSINESS_PHRASE_GLOSSARY
+    )
+
+    context_lines.append(
+        _ir_schema()
+    )
+
+    context_lines.append(
+        render_examples()
+    )
+
+    # ---------------------------------------------------------------
+    # PER-QUERY TAIL
+    # ---------------------------------------------------------------
+
+    grounded_levels = {
+        k
+        for k, v in grounded_entities.items()
+        if v and not k.startswith("_")
+    }
+
     for label, names, entity_key in (
-        ("unit heads", known_unit_heads or [], hierarchy.LEVEL_ENTITY_KEYS.get("unit_head")),
-        ("zonal heads", known_zonal_heads or [], hierarchy.LEVEL_ENTITY_KEYS.get("zonal_head")),
-        ("BCMs", known_bcms or [], hierarchy.LEVEL_ENTITY_KEYS.get("bcm")),
+        (
+            "unit heads",
+            known_unit_heads or [],
+            hierarchy.LEVEL_ENTITY_KEYS.get("unit_head"),
+        ),
+        (
+            "zonal heads",
+            known_zonal_heads or [],
+            hierarchy.LEVEL_ENTITY_KEYS.get("zonal_head"),
+        ),
+        (
+            "BCMs",
+            known_bcms or [],
+            hierarchy.LEVEL_ENTITY_KEYS.get("bcm"),
+        ),
     ):
         context_lines.extend(
-            _person_gazetteer(label, names, text, entity_key in grounded_levels)
+            _person_gazetteer(
+                label,
+                names,
+                text,
+                entity_key in grounded_levels,
+            )
         )
-    context_lines.extend(_metric_catalog_block(text))
-    context_lines.append(BUSINESS_PHRASE_GLOSSARY)
 
-    # Underscore-prefixed keys are META about the extraction (provenance
-    # — see entity_extractor._finalize_provenance), not grounded values
-    # the model should read. Filtered rather than never-stored so the
-    # metadata stays available to the planner and the audit log while the
-    # prompt text remains exactly what it was before provenance existed.
-    prompt_entities = {k: v for k, v in grounded_entities.items() if not k.startswith("_")}
+    context_lines.extend(
+        _metric_evidence(text)
+    )
+
+    prompt_entities = {
+        k: v
+        for k, v in grounded_entities.items()
+        if not k.startswith("_")
+    }
+
     if prompt_entities:
-        context_lines.append(f"Entities already found by rule-based grounding (use these, don't re-derive): {prompt_entities}")
+        context_lines.append(
+            "Entities already found by rule-based grounding "
+            "(use these, don't re-derive): "
+            f"{prompt_entities}"
+        )
 
     if prior_ir_json:
         context_lines.append(
-            "Previous turn's resolved query (for follow-ups like 'what about last month' or "
-            f"'same for Downtown' — treat the new message as a patch on this): {prior_ir_json}"
+            "Previous turn's resolved query. For follow-ups, treat the "
+            "new message as a semantic patch on this query: "
+            f"{prior_ir_json}"
         )
 
-    # The conversation as MESSAGES, alongside the structured prior IR
-    # above rather than instead of it. The IR is the authoritative record
-    # of what the last query RESOLVED to and the deterministic layer
-    # patches it directly; this is the wording, which carries the
-    # references that layer cannot see — a name that appeared only in a
-    # reply, or a subject that never grounded to an entity.
-    #
-    # Bounded upstream by conversation_memory.recent_turns(), so this
-    # renders whatever fits the configured turn and character budget.
     if recent_turns:
-        rendered = "\n".join(f"  {role}: {text}" for role, text in recent_turns)
-        context_lines.append(
-            "Recent conversation (oldest first) — resolve pronouns and "
-            f"ellipsis against it, but prefer the resolved query above when "
-            f"the two disagree:\n{rendered}"
+        rendered = "\n".join(
+            f"  {role}: {turn_text}"
+            for role, turn_text in recent_turns
         )
 
-    context_lines.append(render_examples())
-    context_lines.append(f'User message: "{text}"')
-    context_lines.append(_ir_schema())
+        context_lines.append(
+            "Recent conversation (oldest first). Resolve pronouns and "
+            "ellipsis against it, but prefer the resolved query above "
+            "when the two disagree:\n"
+            f"{rendered}"
+        )
 
-    return "\n".join(context_lines)
+    context_lines.append(
+        f'User message: "{text}"'
+    )
+
+    return "\n".join(
+        context_lines
+    )
+
+
+# ---------------------------------------------------------------------------
+# PROMPT FINGERPRINT
+# ---------------------------------------------------------------------------
+
+def prompt_fingerprint() -> str:
+    """
+    Hash only the static prompt components.
+
+    This identifies the semantic prompt version without including the
+    user's query or per-query grounding.
+    """
+
+    import hashlib
+
+    static = "\n".join(
+        [
+            _business_model(),
+            *_metric_catalog_static(),
+            CONDITION_VOCABULARY,
+            BUSINESS_PHRASE_GLOSSARY,
+            _ir_schema(),
+            render_examples(),
+        ]
+    )
+
+    return hashlib.sha256(
+        static.encode()
+    ).hexdigest()[:12]

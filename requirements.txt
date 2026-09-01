@@ -1,0 +1,44 @@
+# Pinned to the MAJOR/MINOR families this project is verified against —
+# the versions actually installed in the working environment where the
+# suite passes, not the ones the manifest drifted to claiming.
+#
+# This file was previously listed in .gitignore and therefore untracked,
+# so a fresh clone (and any CI runner) had no way to install the
+# project at all. It was also stale in the other direction: it still
+# pinned `ollama` and `anthropic`, neither of which is imported anywhere
+# since the provider moved to OpenAI, and it was missing `openai`,
+# `rapidfuzz` and `pyyaml`, all three of which ARE imported.
+
+# ---- web ----
+fastapi==0.139.*
+uvicorn[standard]==0.50.*
+httpx==0.28.*              # fastapi.testclient, and the OpenAI SDK's transport
+
+# ---- data ----
+sqlalchemy==2.0.*
+alembic==1.18.*
+psycopg2-binary==2.9.*     # the Postgres driver named by DATABASE_URL
+
+# ---- config / auth ----
+pydantic==2.13.*
+pydantic-settings==2.6.*
+python-jose[cryptography]==3.5.*
+
+# ---- Google Sheets ETL ----
+google-api-python-client==2.149.*
+google-auth==2.55.*
+
+# ---- LLM provider ----
+# THE only provider (app/llm/llm_client.PROVIDER). `ollama` and
+# `anthropic` were removed: neither is imported by any module.
+openai==2.44.*
+
+# ---- NLU ----
+rapidfuzz==3.14.*          # app/llm/fuzzy_match.py
+
+# ---- scheduling ----
+apscheduler==3.11.*
+
+# ---- tests ----
+pytest==9.1.*
+pyyaml==6.*                # tests/benchmark case files

@@ -1,21 +1,21 @@
 """llm_client.py unit tests — the provider is monkeypatched throughout, so
-no real network call and no running Ollama is involved.
+no real network call and no API key is involved.
 
 Verifies the FAIL-SOFT CONTRACT (any exception -> None) and that each
 function wires the right provider parameters, not real model output
-quality. The contracts are unchanged from the OpenAI version of this
-file; only the call shape moved.
+quality. Those contracts are unchanged across both provider migrations;
+only the call shape has moved.
 
 Two seams are used deliberately:
 
   `_chat`    the provider boundary every inference call goes through.
              Tests patch THIS rather than the vendor client's own method,
-             because the previous form reached into
-             `_client.chat.completions.create` — four OpenAI SDK details
-             — and all four broke on the migration, erroring 146 tests
-             that had nothing to do with the provider.
+             because an earlier form reached into
+             `_client.chat.completions.create` — four SDK details, none
+             of them this project's — and all four broke on a provider
+             change, erroring 146 tests that had nothing to do with it.
 
-  `_ollama`  patched only where a test asserts on the raw client call
+  `_openai`  patched only where a test asserts on the raw client call
              (embeddings), which has no separate boundary of its own.
 """
 
@@ -30,8 +30,9 @@ from app.llm.llm_client import call_llm_json, call_llm_structured, create_embedd
 def _fake_chat(content, raise_error=None):
     """Stands in for llm_client._chat.
 
-    Returns the Ollama chat shape — `response.message.content` — and
-    records every call's kwargs on `.calls` for assertions.
+    Returns the provider's chat shape — `response.choices[0].message
+    .content` — and records every call's kwargs on `.calls` for
+    assertions.
     """
     calls = []
 
@@ -39,23 +40,37 @@ def _fake_chat(content, raise_error=None):
         calls.append({"messages": messages, "fmt": fmt, "purpose": purpose})
         if raise_error:
             raise raise_error
-        return SimpleNamespace(message=SimpleNamespace(content=content))
+        return _provider_response(content)
 
     _chat.calls = calls
     return _chat
 
 
-def _fake_ollama_embed(vectors, raise_error=None):
-    """Stands in for the Ollama client's `embed(model=, input=)`."""
+def _provider_response(content='{"ok": true}', **usage):
+    """The chat-completions shape: choices[0].message.content, plus the
+    `usage` block the telemetry line reads its token counts from."""
+    fields = dict(prompt_tokens=9363, completion_tokens=120, total_tokens=9483)
+    fields.update(usage)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content, refusal=None))],
+        usage=SimpleNamespace(**fields),
+    )
+
+
+def _fake_embed(vectors, raise_error=None):
+    """Stands in for the client's `embeddings.create(model=, input=)`."""
     calls = []
 
-    def embed(*, model, input):
+    def create(*, model, input):
         calls.append({"model": model, "input": input})
         if raise_error:
             raise raise_error
-        return SimpleNamespace(embeddings=vectors)
+        return SimpleNamespace(data=[SimpleNamespace(embedding=v) for v in vectors])
 
-    return SimpleNamespace(embed=embed, calls=calls)
+    client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+    client.calls = calls
+    return client
 
 
 # ---- call_llm_structured ----
@@ -76,19 +91,13 @@ def test_structured_call_returns_parsed_json(monkeypatch):
 def test_the_boundary_wires_the_configured_model(monkeypatch):
     """`_chat` is the one place the model is named, so this is where that
     wiring is checked."""
-    seen = {}
-
-    def fake_client_chat(**kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(message=SimpleNamespace(content="{}"))
-
-    monkeypatch.setattr(llm_client, "_ollama", SimpleNamespace(chat=fake_client_chat))
+    seen = _capture_chat(monkeypatch)
 
     llm_client._chat(messages=[{"role": "user", "content": "x"}], fmt="json")
 
-    assert seen["model"] == llm_client.settings.ollama_model
-    assert seen["format"] == "json"
-    assert seen["options"]["temperature"] == 0.0
+    assert seen["model"] == llm_client.settings.openai_model
+    assert seen["response_format"] == {"type": "json_object"}
+    assert seen["temperature"] == 0.0
 
 
 def test_structured_call_fails_soft_on_malformed_json(monkeypatch):
@@ -134,19 +143,19 @@ def test_json_call_fails_soft_on_error(monkeypatch):
 # ---- create_embeddings ----
 
 def test_create_embeddings_returns_vectors(monkeypatch):
-    fake = _fake_ollama_embed([[0.1, 0.2], [0.3, 0.4]])
-    monkeypatch.setattr(llm_client, "_ollama", fake)
-    monkeypatch.setattr(llm_client.settings, "ollama_embedding_model", "nomic-embed-text")
+    fake = _fake_embed([[0.1, 0.2], [0.3, 0.4]])
+    monkeypatch.setattr(llm_client, "_openai", lambda: fake)
+    monkeypatch.setattr(llm_client.settings, "openai_embedding_model", "text-embedding-3-small")
 
     assert create_embeddings(["a", "b"]) == [[0.1, 0.2], [0.3, 0.4]]
-    assert fake.calls[0]["model"] == "nomic-embed-text"
+    assert fake.calls[0]["model"] == "text-embedding-3-small"
     assert fake.calls[0]["input"] == ["a", "b"]
 
 
 def test_create_embeddings_empty_input_short_circuits_without_calling_provider(monkeypatch):
-    fake = _fake_ollama_embed([[0.1]])
-    monkeypatch.setattr(llm_client, "_ollama", fake)
-    monkeypatch.setattr(llm_client.settings, "ollama_embedding_model", "nomic-embed-text")
+    fake = _fake_embed([[0.1]])
+    monkeypatch.setattr(llm_client, "_openai", lambda: fake)
+    monkeypatch.setattr(llm_client.settings, "openai_embedding_model", "text-embedding-3-small")
 
     assert create_embeddings([]) == []
     assert fake.calls == []
@@ -156,8 +165,8 @@ def test_create_embeddings_raises_so_the_policy_layer_can_classify(monkeypatch):
     """embeddings.py owns availability policy: it treats an exception as
     the signal to disable the tier for the process."""
     monkeypatch.setattr(
-        llm_client, "_ollama", _fake_ollama_embed(None, raise_error=RuntimeError("boom")))
-    monkeypatch.setattr(llm_client.settings, "ollama_embedding_model", "nomic-embed-text")
+        llm_client, "_openai", lambda: _fake_embed([], raise_error=RuntimeError("boom")))
+    monkeypatch.setattr(llm_client.settings, "openai_embedding_model", "text-embedding-3-small")
 
     with pytest.raises(RuntimeError):
         create_embeddings(["a"])
@@ -167,7 +176,7 @@ def test_create_embeddings_refuses_when_no_model_is_configured(monkeypatch):
     """The migration's actual breakage: embeddings had no working model
     but were still called on every query. Now it says so, in a type
     embeddings.classify_error() maps to `not_configured`."""
-    monkeypatch.setattr(llm_client.settings, "ollama_embedding_model", "")
+    monkeypatch.setattr(llm_client.settings, "openai_embedding_model", "")
 
     with pytest.raises(llm_client.EmbeddingsNotConfigured):
         create_embeddings(["a"])
@@ -188,30 +197,16 @@ def test_the_not_configured_error_is_classified_distinctly():
 # that the boundary now reports it — and that the numbers are the
 # PROVIDER'S, never inferred from string lengths.
 
-def _ollama_response(content='{"ok": true}', **metadata):
-    """A ChatResponse-shaped fake carrying Ollama's real metadata field
-    names. Durations are NANOSECONDS, as ollama._types documents."""
-    fields = dict(
-        total_duration=2_000_000_000,
-        load_duration=500_000_000,
-        prompt_eval_count=9363,
-        prompt_eval_duration=1_000_000_000,
-        eval_count=120,
-        eval_duration=400_000_000,
-    )
-    fields.update(metadata)
-    return SimpleNamespace(message=SimpleNamespace(content=content), **fields)
-
-
 def _fake_client(response=None, raise_error=None):
     # **kwargs, not a fixed signature: the boundary's parameter set is
-    # config-driven and grows (keep_alive, think), and a fake that pins
-    # today's exact set breaks on every addition without testing anything.
-    def chat(**kwargs):
+    # config-driven and can grow, and a fake that pins today's exact set
+    # breaks on every addition without testing anything.
+    def create(**kwargs):
         if raise_error:
             raise raise_error
         return response
-    return SimpleNamespace(chat=chat)
+    return SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
 
 def _llm_call_lines(caplog):
@@ -224,7 +219,7 @@ def _fields(line):
 
 
 def test_a_successful_call_logs_provider_metadata(monkeypatch, caplog):
-    monkeypatch.setattr(llm_client, "_ollama", _fake_client(_ollama_response()))
+    monkeypatch.setattr(llm_client, "_openai", lambda: _fake_client(_provider_response()))
 
     with caplog.at_level("INFO", logger="llm.client"):
         llm_client._chat(messages=[{"role": "user", "content": "x"}],
@@ -236,18 +231,14 @@ def test_a_successful_call_logs_provider_metadata(monkeypatch, caplog):
 
     assert f["purpose"] == "structured:query_ir"
     assert f["success"] == "True"
-    assert f["model"] == llm_client.settings.ollama_model
-    assert f["provider"] == llm_client.settings.llm_provider
+    assert f["model"] == llm_client.settings.openai_model
+    assert f["provider"] == llm_client.PROVIDER
     # Token counts are the provider's own, not derived from characters.
     assert f["prompt_tokens"] == "9363"
     assert f["output_tokens"] == "120"
-    # Nanoseconds converted to milliseconds.
-    assert f["load_duration_ms"] == "500.0"
-    assert f["prompt_eval_duration_ms"] == "1000.0"
-    assert f["eval_duration_ms"] == "400.0"
-    assert f["total_duration_ms"] == "2000.0"
-    # 120 tokens / 0.4s
-    assert f["eval_tokens_per_second"] == "300.0"
+    assert f["total_tokens"] == "9483"
+    # Measured at the boundary, so it is present whatever the provider
+    # reports about itself.
     assert float(f["duration_ms"]) >= 0
 
 
@@ -255,7 +246,8 @@ def test_a_failed_call_is_timed_and_logged_too(monkeypatch, caplog):
     """A 60-second timeout is the most expensive thing this function can
     do; leaving it unlogged would hide it from the measurement."""
     monkeypatch.setattr(
-        llm_client, "_ollama", _fake_client(raise_error=RuntimeError("provider down")))
+        llm_client, "_openai",
+        lambda: _fake_client(raise_error=RuntimeError("provider down")))
 
     with caplog.at_level("INFO", logger="llm.client"):
         with pytest.raises(RuntimeError):
@@ -266,44 +258,30 @@ def test_a_failed_call_is_timed_and_logged_too(monkeypatch, caplog):
     assert f["error"] == "RuntimeError"
     assert f["purpose"] == "narrative"
     assert float(f["duration_ms"]) >= 0
-    # Nothing invented for metadata the provider never sent.
+    # Nothing invented for counts the provider never sent.
     assert f["prompt_tokens"] == "None"
-    assert f["eval_tokens_per_second"] == "None"
+    assert f["output_tokens"] == "None"
 
 
-def test_absent_metadata_is_recorded_as_none_not_zero(monkeypatch, caplog):
-    """An older Ollama, or a response without timings, must not read as
-    "instant"."""
-    monkeypatch.setattr(llm_client, "_ollama", _fake_client(
-        SimpleNamespace(message=SimpleNamespace(content="{}"))))
+def test_absent_usage_is_recorded_as_none_not_zero(monkeypatch, caplog):
+    """A response without a usage block must not read as "zero tokens"."""
+    monkeypatch.setattr(llm_client, "_openai", lambda: _fake_client(
+        SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="{}", refusal=None))], usage=None)))
 
     with caplog.at_level("INFO", logger="llm.client"):
         llm_client._chat(messages=[], fmt="json", purpose="narrative")
 
     f = _fields(_llm_call_lines(caplog)[0])
-    assert f["load_duration_ms"] == "None"
     assert f["prompt_tokens"] == "None"
+    assert f["output_tokens"] == "None"
     assert f["success"] == "True"
-
-
-def test_throughput_is_none_when_it_cannot_be_computed():
-    assert llm_client._tokens_per_second(None, 1_000_000_000) is None
-    assert llm_client._tokens_per_second(100, None) is None
-    # A zero eval_duration must not divide by zero.
-    assert llm_client._tokens_per_second(100, 0) is None
-    assert llm_client._tokens_per_second(100, 1_000_000_000) == 100.0
-
-
-def test_nanoseconds_convert_to_milliseconds():
-    assert llm_client._ns_to_ms(None) is None
-    assert llm_client._ns_to_ms(0) == 0.0
-    assert llm_client._ns_to_ms(1_500_000_000) == 1500.0
 
 
 def test_the_real_call_sites_label_their_purpose(monkeypatch, caplog):
     """Both purposes must be distinguishable in the log, since the whole
     question is which of the two calls costs what."""
-    monkeypatch.setattr(llm_client, "_ollama", _fake_client(_ollama_response()))
+    monkeypatch.setattr(llm_client, "_openai", lambda: _fake_client(_provider_response()))
 
     with caplog.at_level("INFO", logger="llm.client"):
         call_llm_structured("prompt", {"type": "object"}, "query_ir")
@@ -313,91 +291,62 @@ def test_the_real_call_sites_label_their_purpose(monkeypatch, caplog):
     assert purposes == ["structured:query_ir", "narrative"]
 
 
-# ---- inference configuration (task 2) ----
+# ---- inference configuration ----
 #
-# All four options were previously unset, so every call silently inherited
-# an Ollama default. These pin that each is now sent, and that each comes
-# from config rather than a literal — the point of the change is that the
-# configuration is explicit and therefore measurable.
+# The point of these is that every knob is EXPLICIT and comes from config
+# rather than a literal, so a change can be measured rather than guessed
+# at. The Ollama-only knobs (num_ctx, num_predict, keep_alive, think) went
+# with the Ollama transport; what remains is what this provider accepts.
 
 def _capture_chat(monkeypatch):
     seen = {}
 
-    def chat(**kwargs):
+    def create(**kwargs):
         seen.update(kwargs)
-        return SimpleNamespace(message=SimpleNamespace(content="{}"))
+        return _provider_response("{}")
 
-    monkeypatch.setattr(llm_client, "_ollama", SimpleNamespace(chat=chat))
+    monkeypatch.setattr(llm_client, "_openai", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
     return seen
 
 
-def test_all_four_options_are_sent(monkeypatch):
+def test_every_configured_option_is_sent(monkeypatch):
     seen = _capture_chat(monkeypatch)
     llm_client._chat(messages=[], fmt="json")
 
-    assert seen["think"] is False
-    assert seen["keep_alive"] == llm_client.settings.ollama_keep_alive
-    assert seen["options"]["num_ctx"] == llm_client.settings.ollama_num_ctx
-    assert seen["options"]["num_predict"] == llm_client.settings.ollama_num_predict
+    assert seen["model"] == llm_client.settings.openai_model
+    assert seen["temperature"] == llm_client.settings.openai_temperature
+    assert seen["max_completion_tokens"] == llm_client.settings.openai_max_output_tokens
 
 
 def test_the_values_come_from_config_not_literals(monkeypatch):
     """Environment-configurable is the requirement; a literal in the
     client would defeat it."""
-    monkeypatch.setattr(llm_client.settings, "ollama_keep_alive", "5m")
-    monkeypatch.setattr(llm_client.settings, "ollama_num_ctx", 32768)
-    monkeypatch.setattr(llm_client.settings, "ollama_num_predict", 256)
-    monkeypatch.setattr(llm_client.settings, "ollama_think", True)
+    monkeypatch.setattr(llm_client.settings, "openai_model", "some-other-model")
+    monkeypatch.setattr(llm_client.settings, "openai_temperature", 0.7)
+    monkeypatch.setattr(llm_client.settings, "openai_max_output_tokens", 256)
 
     seen = _capture_chat(monkeypatch)
     llm_client._chat(messages=[], fmt="json")
 
-    assert seen["keep_alive"] == "5m"
-    assert seen["options"]["num_ctx"] == 32768
-    assert seen["options"]["num_predict"] == 256
-    assert seen["think"] is True
+    assert seen["model"] == "some-other-model"
+    assert seen["temperature"] == 0.7
+    assert seen["max_completion_tokens"] == 256
 
 
-def test_think_is_disabled_by_default():
-    """qwen3 reasons by default. Both calls are constrained
-    transformations, so thinking is pure latency on the interactive
-    path."""
-    assert llm_client.settings.ollama_think is False
+def test_temperature_defaults_to_deterministic():
+    """Both call sites are deterministic transforms — text to QueryIR
+    under a schema, and a copy-edit rejected if it introduces a number.
+    Sampling adds variance to a task with one right answer and makes a
+    wrong parse unreproducible."""
+    assert llm_client.settings.openai_temperature == 0.0
 
 
-def test_think_can_be_omitted_entirely(monkeypatch):
-    """None is the escape hatch for a model that rejects the parameter —
-    config alone, no code change."""
-    monkeypatch.setattr(llm_client.settings, "ollama_think", None)
-    seen = _capture_chat(monkeypatch)
-    llm_client._chat(messages=[], fmt="json")
-
-    assert "think" not in seen
-
-
-def test_num_ctx_holds_the_measured_worst_case_prompt():
-    """The largest observed prompt is ~9,623 tokens by a chars/4 estimate
-    that UNDER-counts dense JSON and name lists. The window must clear
-    that plus generation plus growth — and must never be 4096, because
-    the user's question sits near the END of the prompt, so a truncating
-    window loses the question itself."""
-    settings = llm_client.settings
-    assert settings.ollama_num_ctx >= 16384
-    assert settings.ollama_num_ctx > 9623 + settings.ollama_num_predict
-
-
-def test_num_predict_clears_the_largest_real_output():
-    """A large realistic QueryIR serialises to ~331 tokens; the narrative
-    reply is 60-120. The ceiling is a runaway guard, so it must not be
-    tight enough to truncate a legitimate answer."""
-    assert llm_client.settings.ollama_num_predict >= 512
-
-
-def test_temperature_is_unchanged(monkeypatch):
-    """Task 2 changes configuration, not sampling."""
-    seen = _capture_chat(monkeypatch)
-    llm_client._chat(messages=[], fmt="json")
-    assert seen["options"]["temperature"] == 0.0
+def test_the_output_ceiling_clears_the_largest_real_output():
+    """A maximal valid QueryIR serialises to ~347 tokens and the
+    narrative reply is 60-120. The ceiling is a runaway guard, so it must
+    not be tight enough to truncate a legitimate answer."""
+    assert llm_client.settings.openai_max_output_tokens >= 512
 
 
 def test_the_options_reach_both_real_call_sites(monkeypatch):
@@ -405,8 +354,8 @@ def test_the_options_reach_both_real_call_sites(monkeypatch):
     seen = _capture_chat(monkeypatch)
 
     call_llm_structured("prompt", {"type": "object"}, "query_ir")
-    assert seen["options"]["num_ctx"] == llm_client.settings.ollama_num_ctx
+    assert seen["max_completion_tokens"] == llm_client.settings.openai_max_output_tokens
     seen.clear()
 
     call_llm_json("prompt")
-    assert seen["options"]["num_ctx"] == llm_client.settings.ollama_num_ctx
+    assert seen["max_completion_tokens"] == llm_client.settings.openai_max_output_tokens

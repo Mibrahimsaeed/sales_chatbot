@@ -296,7 +296,29 @@ def merge(prior, current, spec: TurnSpec, decision: Ellipsis) -> MergeResult:
                  f"the comparison's sides are at {prior.subjects[0].type!r}, which is "
                  "the level its answer is grouped at")
             )
-        if current.intent != "comparison":
+        # ONLY A COMPARISON INHERITS ITS OPERATION.
+        #
+        # The comment above says "the previous turn was a comparison", and
+        # the condition did not check that — it fired whenever the prior
+        # turn had ANY subjects, which is most of them. So an elliptical
+        # follow-up after a single-subject question took the PREVIOUS
+        # turn's operation over its own:
+        #
+        #   "What is Blue Area's revenue?"   -> group_metric
+        #   "top 5"                          -> parsed as leaderboard,
+        #                                       overwritten to group_metric
+        #
+        # and a request to rank came back as one group's figure. The
+        # inheritance is legitimate for a comparison, because dropping the
+        # sides degrades a two-sided question into a ranking of
+        # everything; it is not legitimate anywhere else, where THIS
+        # turn's shape is the question being asked.
+        #
+        # `resolved_operation()` on both sides, not `intent`: `population`
+        # and `group_metric` declare no ir_intent, so reading `intent`
+        # cannot tell a comparison from either of them.
+        if (prior.resolved_operation() == "comparison"
+                and current.resolved_operation() != "comparison"):
             current.intent = prior.intent
             # BOTH NAMES, OR THEY DISAGREE. `operation` and `intent` are
             # the same fact under the old and new vocabularies, and

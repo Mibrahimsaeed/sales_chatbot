@@ -186,7 +186,16 @@ def _effective_metric(ir) -> str | None:
     no-op for it. It bites only on an LLM-built IR that names a measure
     and a period that don't match — exactly the case worth catching.
     """
-    metric_key = ir.sort.metric or (ir.metric.key if ir.metric else None)
+    # THE SAME READING the validator uses (QueryIR.primary_metric), so
+    # "this query has a measure" and "this is the measure to compute"
+    # can never disagree. Reading `sort`/`metric` alone returned None for
+    # a filter-only query — the compiler then answered "no data" for a
+    # question whose measure was stated plainly in the filter.
+    #
+    # It returns None for a population, which is correct and load-bearing:
+    # that operation asks WHO, so there is no value column to compute and
+    # the rows come back without one.
+    metric_key = ir.primary_metric()
     if not metric_key:
         return None
     period = getattr(ir.time_range, "period", None)
@@ -288,7 +297,91 @@ def _is_population_query(ir: QueryIR) -> bool:
     deliberate, which is what separates it from an IR that simply failed
     to resolve a measure — that one must still be refused.
     """
+    if ir.is_hierarchy_read():
+        # A hierarchy read is a population WHEN IT NAMES NO MEASURE, and
+        # only then. "who reports to X" enumerates people with nothing to
+        # rank them by, and belongs here. "connects of advisors under X"
+        # names one — and this branch used to return True regardless, so
+        # the measure was dropped on the way to a metric-free query and
+        # every row came back with value=None. The header read "Total
+        # Connects" and the cell read "—", while the two companion
+        # columns, which are re-read per row rather than taken from the
+        # row's own value, showed real numbers. Six of six phrasings
+        # across connects, meetings, revenue and rates lost the figure,
+        # the ranked form included: "top advisors under X by connects"
+        # was ranked by nothing.
+        #
+        # The rule this restores is the one stated above: a population is
+        # the ABSENCE of a measure. `primary_metric()` is the single
+        # reading of whether one is present, shared with the validator
+        # and `_effective_metric`, so the three cannot disagree.
+        return ir.primary_metric() is None
     return ir.resolved_operation() == "population"
+
+
+def _hierarchy_subject(db, ir: QueryIR):
+    """The person (or group) the target level sits beneath.
+
+    Two ways a subject reaches here, and the IR says which:
+
+      named outright   subjects[0].type == subject_of, so the named
+                       value IS the manager.
+      named by ROLE    subjects[0] is a SCOPE and `subject_of` is the
+        WITHIN A SCOPE role inside it ("the Unit Head in AMD"). The
+                       holder is read out of the scope with
+                       hierarchy_service.get_manager_of_group — the same
+                       resolver reverse lookups already use, rather than
+                       a second way of asking who holds a role.
+
+    Returns (level, value) or None when nothing can be resolved.
+    """
+    if not ir.subjects:
+        return None
+    subject = ir.subjects[0]
+    manager_level = ir.subject_of or subject.type
+
+    if subject.type == manager_level:
+        return manager_level, (subject.resolved_id or subject.value)
+
+    from app.services import hierarchy_service
+
+    holder = hierarchy_service.get_manager_of_group(
+        db, subject.type, (subject.resolved_id or subject.value), manager_level
+    )
+    managers = (holder or {}).get("managers") or []
+    # Exactly one holder, or nothing. Several holders is a question for
+    # the user, not a row this layer may pick — the dispatcher owns that
+    # clarification and this returning None keeps the two from disagreeing.
+    if len(managers) != 1:
+        return None
+    return manager_level, managers[0]
+
+
+def _apply_hierarchy_scope(db, query, ir: QueryIR):
+    """Scope a hierarchy read to the subject, at the requested depth.
+
+    DELEGATES ENTIRELY. `direct_scope_filter` and `subtree_scope_filter`
+    already encode what "directly beneath" and "anywhere beneath" mean —
+    including the self-exclusion that stops a manager counting as one of
+    their own reports — so this only chooses between them from
+    `ir.relation` and hands over.
+    """
+    if not ir.is_hierarchy_read():
+        return query
+
+    resolved = _hierarchy_subject(db, ir)
+    if resolved is None:
+        return query
+    manager_level, manager_value = resolved
+
+    predicate = (
+        hierarchy.direct_scope_filter(manager_level, manager_value, ir.target_level)
+        if ir.relation == "direct"
+        else hierarchy.subtree_scope_filter(manager_level, manager_value, ir.target_level)
+    )
+    if predicate is None:
+        return query
+    return query.filter(predicate)
 
 
 def _build_population_query(db, ir: QueryIR):
@@ -309,6 +402,7 @@ def _build_population_query(db, ir: QueryIR):
         query = query.filter(group_col.isnot(None))
 
     query = query.filter(Advisor.in_master_sheet.is_(True))
+    query = _apply_hierarchy_scope(db, query, ir)
     query = _apply_entity_filters(query, ir)
     query = _apply_subject_filter(query, ir)
     query = _apply_attendance_filter(query, ir, joined)
@@ -382,9 +476,22 @@ def _build_team_named_query(db, ir: QueryIR, binding: ColumnBinding):
         if f.field == "team":
             query = query.filter(model.team.ilike(f"%{f.value}%"))
 
-    subject_names = [s.resolved_id or s.value for s in ir.subjects if s.type == "team"]
-    if subject_names:
-        query = query.filter(model.team.in_(subject_names))
+    # SAME MECHANISM AS THE ADVISOR-ROOTED PATH, within what this table
+    # can express. `binding.team_named` means the ROW IS A TEAM: this
+    # model carries a team column and nothing else, so `team` here is not
+    # a chosen level but the only one the source has. Subjects are still
+    # read through _subjects_by_level so the grouping and the OR-within-a-
+    # level rule cannot drift from the other path.
+    #
+    # A subject at any OTHER level cannot be honoured here — there is no
+    # company or region column on this row to match, and reaching one
+    # would mean joining Advisor, which is a different query shape than
+    # this path exists to build. It is left unapplied, as before.
+    team_subjects = _subjects_by_level(ir).get("team") or []
+    if team_subjects:
+        query = query.filter(or_(*(
+            model.team.ilike(s.resolved_id or s.value) for s in team_subjects
+        )))
 
     return query, value_col
 
@@ -447,6 +554,57 @@ def _apply_entity_filters(query, ir: QueryIR):
     return query
 
 
+def _subjects_by_level(ir: QueryIR) -> dict:
+    """Grounded subjects grouped by THEIR OWN level.
+
+    THE DEFECT THIS EXISTS FOR. `_apply_subject_filter` used to build its
+    predicate from `hierarchy.column_for(ir.subject_level)` — the level
+    the answer is REPORTED at — and keep only the subjects whose type
+    already equalled it. A subject naming a container therefore matched
+    nothing and was dropped in silence: "top teams in <a company> by
+    revenue" carries subject_level="team" and a `company` subject, so the
+    scope vanished and the query ranked every team in the business. The
+    same shape leaked on company->advisor, team->advisor, region->team
+    and region->advisor, on every operation that reaches the compiler.
+
+    A subject's level is a property OF THE SUBJECT, not of the reporting
+    level, so it is read from `s.type` here. Scoping across levels needs
+    no join: every level is a column on the advisor row (see
+    hierarchy.scope_filter, "THE one definition of in scope"), which is
+    why this is a grouping rather than a traversal.
+
+    COMBINATION RULES, both taken from behaviour that already exists
+    rather than invented for this:
+      - within one level, OR. Two teams mean either team, which is what
+        the previous `column.in_(names)` meant and what a comparison
+        needs.
+      - across levels, AND — each level appends its own `query.filter`,
+        exactly as `_apply_entity_filters` already does for two filters
+        on different fields.
+    A subject whose type names no hierarchy column is skipped rather than
+    guessed at.
+    """
+    # A COMPARISON'S SUBJECTS ARE ITS SIDES, not a scope around it.
+    # "compare <team A> and <team B>" names the two things to set beside
+    # each other, so a subject of some OTHER type is not a container to
+    # scope into — it is noise, and ignoring it is the behaviour this
+    # path has always had (test_comparison_still_requires_exact_subject_
+    # type_match pins it deliberately). Scoping it instead would
+    # intersect the sides away and answer with nothing.
+    #
+    # The same split the validator already draws between an operation
+    # whose subject IS the answer and one whose subject CONTAINS it.
+    subjects = ir.subjects
+    if ir.resolved_operation() == "comparison":
+        subjects = [s for s in subjects if s.type == ir.subject_level]
+
+    grouped: dict = {}
+    for subject in subjects:
+        if hierarchy.column_for(subject.type) is not None:
+            grouped.setdefault(subject.type, []).append(subject)
+    return grouped
+
+
 def _apply_subject_filter(query, ir: QueryIR):
     """Any grounded subject scopes the query down to it — not just for
     intent=="comparison" (comparisons compile as a normal query with an
@@ -475,22 +633,25 @@ def _apply_subject_filter(query, ir: QueryIR):
     silently dropping the unresolved subjects out of a comparison."""
     if not ir.subjects:
         return query
-    column = hierarchy.column_for(ir.subject_level)
-    if column is None:
+
+    grouped = _subjects_by_level(ir)
+    if not grouped:
         return query
 
-    subjects = [s for s in ir.subjects if s.type == ir.subject_level]
-    if not subjects:
-        return query
+    for level, subjects in grouped.items():
+        # An advisor subject addresses ONE person, and a name cannot:
+        # 238 name groups in production map to more than one human, so
+        # matching by name sums several people into one row. Unchanged.
+        if level == "advisor":
+            wids = [s.resolved_wid for s in subjects if s.resolved_wid is not None]
+            if wids and len(wids) == len(subjects):
+                query = query.filter(Advisor.wid.in_(wids))
+                continue
 
-    if ir.subject_level == "advisor":
-        wids = [s.resolved_wid for s in subjects if s.resolved_wid is not None]
-        if wids and len(wids) == len(subjects):
-            return query.filter(Advisor.wid.in_(wids))
-
-    names = [s.resolved_id or s.value for s in subjects]
-    if names:
-        query = query.filter(column.in_(names))
+        query = query.filter(or_(*(
+            hierarchy.scope_filter(level, s.resolved_id or s.value)
+            for s in subjects
+        )))
     return query
 
 
@@ -817,6 +978,23 @@ def _build_advisor_rooted_query(db, ir: QueryIR, binding: ColumnBinding):
 
     query = _apply_entity_filters(query, ir)
     query = _apply_subject_filter(query, ir)
+    # A HIERARCHY READ KEEPS ITS DEPTH WHEN IT CARRIES A MEASURE.
+    #
+    # This was reached only from `_build_population_query`, so a metric-
+    # bearing hierarchy read — which no longer detours through that path
+    # — would be scoped by the subject filter alone. That filter is a
+    # plain column match, i.e. the whole subtree: it cannot express
+    # "directly under", and it does not exclude a manager from their own
+    # reports. Both meanings live in `direct_scope_filter` /
+    # `subtree_scope_filter`, and `_apply_hierarchy_scope` already picks
+    # between them from `ir.relation`, so it is called here rather than
+    # restated. Measured without it, "directly under" returned the whole
+    # subtree (7 people where 0 are direct reports) and the manager
+    # appeared among their own reports.
+    #
+    # A no-op for every other query: it returns immediately unless
+    # `is_hierarchy_read()`.
+    query = _apply_hierarchy_scope(db, query, ir)
     query = _apply_attendance_filter(query, ir, joined)
     query = _apply_metric_filters(query, ir, level, joined)
     # P0: the boolean structure, ANDed on after the flat conjuncts above.

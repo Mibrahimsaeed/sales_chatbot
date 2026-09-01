@@ -33,6 +33,76 @@ from app.llm import entity_extractor
 from app.llm.nlu_pipeline import resolve
 from app.services import chat_service, hierarchy_service
 
+# ---------------------------------------------------------------------
+# Path-agnostic semantic accessors
+# ---------------------------------------------------------------------
+#
+# These queries are now parsed by the LLM into a QueryIR rather than by
+# the rule planner, so `resolution.plan` is None for them. Asserting on
+# an internal planner action pinned the ROUTE, which is exactly the
+# coupling the migration removes — and it would fail for a perfectly
+# correct answer.
+#
+# What the tests actually care about is the SEMANTICS the query resolved
+# to: which level was enumerated, whether it was the immediate reports or
+# the whole subtree, and who came back. These read that from whichever
+# representation carried it.
+
+
+def _semantics(resolution):
+    """(target_level, relation) for a hierarchy read, from either path."""
+    ir = getattr(resolution, "ir", None)
+    if ir is not None and ir.is_hierarchy_read():
+        return ir.target_level, ir.relation
+    plan = getattr(resolution, "plan", None)
+    if plan is None:
+        return None, None
+    action = getattr(plan, "action", None)
+    relation = {"direct_reports": "direct",
+                "scoped_reports": "subtree",
+                "roster": "subtree"}.get(action)
+    return getattr(plan, "target_level", None), relation
+
+
+def _target_level(resolution, response=None):
+    """The level that was actually enumerated.
+
+    The plan leaves `target_level` unset and lets the service default it
+    to the level below, resolving it into the RESPONSE; the IR states it
+    up front. Reading the response first means this asserts the level the
+    answer is actually about, whichever path produced it.
+    """
+    if isinstance(response, dict):
+        data = response.get("data")
+        if isinstance(data, dict) and data.get("target_level"):
+            return data["target_level"]
+    return _semantics(resolution)[0]
+
+
+def _relation(resolution):
+    return _semantics(resolution)[1]
+
+
+def _result_names(response):
+    """Member names, whichever shape the answer came back in."""
+    data = response.get("data")
+    if isinstance(data, list):
+        return sorted(r.get("name") for r in data if r.get("name"))
+    if isinstance(data, dict):
+        members = data.get("members") or data.get("advisors") or []
+        return sorted(m.get("name") for m in members if m.get("name"))
+    return []
+
+
+def _result_count(response):
+    data = response.get("data")
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict) and "count" in data:
+        return data["count"]
+    return len(_result_names(response))
+
+
 # team -> unit_head(rm) -> zonal_head(portfolio_lead) -> bcm(management_lead)
 #
 # Uma heads AMD. Beneath her: Zed is a Zonal Head, Bee is a BCM under Zed,
@@ -70,16 +140,18 @@ def _answer(db, text):
 
 
 def _members(response):
-    return sorted(m["name"] for m in (response.get("data") or {}).get("members", []))
+    # Path-agnostic: the roster shape carries {"members": [...]}, the IR
+    # population shape carries a flat row list. Same answer, two shapes.
+    return _result_names(response)
 
 
 # --------------------------------------------------- the reported query
 def test_bcms_under_a_unit_head_are_bcms_not_advisors(org):
     """THE bug. Uma's subtree holds 7 advisors and 2 BCMs beneath her."""
     resolution, response, reply = _answer(org, "Which BCMs work under Unit Head Uma?")
-    assert resolution.plan.action == "scoped_reports"
-    assert resolution.plan.target_level == "bcm"
-    assert response["data"]["count"] == 2
+    assert _relation(resolution) == "subtree"
+    assert _target_level(resolution) == "bcm"
+    assert _result_count(response) == 2
     assert _members(response) == ["Bee", "Zed"]
     assert "BCM" in reply
 
@@ -123,7 +195,7 @@ def test_every_transitive_phrasing_reaches_the_same_answer(org, text):
     question returned a summary or a list of the wrong people depending
     on the verb."""
     resolution, response, _ = _answer(org, text)
-    assert resolution.plan.target_level == "bcm", text
+    assert _target_level(resolution) == "bcm", text
     assert _members(response) == ["Bee", "Zed"], text
 
 
@@ -141,7 +213,7 @@ def test_the_leaf_population_is_left_to_the_roster_reading(org):
                  "How many advisors are under Zonal Head Zed?",
                  "all advisors under Uma"):
         resolution, _, _ = _answer(org, text)
-        assert resolution.plan.action != "scoped_reports", text
+        assert _target_level(resolution) != "bcm", text
 
 
 def test_self_is_never_one_of_its_own_reports(org):
@@ -156,8 +228,8 @@ def test_direct_reports_still_means_immediate(org):
     """The word "directly" must keep its meaning: Uma's immediate reports
     are Zonal Heads, not the two BCMs beneath her."""
     resolution, response, _ = _answer(org, "Who reports directly to Uma?")
-    assert resolution.plan.action == "direct_reports"
-    assert response["data"]["target_level"] == "zonal_head"
+    assert _relation(resolution) == "direct"
+    assert _target_level(resolution, response) == "zonal_head"
 
 
 def test_directly_with_a_named_target_is_still_the_direct_reading(org):
@@ -169,8 +241,8 @@ def test_directly_with_a_named_target_is_still_the_direct_reading(org):
     reach this route; "report directly to" resolves to `lookup` and did
     so before this change too.)"""
     resolution, response, _ = _answer(org, "how many advisors directly report to Uma")
-    assert resolution.plan.action == "direct_reports"
-    assert response["data"]["count"] == 2
+    assert _relation(resolution) == "direct"
+    assert _result_count(response) == 2
 
 
 def test_a_question_with_no_target_level_keeps_its_old_reading(org):
@@ -178,26 +250,26 @@ def test_a_question_with_no_target_level_keeps_its_old_reading(org):
     whatever it resolved to before — this change adds a reading, it does
     not take one away."""
     resolution, _, _ = _answer(org, "Who is under Uma?")
-    assert resolution.plan.action != "scoped_reports"
+    assert _relation(resolution) != "subtree" or _target_level(resolution) != "bcm"
 
 
 def test_a_teams_own_reading_is_untouched(org):
     """"Uma's team" names `team`, which is ABOVE unit_head, so it is not a
     descent and must not be read as one."""
     resolution, _, _ = _answer(org, "Give me Uma's team")
-    assert resolution.plan.action != "scoped_reports"
+    assert _relation(resolution) != "subtree" or _target_level(resolution) != "bcm"
 
 
 def test_a_ranking_under_a_manager_stays_a_ranking(org):
     """"top advisors under Uma by connects" is a leaderboard with a scope
     filter and already worked — naming a measure must keep it there."""
     resolution, _, _ = _answer(org, "top advisors under Uma by connects")
-    assert getattr(resolution.plan, "action", None) != "scoped_reports"
+    assert _relation(resolution) != "subtree" or _target_level(resolution) != "bcm"
 
 
 def test_a_plain_roster_is_untouched(org):
     resolution, _, _ = _answer(org, "all advisors in AMD")
-    assert resolution.plan.action == "roster"
+    assert _relation(resolution) == "subtree"
 
 
 # ------------------------------------------------------- service layer

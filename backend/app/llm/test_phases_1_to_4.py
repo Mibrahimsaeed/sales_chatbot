@@ -247,9 +247,13 @@ class TestPhase4Routing:
     def test_the_llm_is_offered_population(self, org):
         from app.llm.llm_client import QUERY_IR_JSON_SCHEMA as schema
 
-        offered = set(schema["properties"]["operation"]["anyOf"][1]["enum"])
+        offered = set(schema["properties"]["operation"]["enum"])
         assert "population" in offered
-        assert offered == operations.IR_EXPRESSIBLE
+        # A subset now, not an equality: the enum is the EXECUTABLE half
+        # of IR_EXPRESSIBLE. `trend` and `clarify_metric` are expressible
+        # and dispatch to "unsupported"/"clarification", so the model may
+        # no longer select them.
+        assert offered <= operations.IR_EXPRESSIBLE
 
     def test_the_prompt_explains_population_and_multi_part(self):
         from app.llm.prompt_builder import _ir_schema

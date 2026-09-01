@@ -89,6 +89,16 @@ class RequestTrace:
     sql: list[SqlEvent] = field(default_factory=list)
 
     planner: dict | None = None
+    # LLM-first parse attempt: whether the model was asked, whether it
+    # answered, which model and prompt produced it, and — when it did not
+    # — what served the query instead. Written by
+    # semantic_parser.parse() via record_llm_parse().
+    #
+    # This is the one record that distinguishes "the LLM understood this"
+    # from "the LLM was never asked" from "the LLM failed and the rule
+    # plan answered". All three previously looked identical in the trace,
+    # which made an LLM-path regression indistinguishable from an outage.
+    llm: dict | None = None
     row_count: int | None = None
     response_type: str | None = None
     response_preview: str | None = None
@@ -108,6 +118,7 @@ class RequestTrace:
                 "candidates": self.candidates,
             },
             "planner": self.planner,
+            "llm": self.llm,
             "plan": self.plan,
             "ir": self.ir,
             "sql": [asdict(e) for e in self.sql],
@@ -329,6 +340,38 @@ def record_planner(trace: RequestTrace, prompt: str | None, raw, plan,
         "validated_plan": plan,
         "rejected": rejected,
         "elapsed_ms": elapsed_ms,
+    }
+
+
+@_safe
+def record_llm_parse(trace: RequestTrace, *, attempted: bool, succeeded: bool,
+                     model: str | None = None, prompt_hash: str | None = None,
+                     prompt_tokens: int | None = None,
+                     validation_missing: list | None = None,
+                     fallback_used: bool = False,
+                     fallback_reason: str | None = None) -> None:
+    """The LLM-first parse attempt, in the shape a debugger needs.
+
+    Deliberately records the prompt HASH rather than the prompt: the
+    prompt embeds the live gazetteer and can run to 28k characters, and
+    the question a trace has to answer is "was this the same prompt as
+    the run that worked?", which a hash answers exactly. The full text is
+    still available under CHAT_AUDIT_DEBUG (app/core/audit.py) when a
+    specific prompt genuinely needs reading.
+
+    `attempted=False` is as important as a failure: it means a routing
+    gate served the query before the model was consulted, which is the
+    state that used to be invisible.
+    """
+    trace.llm = {
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "model": model,
+        "prompt_hash": prompt_hash,
+        "prompt_tokens": prompt_tokens,
+        "validation_missing": list(validation_missing or []),
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
     }
 
 

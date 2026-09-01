@@ -203,6 +203,38 @@ class QueryIR(BaseModel):
     sort: Sort = Field(default_factory=Sort)
     limit: Optional[int] = 10
     group_by: Optional[Level] = None
+    # ---- HIERARCHY READS -------------------------------------------
+    #
+    # "how many advisors report directly to the Unit Head in AMD" needs
+    # THREE levels and a relation, and the IR carried one. `subject_level`
+    # conflates "who the query is about" with "what to return", so it can
+    # express "advisors in AMD" but not "advisors beneath AMD's unit
+    # head" — and certainly not the difference between the whole subtree
+    # and the immediate reports.
+    #
+    # Because the shape had no representation, `roster`/`direct_reports`/
+    # `scoped_reports` were marked plan-only and the LLM was never asked.
+    # Routing then hinged on the literal token "directly": drop it and
+    # the same question re-routed and answered something else.
+    #
+    # All three default to the values an IR built before they existed
+    # would have, so nothing that does not set them changes behaviour.
+
+    # WHICH level to enumerate. None means "the same level the query is
+    # grouped at", which is every non-hierarchy query.
+    target_level: Optional[Level] = None
+    # The level the target sits BENEATH. When it differs from the named
+    # subject's own level the subject is the SCOPE and the role holder is
+    # read out of it ("the Unit Head in AMD" -> scope=team AMD,
+    # subject_of=unit_head), which is what get_manager_of_group already
+    # does for reverse lookups.
+    subject_of: Optional[Level] = None
+    # How far down to look. "subtree" is every descendant — the reading
+    # one denormalised column match gives for free. "direct" is only the
+    # immediate reports. This is the field that carries "directly" /
+    # "immediately" as MEANING rather than as a keyword in a router.
+    relation: Literal["subtree", "direct"] = "subtree"
+
     # intent=="breakdown" only: nested-by-team (default False) vs a flat
     # advisor list for the single named subject — see hierarchy_service.
     # get_level_breakdown / get_level_flat_list. Ignored by every other
@@ -221,6 +253,27 @@ class QueryIR(BaseModel):
     # observability only (persisted in ChatLog.resolved_ir): which NLU mode
     # served this IR — not part of the LLM output schema, never validated
     nlu_mode: Optional[str] = None
+    # EVERY MEANING-CHANGING REPAIR the validator made, in order.
+    #
+    # ir_validator does not only reject — it rewrites: it normalises the
+    # intent from the registry, copies a subject's level over
+    # `subject_level`, corrects a near-miss metric key, re-types a subject
+    # the parser mislabelled, drops an ungroundable one, prunes a filter
+    # it cannot ground, and re-labels a metric-free list as a population.
+    # Each is defensible and each CHANGES WHAT THE QUERY MEANS, and until
+    # now they were invisible: the logs showed the model's raw output and
+    # the final IR, with no record of which layer moved anything in
+    # between. "The LLM got it wrong" and "we rewrote it afterwards" were
+    # indistinguishable after the fact — the single hardest thing to
+    # establish when a production answer is wrong.
+    #
+    # Each entry is {"field", "from", "to", "why"}, so the raw parse is
+    # reconstructible by replaying them backwards from the final IR.
+    #
+    # Observability only, like `nlu_mode`: not in the LLM output schema,
+    # never validated, and never rendered to the user — it is persisted in
+    # ChatLog.resolved_ir and carried on the request trace.
+    repairs: list[dict] = Field(default_factory=list)
 
     # ---- accessors -------------------------------------------------
     #
@@ -257,6 +310,66 @@ class QueryIR(BaseModel):
             leaves.extend(self.filter_tree.leaves())
         return leaves
 
+    def primary_metric(self) -> Optional[str]:
+        """THE measure this query is valued and ordered by, from wherever
+        the parser actually put it.
+
+        A metric can legitimately live in four places, and which one gets
+        used depends on how the question was phrased, not on what it
+        means:
+
+            sort.metric   an explicit ranking      "top advisors BY revenue"
+            metric.key    the named primary        "revenue of Blue Area"
+            metrics[0]    several measures named   "connects and answered calls"
+            a filter      the measure is a CONDITION
+                          "advisors with connects above 1000"
+
+        Every consumer used to read only the first two, so the fourth
+        shape — which is the natural one for every "X above N" question —
+        looked like a query with no measure at all. `ir_validator` then
+        asked the user which metric they meant, for a sentence that named
+        one, and `_effective_metric` returned None, which would have made
+        the compiler answer "no data" instead. One reading, in one place,
+        is what stops those two disagreeing again.
+
+        ORDER IS THE DOCUMENTED SEMANTICS, not a preference: an explicit
+        sort wins over a named primary, which wins over the first of
+        several (the prompt specifies "primary first" for `metrics`),
+        which wins over a condition. A filter is last because it is the
+        weakest evidence of intent — it says the measure is INTERESTING,
+        not that the answer is ranked by it.
+
+        THIS DOES NOT MUTATE. Nothing here writes `metric` or
+        `sort.metric`, so a filtered list keeps `metric=None` and
+        response_planner still sees `filtered_list` rather than
+        `leaderboard`. Deriving the column to compute is a different
+        question from deciding the answer's shape, and conflating them is
+        how a "who matches this" question would start rendering as a
+        ranking.
+
+        A POPULATION HAS NO PRIMARY MEASURE, by definition — it is the
+        operation for "who matches this constraint, with nothing to rank
+        by". Returning a filter's metric for it would put a value column
+        on a question that asked for names, which is the regression
+        response_planner's own comment warns about ("printed 'no data'
+        beside every name"). None is the correct answer here, not a
+        missing one.
+        """
+        if self.resolved_operation() == "population":
+            return None
+        if self.sort and self.sort.metric:
+            return self.sort.metric
+        if self.metric:
+            return self.metric.key
+        if self.metrics:
+            return self.metrics[0].key
+        from app.llm.metric_ontology import METRICS
+
+        for leaf in self.filter_leaves():
+            if leaf.field in METRICS:
+                return leaf.field
+        return None
+
     def metric_keys(self) -> list[str]:
         """Every measure named, primary first, deduplicated in order.
 
@@ -267,6 +380,16 @@ class QueryIR(BaseModel):
         seen: set[str] = set()
         return [k for k in ordered if k and not (k in seen or seen.add(k))]
 
+    def is_hierarchy_read(self) -> bool:
+        """Does this query enumerate a level beneath a subject?
+
+        True only when a target level is named AND something to scope it
+        beneath exists. Both halves matter: a target with no subject is
+        an ordinary population at that level, and a subject with no
+        target is an ordinary scoped query.
+        """
+        return bool(self.target_level) and bool(self.subject_of or self.subjects)
+
     def grouping_level(self) -> str:
         """The level rows are grouped by.
 
@@ -275,7 +398,7 @@ class QueryIR(BaseModel):
         that filled it correctly got no benefit. It is honoured here when
         set, and falls back to the level that has always been used.
         """
-        return self.group_by or self.subject_level
+        return self.target_level or self.group_by or self.subject_level
 
     def compare_period(self) -> Optional[str]:
         """The period this query is compared AGAINST, when it is one.

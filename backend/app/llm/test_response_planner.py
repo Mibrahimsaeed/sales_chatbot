@@ -299,3 +299,99 @@ def test_the_trace_records_an_unsupported_refusal(org):
     handle_chat_message(org, "Show the trend of revenue", session_id=None)
     step = next(s for s in routing.current_trace().steps if s.stage == "Response")
     assert step.chose == "unsupported"
+
+
+# =====================================================================
+# The response-type / data-shape contract
+# =====================================================================
+#
+# ONE WIRE TYPE, ONE DATA SHAPE. A client picks its renderer from
+# `response["type"]`, so a type that carries two incompatible shapes is
+# not consumable — it forces every client to sniff the payload before it
+# can draw anything.
+#
+# This is not hypothetical. `filtered_list` and `population` both used to
+# report as "breakdown", which already meant the hierarchy breakdown and
+# carries a NESTED OBJECT (level_label, teams[], mtd_cleared). Those two
+# carry a flat ARRAY of rows. The frontend's BreakdownCard read `b.teams`
+# off an array, got undefined, rendered an empty shell — and because a
+# card was assumed present the reply text was suppressed, so a fully
+# correct backend answer arrived at the user as a blank message.
+#
+# These tests pin the separation so it cannot be undone silently.
+
+class TestResponseTypeDataShapeContract:
+    def test_filtered_list_does_not_report_as_a_hierarchy_breakdown(self):
+        rows = [ROW, {"wid": 2, "name": "B", "value": 50.0}]
+        plan = plan_response(_ir(intent="filtered_list"), rows)
+        assert plan.mode == "filtered_list"
+        assert plan.mode != "breakdown", (
+            "filtered_list carries an array of rows; 'breakdown' carries the "
+            "hierarchy object. Sharing the type makes the payload unrenderable."
+        )
+
+    def test_population_does_not_report_as_a_hierarchy_breakdown(self):
+        rows = [{"wid": 1, "name": "A"}, {"wid": 2, "name": "B"}]
+        ir = _ir(intent="filtered_list", operation="population", metric=None,
+                 sort=Sort(metric=None, direction="desc"))
+        plan = plan_response(ir, rows)
+        assert plan.mode == "population"
+        assert plan.mode != "breakdown"
+
+    def test_population_stays_distinct_from_filtered_list(self):
+        """A population has NO measure. Collapsing it into filtered_list
+        would let a client render it as a ranking, printing "no data"
+        beside every name — the regression plan_response's own comment
+        warns about."""
+        rows = [{"wid": 1, "name": "A"}, {"wid": 2, "name": "B"}]
+        ranked = plan_response(_ir(intent="filtered_list"), rows)
+        population = plan_response(
+            _ir(intent="filtered_list", operation="population", metric=None,
+                sort=Sort(metric=None, direction="desc")), rows)
+        assert ranked.mode != population.mode
+
+    def test_both_still_render_as_a_filtered_table(self):
+        """The wire type changed; the RENDERING did not. `shape` is what
+        the formatter dispatches on, and both remain a plain list."""
+        rows = [ROW, {"wid": 2, "name": "B", "value": 50.0}]
+        assert plan_response(_ir(intent="filtered_list"), rows).shape == "filtered_table"
+        assert plan_response(
+            _ir(intent="filtered_list", operation="population", metric=None,
+                sort=Sort(metric=None, direction="desc")), rows).shape == "filtered_table"
+
+    def test_every_operation_dispatch_mode_is_known_to_the_planner(self):
+        """The registry cross-check, asserted here too: an operation may
+        not invent a response type."""
+        from app.llm.operations import OPERATIONS
+        from app.llm.response_planner import DISPATCH_MODES
+
+        unknown = {op.name: op.dispatch_mode for op in OPERATIONS.values()
+                   if op.dispatch_mode not in DISPATCH_MODES}
+        assert not unknown, f"operations dispatch as modes the planner does not know: {unknown}"
+
+    def test_no_wire_type_is_shared_by_operations_with_different_payloads(self):
+        """THE contract, stated structurally.
+
+        `breakdown` is the type whose payload is an object; every other
+        row-list operation must have a type of its own. Listed explicitly
+        rather than derived, so adding an operation to the object-shaped
+        family is a deliberate edit rather than an accident.
+        """
+        from app.llm.operations import OPERATIONS
+        from app.llm.response_planner import DISPATCH_MODES
+
+        OBJECT_PAYLOAD = {"breakdown", "lookup", "summary", "roster",
+                          "reverse_hierarchy", "ancestry", "direct_reports",
+                          "scoped_reports", "group_metric", "advisor_metric"}
+        ROW_LIST_PAYLOAD = {"leaderboard", "filtered_list", "population", "comparison"}
+
+        wire_of = {name: DISPATCH_MODES[op.dispatch_mode]
+                   for name, op in OPERATIONS.items()}
+        for row_op in ROW_LIST_PAYLOAD:
+            clash = [o for o in OBJECT_PAYLOAD
+                     if o in wire_of and wire_of[o] == wire_of[row_op]]
+            assert not clash, (
+                f"{row_op!r} (array payload) shares wire type "
+                f"{wire_of[row_op]!r} with {clash} (object payload) — a client "
+                "cannot pick a renderer from the type alone"
+            )

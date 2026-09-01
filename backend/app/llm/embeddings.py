@@ -43,10 +43,11 @@ from app.llm import llm_client
 log = get_logger("llm.embeddings")
 
 # The provider these slugs describe. Reads the configured value rather
-# than naming a vendor: `llm_provider` was declared in config.py during
-# the Ollama migration and then read by nothing, so the health endpoint
-# went on reporting "openai" after the switch.
-PROVIDER = settings.llm_provider
+# than naming a vendor. It now reads llm_client.PROVIDER, which is a
+# constant rather than a setting: there is one provider, so a
+# configurable value here could only ever disagree with what actually
+# served the call.
+PROVIDER = llm_client.PROVIDER
 
 # Stable slugs. Kept as constants so the health endpoint, tests, and any
 # alerting rule all reference the same strings.
@@ -140,10 +141,16 @@ def classify_error(exc: BaseException) -> str:
     Imported lazily and defensively: the openai package's exception
     hierarchy is not something to hard-depend on at module import, and a
     classification failure must never be what takes the subsystem down."""
-    # Checked before any provider's exception hierarchy: this one is
-    # raised by llm_client itself and means "nobody configured a model",
-    # which no provider-specific branch below would recognise.
-    if isinstance(exc, llm_client.EmbeddingsNotConfigured):
+    # Checked before any provider's exception hierarchy: both are raised
+    # by llm_client itself and mean "nobody configured this", which no
+    # provider-specific branch below would recognise.
+    #
+    # ProviderNotConfigured is the OpenAI-provider case — LLM_PROVIDER is
+    # openai but OPENAI_API_KEY is unset. Same reason, same handling:
+    # disable the tier once and stop calling, rather than retrying a
+    # request that cannot succeed until a human edits .env.
+    if isinstance(exc, (llm_client.EmbeddingsNotConfigured,
+                        llm_client.ProviderNotConfigured)):
         return REASON_NOT_CONFIGURED
 
     # Provider-agnostic transport failures. The Ollama client raises

@@ -55,6 +55,7 @@ async def _lifespan(app: FastAPI):
     regardless), so a failure here must never block startup."""
     from app.core.config import settings
     from app.core.logger import get_logger
+    from app.llm import llm_client
     from app.llm.llm_client import call_llm_json
     from app.llm import entity_extractor  # noqa: F401 — import registers entity types with entity_linker
     from app.llm import entity_linker
@@ -62,12 +63,13 @@ async def _lifespan(app: FastAPI):
 
     log = get_logger("main")
     if call_llm_json('Return ONLY JSON: {"ok": true}') is not None:
-        log.info("LLM reachable (%s / %s)", settings.llm_provider, settings.ollama_model)
+        log.info("LLM reachable (%s / %s)", llm_client.PROVIDER, settings.openai_model)
     else:
         log.warning(
-            "LLM unreachable at startup (%s at %s — is the daemon running, is the "
-            "model pulled?) — will retry lazily on first chat request",
-            settings.llm_provider, settings.ollama_base_url,
+            "LLM unreachable at startup (%s / %s — is OPENAI_API_KEY set, and does "
+            "the key have access to that model?) — will retry lazily on the first "
+            "chat request; until then queries answer on the deterministic planner",
+            llm_client.PROVIDER, settings.openai_model,
         )
 
     # ---- embeddings: probe ONCE, then live with the answer ----

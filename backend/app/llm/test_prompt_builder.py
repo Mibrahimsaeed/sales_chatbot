@@ -19,14 +19,14 @@ def test_prompt_contains_all_grounding_sections():
     # full synonym lists, not the old first-3 truncation — "highest closer"
     # is synonym #7 of mtd_cleared
     assert "highest closer" in prompt
-    assert "How to read common business phrases" in prompt
+    assert "COMMON BUSINESS PHRASES" in prompt
     assert "Examples (follow these exactly" in prompt
     assert "Return ONLY a JSON object" in prompt
     assert '"top 5 advisors by revenue"' in prompt
 
 
 def test_prompt_includes_prior_ir_only_when_present():
-    assert "treat the new message as a patch" not in _prompt()
+    assert "treat the new message as a semantic patch" not in _prompt()
     with_prior = _prompt(prior_ir_json='{"intent": "leaderboard"}')
-    assert "treat the new message as a patch" in with_prior
+    assert "treat the new message as a semantic patch" in with_prior
     assert '{"intent": "leaderboard"}' in with_prior
