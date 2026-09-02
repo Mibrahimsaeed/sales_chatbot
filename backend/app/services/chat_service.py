@@ -2,7 +2,9 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.llm import aggregation, conversation_memory, hierarchy, narrative, routing
+from app.llm import (
+    aggregation, conversation_memory, hierarchy, narrative, response_generator, routing,
+)
 from app.llm.ir_validator import confidence_breakdown
 from app.llm.nlu_pipeline import resolve, Resolution
 from app.llm.periods import label_for as period_label
@@ -1006,7 +1008,37 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
         # existed — not the full (possibly 500+ row) match set.
         facts = narrative.compute_facts(ir, rows)
         explanation = narrative.build_explanation(ir, rows, total_count=capped_total)
-        explanation = narrative.polish_explanation(explanation, facts)
+        # PHASE 10 — the final answer is COMPOSED by the model from the
+        # verified rows, not copy-edited from this sentence.
+        #
+        # polish_explanation() used to hand the model one deterministic
+        # sentence and ask it to smooth the wording. It never saw the
+        # question, the conversation or a row, so it could not answer a
+        # "why?", could not compare two rows, and could not say anything
+        # the template had not already said.
+        #
+        # The deterministic explanation is still computed and still the
+        # fallback: generate_or() returns it unchanged whenever the
+        # generated answer fails a grounding check, so a bad generation
+        # costs phrasing and never a number.
+        #
+        # The query and the context come from conversation memory rather
+        # than a new parameter — chat() records the user's turn before
+        # dispatching, so the last user turn IS this question.
+        turns = conversation_memory.recent_turns(session_id)
+        question = next((text for role, text in reversed(turns) if role == "user"), "")
+        explanation = response_generator.generate_or(
+            explanation, question, rows, facts,
+            metadata={
+                "metric": effective_metric(ir),
+                "level": ir.grouping_level(),
+                "period": getattr(ir.time_range, "period", None),
+                "shown_count": len(rows),
+                "total_count": capped_total,
+                "has_more": has_more,
+            },
+            recent_turns=turns[:-1],
+        )
         if explanation and response_plan.show_explanation:
             reply = f"{explanation}\n\n{reply}"
         # Part 8/11: only attach insights when the response planner judges

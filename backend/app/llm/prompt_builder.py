@@ -86,17 +86,17 @@ of Advisors and the management path associated with each Advisor.
 
 A row such as:
 
-    Team = AMD
-    Unit Head = Faisal Hussain Naqvi
-    Zonal Head/Manager = Faisal Hussain Naqvi
-    BCM = Faisal Hussain Naqvi
+    Team = TEAM-A
+    Unit Head = Lars
+    Zonal Head/Manager = Lars
+    BCM = Lars
     Advisor = Ahmed Raza
     SAP ID = 100001
 
 means:
 
-    AMD
-    └── Faisal Hussain Naqvi
+    TEAM-A
+    └── Lars
         ├── Unit Head
         ├── Zonal Head/Manager
         └── BCM
@@ -110,13 +110,13 @@ Do NOT treat those appearances as different employees.
 
 For example:
 
-    Unit Head = Faisal
-    Zonal Head = Faisal
-    BCM = Faisal
+    Unit Head = Lars
+    Zonal Head = Lars
+    BCM = Lars
 
-does NOT mean there are three Faisals.
+does NOT mean there are three Larss.
 
-It means ONE person, Faisal, occupies all three hierarchy positions.
+It means ONE person, Lars, occupies all three hierarchy positions.
 
 =======================================================================
 3. HIERARCHY CONTAINMENT
@@ -147,19 +147,19 @@ Hierarchy priority:
 
 For example, if:
 
-    Faisal Hussain Naqvi
+    Lars
         appears as Unit Head
         appears as Zonal Head/Manager
         appears as BCM
 
-then Faisal's PRIMARY organisational position is:
+then Lars's PRIMARY organisational position is:
 
     Unit Head
 
-Do NOT treat Faisal as primarily a BCM merely because his name also
+Do NOT treat Lars as primarily a BCM merely because his name also
 appears in the BCM column.
 
-Do NOT treat Faisal's organisational scope as being determined by his
+Do NOT treat Lars's organisational scope as being determined by his
 lower-level occurrences when a higher-level occurrence exists.
 
 This highest-level rule is authoritative for person identification,
@@ -194,59 +194,15 @@ their organisational scope.
 
 A person's organisational scope depends on their HIGHEST hierarchy level.
 
------------------------------------------------------------------------
-UNIT HEAD
------------------------------------------------------------------------
+ONE RULE, WHATEVER THAT LEVEL IS. The column of the person's highest
+level, matched to their name, defines their complete scope:
 
-If the person is a Unit Head:
+    <their highest level> = Person
 
-    Unit Head = Person
-
-defines that person's complete organisational scope.
-
-All rows satisfying:
-
-    Unit Head = Person
-
-belong to that Unit Head's scope.
-
-Those rows may contain:
-
-    Zonal Heads/Managers
-    BCMs
-    Advisors
-
-within that Unit Head's organisation.
-
------------------------------------------------------------------------
-ZONAL HEAD / MANAGER
------------------------------------------------------------------------
-
-If the person's highest level is Zonal Head/Manager:
-
-    Zonal Head/Manager = Person
-
-defines that person's scope.
-
------------------------------------------------------------------------
-BCM
------------------------------------------------------------------------
-
-If the person's highest level is BCM:
-
-    BCM = Person
-
-defines that person's scope.
-
------------------------------------------------------------------------
-ADVISOR
------------------------------------------------------------------------
-
-If the person's highest level is Advisor:
-
-    Advisor = Person
-
-or the Advisor SAP ID identifies the Advisor's row.
+So a Unit Head's scope is every row with Unit Head = Person — which will
+contain Zonal Heads, BCMs and Advisors beneath them. A Zonal Head's is
+every row with Zonal Head = Person, and so on down. For an Advisor the
+row is the person, and the Advisor SAP ID identifies it.
 
 IMPORTANT:
 
@@ -261,47 +217,21 @@ Then use the corresponding hierarchy column to establish scope.
 7. HIGHEST-ROLE EXAMPLE
 =======================================================================
 
-Suppose the table contains:
+Suppose Lars appears as Unit Head on several rows, and as Zonal Head and
+BCM on some of them, while other rows under him have Ahmed Khan as Zonal
+Head and BCM. Lars's highest role is Unit Head, so his scope is:
 
-    Team = AMD
-    Unit Head = Faisal Hussain Naqvi
-    Zonal Head = Faisal Hussain Naqvi
-    BCM = Faisal Hussain Naqvi
-    Advisor = Ahmed Raza
-    SAP ID = 100001
+    Unit Head = Lars
 
-and additional rows with:
+which includes everyone beneath Ahmed Khan too.
 
-    Team = AMD
-    Unit Head = Faisal Hussain Naqvi
-    Zonal Head = Ahmed Khan
-    BCM = Ahmed Khan
-    Advisor = Bilal
-    SAP ID = 100002
+Do NOT resolve Lars's team or organisation using:
 
-Faisal appears at:
-
-    Unit Head
-    Zonal Head
-    BCM
-
-Therefore Faisal's highest role is:
-
-    Unit Head
-
-His organisational scope is:
-
-    Unit Head = Faisal
-
-This scope includes both Ahmed and Bilal.
-
-Do NOT resolve Faisal's team or organisation using:
-
-    Zonal Head = Faisal
+    Zonal Head = Lars
 
 or:
 
-    BCM = Faisal
+    BCM = Lars
 
 because his Unit Head occurrence is higher.
 
@@ -312,71 +242,55 @@ because his Unit Head occurrence is higher.
 If a person appears at multiple hierarchy levels, resolve their Team
 using their HIGHEST hierarchy occurrence.
 
-If Faisal's highest role is Unit Head, then:
+If Lars's highest role is Unit Head, then:
 
-    "Faisal's team"
-    "Which team does Faisal belong to?"
-    "What team is Faisal in?"
+    "Lars's team"
+    "Which team does Lars belong to?"
+    "What team is Lars in?"
 
 should resolve using:
 
-    Unit Head = Faisal
+    Unit Head = Lars
 
 and return the corresponding Team value(s).
 
 Do NOT search for:
 
-    Zonal Head = Faisal
+    Zonal Head = Lars
 
 or:
 
-    BCM = Faisal
+    BCM = Lars
 
-when Faisal's highest role is Unit Head.
+when Lars's highest role is Unit Head.
 
 If multiple Team values are associated with the person's highest-level
 occurrence, preserve the resulting ambiguity rather than inventing one.
 
 =======================================================================
-9. ZONAL RESOLUTION
+9. READING A LEVEL BENEATH A PERSON
+=======================================================================
+
+"Which zonals are under Lars?", "Which BCMs are under Lars?" — one rule,
+whatever level is asked for. If Lars's highest role is Unit Head, find
+the unique values of the REQUESTED level from rows satisfying:
+
+    Unit Head = Lars
+
+Do NOT simply search the requested level's own column for Lars. "Under
+Lars" means descendants within his highest-level scope.
+
+=======================================================================
+10. NESTED SCOPE
 =======================================================================
 
 If the user asks:
 
-    "Which zonals are under Faisal?"
-
-and Faisal's highest role is Unit Head:
-
-Find unique Zonal Head/Manager values from rows satisfying:
-
-    Unit Head = Faisal
-
-Do NOT simply search the entire Zonal Head/Manager column for Faisal.
-
-The phrase "under Faisal" means descendants within Faisal's
-highest-level organisational scope.
-
-=======================================================================
-10. BCM RESOLUTION
-=======================================================================
-
-If the user asks:
-
-    "Which BCMs are under Faisal?"
-
-and Faisal is a Unit Head:
-
-Find unique BCM values from rows satisfying:
-
-    Unit Head = Faisal
-
-If the user asks:
-
-    "Which advisors are under Faisal's BCM Ahmed Khan?"
+    "Which advisors are under Lars's BCM Ahmed Khan?"
 
 then the scope must preserve BOTH relationships:
 
-    Unit Head = Faisal
+    Unit Head = Lars
     AND
     BCM = Ahmed Khan
 
@@ -391,16 +305,16 @@ Every hierarchy row is one Advisor and carries their COMPLETE reporting
 path. So an Advisor directly reports to a person only when that person's
 name occupies EVERY management column between them:
 
-    Unit Head = Faisal  AND  Zonal Head = Faisal  AND  BCM = Faisal
+    Unit Head = Lars  AND  Zonal Head = Lars  AND  BCM = Lars
 
-    Row 1: Unit Head=Faisal, Zonal Head=Faisal, BCM=Faisal, Advisor=Ahmed
-           -> Ahmed reports DIRECTLY to Faisal.
-    Row 2: Unit Head=Faisal, Zonal Head=Ahmed Khan, BCM=Ahmed Khan, Advisor=Bilal
-           -> Bilal is INSIDE Faisal's scope but does NOT report directly
+    Row 1: Unit Head=Lars, Zonal Head=Lars, BCM=Lars, Advisor=Ahmed
+           -> Ahmed reports DIRECTLY to Lars.
+    Row 2: Unit Head=Lars, Zonal Head=Ahmed Khan, BCM=Ahmed Khan, Advisor=Bilal
+           -> Bilal is INSIDE Lars's scope but does NOT report directly
               to him: another manager sits in between.
 
-This is the difference between "under Faisal" (his whole scope — may
-include Bilal) and "directly reporting to Faisal" (must not). The word
+This is the difference between "under Lars" (his whole scope — may
+include Bilal) and "directly reporting to Lars" (must not). The word
 "directly" is never ignorable.
 
 Which `relation` value expresses each is specified once, under CHOOSE
@@ -412,14 +326,14 @@ RELATION BY MEANING in the output-schema section below.
 
 The following are NOT automatically direct-report questions:
 
-    "Show me Faisal's advisors"
-    "How many advisors does Faisal have?"
-    "What are Faisal's advisors?"
+    "Show me Lars's advisors"
+    "How many advisors does Lars have?"
+    "What are Lars's advisors?"
 
-If Faisal's highest role is Unit Head, these mean Faisal's COMPLETE
+If Lars's highest role is Unit Head, these mean Lars's COMPLETE
 Unit Head scope:
 
-    Unit Head = Faisal
+    Unit Head = Lars
 
 Only interpret them as direct reports when the user explicitly uses
 direct-reporting language such as:
@@ -430,20 +344,6 @@ direct-reporting language such as:
     directly reporting
     immediately reports
     immediately under
-
-Therefore:
-
-    "How many advisors does Faisal have?"
-
-means:
-
-    Unit Head = Faisal
-
-not:
-
-    Unit Head = Faisal
-    AND Zonal Head = Faisal
-    AND BCM = Faisal
 
 =======================================================================
 19. HIERARCHY LEVELS AND ROLES
@@ -579,7 +479,7 @@ position.
 
 For example:
 
-    Faisal Hussain Naqvi
+    Lars
 
 may appear as:
 
@@ -595,7 +495,7 @@ Use the highest occurrence:
 
     Unit Head
 
-as Faisal's primary organisational identity.
+as Lars's primary organisational identity.
 
 =======================================================================
 24. BUSINESS DATA FILTERING MODEL
@@ -618,13 +518,13 @@ highest-role rule.)
 
 One hierarchy relationship, three different questions:
 
-    "advisors under Faisal"
-    "connects of advisors under Faisal"
-    "top advisors under Faisal by connects"
+    "advisors under Lars"
+    "connects of advisors under Lars"
+    "top advisors under Lars by connects"
 
 They share the word "under" and are not the same query shape. And
 
-    "how many advisors under Faisal"
+    "how many advisors under Lars"
 
 still targets Advisors — "how many" asks for the SIZE of that
 population, it does not change what the population is of.
@@ -744,6 +644,17 @@ Never silently substitute MTD for a stated period.
 =======================================================================
 
 Before constructing QueryIR, reason in this order:
+
+A0. SURFACE FORM IS NOT MEANING.
+
+Plural, word order and the prepositions in/of/for/under do not change
+the interpretation: "unit heads in X", "X's unit head" and "unit head
+for X" are one question.
+
+A LEVEL WORD plus a NAMED GROUP asks which members of that group hold
+that level: the group is the scope, the level is `target_level`. Naming
+no measure makes it a `population` — do not ask which metric was meant,
+and do not drop the group.
 
 A. WHO OR WHAT is the user asking about?
 
@@ -1333,7 +1244,14 @@ Hierarchy reads use:
 
 `target_level` = level being asked for.
 
-`subject_of` = level of the scope entity.
+`subject_of` = the level the target sits BENEATH — the MANAGER's level.
+
+Usually that is the scope entity's own level ("advisors under Haseeb" ->
+subjects=[unit_head Haseeb], subject_of=unit_head). It DIFFERS when the
+query names a ROLE INSIDE A GROUP: "the Unit Head in TEAM-A" is a Unit
+Head scoped to the team TEAM-A, so subjects=[team TEAM-A] and
+subject_of=unit_head.
+The role is never itself a subject — no entity of that name was named.
 
 `relation`:
 
@@ -1349,8 +1267,15 @@ They must agree with the question that was asked:
     "top 3 teams by connects excluding Blue Area"   all three null
     "advisors in Blue Area or DownTown"             all three null
     "revenue by region"                             all three null
+    "connects of Blue Area"                         all three null
     "advisors under Haseeb"                         target_level=advisor
                                                     subject_of=unit_head
+    "connects of advisors in Blue Area"             target_level=advisor
+                                                    subject_of=team
+
+Those two differ by one word. A named group with NO level beneath it is
+the SUBJECT — report ITS figure; naming a level makes it the SCOPE. A
+relationship ("who reports directly to X") stands in for the level word.
 
 Setting `target_level` because the query merely NAMES a level turns an
 ordinary ranking into a hierarchy read, and the answer is then scoped to
@@ -1370,45 +1295,23 @@ For a named Team:
 
 CHOOSE RELATION BY MEANING
 
-Use direct for:
+THE DISTINCTION IS REPORTING vs CONTAINMENT, not the word "directly".
 
-    directly
-    direct reports
-    reports directly
-    directly reporting
-    immediately under
-    immediately reports to
-    personally manages
-    straight to
+Use direct for REPORTING language — the relationship itself:
 
-Use subtree for:
+    reports to / report to / reporting to / who reports to
+    directly reports to / reports directly / directly reporting
+    managed by / manages / personally manages
+    immediately under / immediately reports to / straight to
 
-    under
-    beneath
-    within
-    in their organisation
-    reporting structure
-    people under them
+Use subtree for CONTAINMENT language — everyone somewhere beneath:
 
-IMPORTANT:
+    under / beneath / within
+    in their organisation / reporting structure / people under them
 
-For this data model, direct reporting of an Advisor to a manager is
-represented by the manager's name appearing at EVERY intervening
-management level in that Advisor's hierarchy row.
-
-For a Unit Head:
-
-    Unit Head = X
-    AND Zonal Head/Manager = X
-    AND BCM = X
-
-must all hold.
-
-Do NOT represent direct reporting as merely:
-
-    Unit Head = X
-
-when lower management columns can contain another person.
+"Who reports to X" asks for X's reports; "who is under X" asks for X's
+whole organisation. "Directly" makes the first explicit, it does not
+create it, so both phrasings are the same relationship.
 
 CHOOSING TARGET_LEVEL
 
@@ -1416,16 +1319,8 @@ Rule 1:
 
 If the question names the target level explicitly, use that level.
 
-Examples:
-
-    "advisors under Haseeb"
-        target_level = advisor
-
-    "teams under Agency21"
-        target_level = team
-
-    "BCMs under Unit Head X"
-        target_level = bcm
+Examples: "advisors under Haseeb" -> advisor; "teams under Agency21" ->
+team; "BCMs under Unit Head X" -> bcm.
 
 Rule 2:
 

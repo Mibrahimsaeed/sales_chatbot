@@ -27,7 +27,9 @@ from sqlalchemy.orm import Session
 
 from app.core import tracing
 from app.core.config import settings
-from app.llm import conversation_memory, hierarchy, semantic_retrieval
+from app.llm import conversation_memory, hierarchy, routing, semantic_retrieval
+from app.llm import grounding as grounding_mod
+from app.llm import hierarchy_grounding, semantic_validation
 from app.llm.entity_extractor import (
     get_known_teams, get_known_companies,
     get_known_unit_heads, get_known_zonal_heads, get_known_bcms,
@@ -174,6 +176,156 @@ def _finish(ir: QueryIR, db: Session, session_id: str | None, used_llm: bool,
     result = validate_ir(ir, db, entities=entities)
     result.ir.nlu_mode = settings.nlu_mode
     return ParseOutcome(ir=result.ir, missing=result.missing, used_llm=used_llm)
+
+
+class Interpretation:
+    """What the LLM understood, before any deterministic component has had
+    a say.
+
+    `model` is the SemanticModel (Phase 1) — the statement of MEANING.
+    `ir` is the same parse in the execution contract, carried alongside so
+    the existing compiler, validator and dispatcher keep working unchanged
+    while the migration proceeds; Phase 6 replaces that with a conversion
+    built from the model.
+
+    `reached_llm` records whether the provider actually answered. It is
+    the assertion Phase 2 exists to make: not "the LLM was preferred", but
+    "the LLM was asked, for this query, before anything else decided what
+    the query meant".
+
+    `grounding` is PHASE 4: what the database says about the entities the
+    model named. It is a parallel structure rather than an edit to
+    `model`, so the interpretation and its verification stay separable —
+    a mismatch is visible as "the model said team, the database has it as
+    an advisor" instead of disappearing into a rewritten field.
+
+    `hierarchy` and `verdict` are PHASE 5: whether the requested
+    relationship exists in the data, and whether the interpretation is
+    executable as stated. Both are reports carried alongside — validation
+    has no repair path, so nothing here rewrites the parse.
+    """
+
+    def __init__(self, model, ir, reached_llm: bool, reason: str | None = None,
+                 grounding=None, hierarchy=None, verdict=None):
+        self.model = model
+        self.ir = ir
+        self.reached_llm = reached_llm
+        self.reason = reason
+        self.grounding = grounding
+        self.hierarchy = hierarchy
+        self.verdict = verdict
+
+    @property
+    def understood(self) -> bool:
+        """Did the model return something the pipeline can act on?"""
+        return self.ir is not None
+
+
+def interpret(text: str, entities: dict, db: Session,
+              session_id: str | None = None) -> Interpretation:
+    """THE mandatory first semantic step. Always calls the LLM.
+
+    PHASE 2. Nothing decides whether this runs. The previous design asked
+    `nlu_pipeline._plan_is_authoritative()` first — a rule-based
+    classifier that answered "does this query need the model?" — and for
+    fourteen of the twenty-one operations the answer was permanently no,
+    so the model was never consulted for a roster, a profile, a manager
+    lookup or an ancestry walk. Whether the LLM saw a query depended on a
+    regex scorer's opinion of it.
+
+    Grounding still runs BEFORE this, and deliberately: `entities` is
+    handed to the prompt so the model reads real team and person names
+    rather than guessing them. That is not a semantic decision — it
+    establishes what exists, and the model decides what the user meant
+    about it.
+
+    Returns an Interpretation either way. A provider that is unreachable
+    yields `reached_llm=False` and no IR, which the caller degrades from —
+    an outage must not become a dead end.
+    """
+    from app.llm.semantic_model import from_query_ir
+
+    # THE ROLLBACK SURVIVES. NLU_MODE="rules_first" is the documented
+    # switch back to the pre-inversion routing, and a migration this size
+    # should not remove the way out of it. Under that mode the mandatory
+    # call is skipped and the legacy path below runs verbatim; under the
+    # default "llm_first" nothing can skip it.
+    if settings.nlu_mode == "rules_first":
+        return Interpretation(None, None, reached_llm=False,
+                              reason='NLU_MODE="rules_first" — the rollback path')
+
+    ir = _call_llm_for_ir(text, entities, db, session_id)
+    if ir is None:
+        # Deliberately one reason for two causes: _call_llm_for_ir
+        # collapses "unreachable/refused" and "output failed the schema"
+        # into the same None. Both mean the same thing HERE — no semantic
+        # model — and the distinction is already recorded on the request
+        # trace by record_llm_parse, which is where it is actionable.
+        return Interpretation(None, None, reached_llm=False,
+                              reason="the model produced nothing usable "
+                                     "(unreachable, refused, or schema-invalid)")
+
+    # PHASE 11 — the model's interpretation is not rewritten here.
+    #
+    # validate_ir still grounds entities, resolves metrics, computes
+    # `missing` and records confidence. What it no longer does on this
+    # path is change the MEANING: retype a subject from pre-LLM
+    # extraction, or null the target_level/subject_of/relation triple.
+    # Those were deterministic code overruling the model with no signal
+    # in the reply that it had happened. Conflicts now surface through
+    # grounding (TYPE_MISMATCH) and validation, which reject or ask.
+    result = validate_ir(ir, db, entities=entities, allow_semantic_repair=False)
+    result.ir.nlu_mode = settings.nlu_mode
+    model = from_query_ir(result.ir, level_word=entities.get("level_word"))
+
+    # PHASE 4 — GROUND WHAT THE MODEL NAMED.
+    #
+    #     semantic model -> grounding -> grounded entities -> validation
+    #
+    # Verification only: grounding_mod.ground() returns a parallel report
+    # and modifies neither the model nor the IR, so nothing downstream
+    # executes differently for it yet. The structured ambiguity it
+    # produces is what a later phase acts on — and having it recorded now
+    # is what makes "the model named something that does not exist" a
+    # visible state rather than an empty result set.
+    grounded = grounding_mod.ground(model, db)
+    if grounded:
+        routing.decide(
+            "Grounding",
+            "resolved" if grounded.is_fully_grounded else "unresolved",
+            "; ".join(
+                f"{e.name} ({e.stated_level or 'no level stated'}) -> {e.status}"
+                + (f" at {'/'.join(e.found_at)}" if e.status == grounding_mod.TYPE_MISMATCH else "")
+                for e in grounded.entities
+            ),
+        )
+
+    # PHASE 5 — verify the RELATIONSHIP, then judge the whole thing.
+    #
+    #     grounded entities -> hierarchy grounding -> validation
+    #
+    # Both are reports. Neither edits the model or the IR: validation has
+    # no repair path by design, so an interpretation that cannot run as
+    # stated is rejected or sent for clarification rather than quietly
+    # turned into a different query that happens to work.
+    hierarchy_result = hierarchy_grounding.verify(model, grounded, db)
+    if hierarchy_result.is_hierarchy:
+        routing.decide(
+            "Hierarchy", hierarchy_result.status,
+            f"{hierarchy_result.subject_value} ({hierarchy_result.subject_level}) "
+            f"-> {hierarchy_result.target_level} [{hierarchy_result.relation}]: "
+            f"{hierarchy_result.member_count} found"
+            + (f" — {hierarchy_result.reason}" if hierarchy_result.reason else ""))
+
+    verdict = semantic_validation.validate(model, grounded, hierarchy_result, db,
+                                           entities=entities)
+    if not verdict.is_valid:
+        routing.decide(
+            "Validation", verdict.status,
+            "; ".join(f"[{f.check}] {f.message}" for f in verdict.findings))
+
+    return Interpretation(model, result.ir, reached_llm=True, grounding=grounded,
+                          hierarchy=hierarchy_result, verdict=verdict)
 
 
 def parse(text: str, entities: dict, db: Session, session_id: str | None,

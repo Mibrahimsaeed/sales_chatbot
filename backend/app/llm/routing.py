@@ -210,6 +210,27 @@ def shortcut_allowed(text: str, entities: dict) -> tuple[bool, str]:
             "belongs to the planner, which can bind the named metric to that "
             "person; the canned handler can express neither"
         )
+    # ANY GROUNDED SUBJECT, not only an advisor.
+    #
+    # This read `advisor_wids` alone, so a question naming a MANAGER or a
+    # GROUP — neither of which is a master-sheet advisor — looked to it
+    # like a question naming nobody:
+    #
+    #   "attendance of <a BCM>"  ->  the canned org-wide sweep,
+    #                                "176 advisor(s) with attendance issues",
+    #                                the named person nowhere in the answer
+    #
+    # The rule this restores is the one stated above — a shortcut may
+    # answer only what nothing better can — applied to the level the
+    # subject actually grounded at. `_any_subject_grounded` reads the
+    # hierarchy registry rather than a key list, so a level added later
+    # counts here without a second edit.
+    if _any_subject_grounded(entities):
+        return False, (
+            "entity extraction grounded a subject this question is about — a "
+            "scoped question belongs to the planner, which can bind the named "
+            "measure to it; the canned handler answers about everybody"
+        )
     if names_a_rate(text):
         match = metric_aliases.resolve(text)
         phrase = match.phrase if match else text

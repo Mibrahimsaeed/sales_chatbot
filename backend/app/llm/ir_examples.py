@@ -1611,6 +1611,99 @@ EXAMPLES: list[dict] = [
 
     {
         # ---------------------------------------------------------------
+        # A MANAGEMENT LEVEL WITHIN A NAMED GROUP
+        #
+        # THE SHAPE WITH NO COVERAGE. Every other hierarchy example reads
+        # a level beneath a PERSON ("which BCMs are under Zonal Head
+        # Bilal") or advisors within a TEAM. Nobody showed a MANAGEMENT
+        # level within a TEAM, and measured against the real model five
+        # equivalent phrasings of it produced four different
+        # interpretations — two of them asking which metric was meant,
+        # for a question that names no measure at all.
+        #
+        # Deliberately a different level and a different team from the
+        # phrasings this was written for: what has to be learned is the
+        # SHAPE — group is the scope, level is the target, no measure
+        # required — not any particular sentence.
+        # ---------------------------------------------------------------
+        "utterance": "zonal heads in Downtown",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "team",
+            "subjects": [
+                {"type": "team", "value": "Downtown", "match_confidence": 1.0},
+            ],
+            # NO MEASURE, and none is needed: the question asks WHO holds
+            # a level, not how they performed. Asking which metric was
+            # meant is a wrong answer to a complete question.
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "zonal_head",
+            "subject_of": "team",
+            "relation": "subtree",
+            "time_range": {"mode": "snapshot", "period": "MTD",
+                           "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": None, "direction": "desc"},
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.96,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
+        # A ROLE INSIDE A GROUP, AND A DIRECT RELATIONSHIP
+        #
+        # "the Unit Head in AMD" names no person — it names a ROLE and the
+        # group to find it in. So the TEAM is the subject and the role is
+        # `subject_of`; putting the role in `subjects` invents an entity
+        # nobody named, and the scope is then lost entirely.
+        #
+        # Measured before this example existed: the model set
+        # subject_of="unit_head" correctly and dropped the team, so eight
+        # equivalent phrasings all lost the scope.
+        #
+        # Also the reporting reading: "reports to" IS the direct
+        # relationship. "Directly" makes it explicit, it does not create
+        # it — "under" would be subtree.
+        # ---------------------------------------------------------------
+        "utterance": "who reports to the unit head in Downtown",
+        "prior_ir": None,
+        "expect_valid": True,
+        "ir": {
+            "intent": "filtered_list",
+            "operation": "population",
+            "subject_level": "advisor",
+            "subjects": [
+                {"type": "team", "value": "Downtown", "match_confidence": 1.0},
+            ],
+            "metric": None,
+            "metrics": [],
+            "filters": [],
+            "filter_tree": None,
+            "target_level": "advisor",
+            "subject_of": "unit_head",
+            "relation": "direct",
+            "time_range": {"mode": "snapshot", "period": "MTD",
+                           "compare_to": None, "confidence": 0.6},
+            "sort": {"metric": None, "direction": "desc"},
+            "limit": None,
+            "group_by": None,
+            "flat": False,
+            "overall_confidence": 0.95,
+            "intent_confidence": 0.96,
+        },
+    },
+
+    {
+        # ---------------------------------------------------------------
         # HIERARCHY READ — DIRECT REPORTS FROM A LOWER MANAGER
         #
         # The same shape as the Unit Head example, one rung down, so the

@@ -723,11 +723,44 @@ def extract_entities(text: str, db: Session) -> dict:
     if limit_match:
         entities["limit"] = int(limit_match.group(1))
 
+    # WHICH LEVEL, IF ANY, THE USER NAMED — "advisors", "BCMs", "teams".
+    #
+    # Its ABSENCE is what is load-bearing: a hierarchy read enumerates a
+    # level, so a turn naming no level to enumerate cannot be one.
+    # "connects of Blue Area" names a team and asks for ITS figure;
+    # "connects of advisors in Blue Area" names the level to list. Both
+    # ground exactly one team — the level word is the only difference.
+    #
+    # Read from intent_catalog, which already owns this question for the
+    # rule planner, rather than a second detector that could disagree.
+    from app.llm import intent_catalog as cat
+
+    entities["level_word"] = cat.detect_level(q)
+
     entities["thresholds"] = _extract_thresholds(q)
     # A MODIFIER on the relational reading, not an intent of its own —
     # see _DIRECT_RE. False for every query that does not say it, which
     # is what keeps "X's team" and "people under X" on the subtree.
     entities["direct"] = bool(_DIRECT_RE.search(q))
+
+    # A HIERARCHY READ CAN BE NAMED BY A RELATIONSHIP INSTEAD OF A LEVEL.
+    #
+    # `level_word` above answers "which level does this turn enumerate",
+    # and it is the discriminator ir_validator uses to tell "connects of
+    # Blue Area" (the team's own figure) from "connects of advisors in
+    # Blue Area" (its members'). That test has a blind spot: a turn can
+    # name the relationship and leave the level implicit —
+    #
+    #     "who reports directly to X"     no level word, still a read
+    #     "who works under X"             no level word, still a read
+    #
+    # — and treating those as "no level to enumerate" discards the very
+    # relationship the user asked about. Recorded here, beside the signal
+    # it corrects, and read from the two expressions that already own
+    # this vocabulary (SCOPED_UNDER_RE for "under"/"reports to"/"works
+    # for", _DIRECT_RE for "directly") rather than a third keyword list
+    # that could drift away from them.
+    entities["relation_word"] = bool(cat.SCOPED_UNDER_RE.search(q)) or entities["direct"]
 
     # companies/teams/offices/portfolio & management leads — exact substring,
     # then fuzzy, then embedding semantic search (Part 9); see

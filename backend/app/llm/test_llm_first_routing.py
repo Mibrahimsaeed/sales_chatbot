@@ -96,14 +96,26 @@ class TestCapabilityGate:
         ("who is Ayesha Khan's unit head", "reverse_hierarchy"),
     ])
     def test_shapes_no_ir_expresses_stay_on_the_plan(self, text, action, org, monkeypatch):
-        """A card or a hierarchy read has no IR to be parsed into, so the
-        LLM is not consulted at all."""
+        """A card or a hierarchy read still EXECUTES on the plan — but the
+        model is asked first.
+
+        PHASE 2 INVERTED THE SECOND HALF OF THIS. It used to assert the
+        LLM was "not consulted at all", which was the capability gate
+        deciding whether the model was needed: fourteen of twenty-one
+        operations were marked plan-only, so a profile, a roster and a
+        manager lookup never reached it. Whether the model saw a query
+        depended on a regex scorer's opinion of the query.
+
+        What must NOT change is where these EXECUTE. The IR cannot express
+        a card or a hierarchy enumeration, so the plan still answers them;
+        widening the grammar so the model can express them is Phase 3.
+        """
         calls = _llm_returns(monkeypatch, QueryIR(intent="leaderboard"))
 
         resolution = _resolve(org, text)
         assert resolution.kind == "plan"
         assert resolution.plan.action == action
-        assert not calls, f"{text!r} should never reach the LLM"
+        assert calls, f"{text!r} must reach the LLM first (Phase 2)"
 
     def test_a_card_shape_escalates_when_several_entities_ground(self, org, monkeypatch):
         """A single-entity card cannot answer a two-entity question, so
@@ -227,12 +239,18 @@ class TestRollbackAndInvariants:
         assert resolution.kind == "plan"
         assert not calls
 
-    def test_greetings_never_reach_the_planner(self, org, monkeypatch):
-        """Shortcuts stay outside the analytical path entirely."""
+    def test_greetings_still_answer_from_the_shortcut(self, org, monkeypatch):
+        """A greeting still gets its canned reply — but the model is asked
+        first, because Phase 2 removed the pre-LLM semantic shortcut.
+
+        THE COST IS REAL and worth stating: "hello" now buys an LLM round
+        trip it cannot benefit from. A cheap pre-filter for messages that
+        contain no business content belongs in Phase 3 with the rest of
+        the prompt/schema work, not in a rule that decides meaning."""
         calls = _llm_returns(monkeypatch, QueryIR(intent="leaderboard"))
 
         assert _resolve(org, "hello").kind == "shortcut"
-        assert not calls
+        assert calls, "Phase 2: every query reaches the model first"
 
     def test_the_llm_never_produces_sql(self, org, monkeypatch):
         """The safety property the inversion must not weaken: the model

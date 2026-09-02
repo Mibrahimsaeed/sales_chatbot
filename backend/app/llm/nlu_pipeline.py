@@ -518,6 +518,14 @@ _SHOW_MORE_RE = re.compile(r"^(show more|more|next|next page|load more)$", re.I)
 # serialise the entity dict already skip these keys.
 PINNED_LEVEL_KEY = "_pinned_level"
 
+# The level an AMBIGUOUS NAME was resolved to — by the user answering
+# "the BCM or the Advisor?", or by the role ranking in resolve(). Distinct
+# from PINNED_LEVEL_KEY above, which records that the text's level WORD
+# was overruled and is read by the planner. This one is read by
+# ir_validator._authoritative_levels, which treats it as settled rather
+# than as one more competing reading of the name.
+RESOLVED_LEVEL_KEY = "_resolved_level"
+
 
 @dataclass
 class Resolution:
@@ -841,26 +849,29 @@ def _handle_pending_person(
 
 
 def _plan(text: str, entities: dict, db: Session, session_id: str | None) -> QueryPlan:
-    """Choose a planner (USE_LLM_PLANNER), with the rule-based one as the
-    fallback in every failure case.
+    """The rule-based plan, used only when the model could not answer.
 
-    The fallback is what makes the flag safe to flip in either direction:
-    if the LLM planner is off, unreachable, out of quota, or returns
-    something unusable, planning silently continues with the rule-based
-    planner — so the worst case is exactly today's behaviour, never an
-    error. Both planners emit the SAME QueryPlan shape, so nothing
-    downstream (dispatch, resolver, compiler, formatter) can tell which
-    one ran, which is also what makes an A/B comparison meaningful."""
-    if llm_planner.is_enabled():
-        try:
-            planned = llm_planner.plan_query(text, entities, db, session_id)
-            if planned is not None:
-                return planned
-            log.debug("LLM planner unavailable for %r — using rule-based planner", text)
-        except Exception:
-            # planning must never be the reason a request fails
-            log.exception("LLM planner raised — falling back to the rule-based planner")
+    THE LLM PLANNER IS GONE FROM THIS PATH. It was an earlier attempt at
+    LLM-led planning, behind USE_LLM_PLANNER (default off), and the
+    migration left it as a SECOND, COMPETING model-led interpreter:
+    semantic_parser.interpret() now asks the model about every query
+    before this function can run, so reaching here means the model either
+    could not be reached or returned an answer with slots missing.
 
+    In the first case a second call to the same provider only adds a
+    timeout to a request that is already degrading. In the second, the
+    model has already given its reading and a different prompt producing a
+    different plan is two interpreters disagreeing — precisely the
+    architecture this migration replaced.
+
+    Superseded, not deleted: llm_planner.plan_query remains, and anything
+    that wants LLM-led planning gets it from the semantic parser at the
+    TOP of resolve(), where the model is asked first and its answer is
+    authoritative.
+
+    What is left here is deliberately deterministic. It is the outage
+    path, and it must not depend on the thing that is out.
+    """
     return build_query_plan(text, entities)
 
 
@@ -895,6 +906,18 @@ def _pin_level(entities: dict, value: str, level: str) -> dict:
 
     pinned = dict(entities)
     pinned.pop("ambiguous_entity", None)
+    # RECORD THAT THIS WAS DECIDED, not merely extracted. Downstream, a
+    # resolved level must outrank the model's own choice even when both
+    # ground equally well — the ambiguity has already been settled here,
+    # by the user's wording or by the role ranking, so the model's level
+    # is a second opinion on a closed question.
+    #
+    # A SEPARATE KEY from PINNED_LEVEL_KEY, which means something else:
+    # that is the planner's breadcrumb for "the level WORD in the text was
+    # overruled", written only by _pin_stated_level, and the planner reads
+    # its absence. Writing it here changed how every ambiguity pin was
+    # planned and broke roster promotion.
+    pinned[RESOLVED_LEVEL_KEY] = level
     lowered = value.lower()
     for other in _AMBIGUITY_LEVELS:
         if other == level:
@@ -913,6 +936,23 @@ def _pin_level(entities: dict, value: str, level: str) -> dict:
                 pinned[plural] = [v for v in pinned[plural] if v.lower() != lowered]
                 if not pinned[plural]:
                     pinned.pop(plural, None)
+            # AND THE `_matches` KEY, which carries the same grounding with
+            # its confidence score. Dropping the singular and the plural
+            # while leaving this behind left the discarded reading visible
+            # to anything reading `_matches` — and
+            # ir_validator._authoritative_levels reads exactly that to
+            # decide whether extraction identified a name unambiguously.
+            # It kept seeing BOTH levels, treated the name as ambiguous,
+            # and abstained — so the level the user had just been pinned
+            # to was not enforced against the model's own guess, and
+            # "attendance of <a Zonal Head>" came back at `bcm`, where
+            # _exclude_more_senior_roles drops him and the answer is empty.
+            matches = f"{other}_matches"
+            if isinstance(pinned.get(matches), list):
+                pinned[matches] = [m for m in pinned[matches]
+                                   if str(m.get("value", "")).lower() != lowered]
+                if not pinned[matches]:
+                    pinned.pop(matches, None)
     return pinned
 
 
@@ -1244,6 +1284,7 @@ def _pin_stated_level(text: str, entities: dict) -> dict:
            for ref in reference_parser.parse(text)):
         return entities
 
+
     promoted = _authoritative_role(stated, ambiguous.get("levels") or [])
 
     routing.decide(
@@ -1375,6 +1416,95 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
                         "advisor_wids": [wid], "advisor_match_score": 1.0}
             entities.pop("advisor_ambiguous", None)
             entities.pop("advisor_resolution", None)
+
+    # =================================================================
+    # PHASE 2 — THE LLM IS THE FIRST SEMANTIC STEP
+    # =================================================================
+    #
+    # Every query reaches the semantic parser HERE, before any
+    # deterministic component forms an opinion about what it means.
+    #
+    # WHAT THIS REPLACES. The model used to be consulted at the END of
+    # this function, and only if `_plan_is_authoritative()` — a
+    # rule-based scorer — decided it was needed. Fourteen of the
+    # twenty-one operations were marked plan-only, so a roster, a
+    # profile, a manager lookup and an ancestry walk never reached the
+    # model at all; and for everything else, twelve semantic branches
+    # above could return before it was asked. Whether the LLM saw a
+    # query depended on a regex classifier's opinion of the query.
+    #
+    # WHAT STILL RUNS FIRST, and why none of it is a semantic decision:
+    #   extract_entities   establishes what EXISTS, so the prompt names
+    #                      real teams and people. The model still decides
+    #                      what the user meant about them.
+    #   pending clarify    an answer to a question we asked last turn is
+    #                      not a new query; conversation handling moves
+    #                      to the model in Phase 9.
+    #   pagination cursor  "show more" is a continuation gesture with no
+    #                      semantics to parse.
+    #
+    # WHAT HAPPENS WHEN THE MODEL CANNOT ANSWER. Everything below runs
+    # unchanged. That path is now a DEGRADE — reached only when the
+    # provider is unreachable or its output failed the schema — where it
+    # used to be the primary route for most queries. An outage must not
+    # become a dead end.
+    interpretation = semantic_parser.interpret(cleaned, entities, db, session_id)
+    routing.decide(
+        "Understanding",
+        "LLM semantic parser" if interpretation.reached_llm else "unavailable",
+        "every query is interpreted by the model before any deterministic "
+        "component decides what it means"
+        if interpretation.reached_llm else
+        f"the model could not be reached ({interpretation.reason}) — degrading "
+        "to the deterministic planner, which is now a fallback rather than a route",
+    )
+
+    # PHASE 9 — THE MODEL RESOLVES FOLLOW-UPS, NOT THE PATCHER.
+    #
+    # A bare follow-up ("what about last month", "only Graana", "top 5")
+    # means nothing without the previous turn. Until this phase the
+    # PREVIOUS TURN WAS SUPPLIED BY DETERMINISTIC CODE: an ellipsis
+    # detector classified the turn, and conversation_context.merge()
+    # copied the prior metric, period, subject level, filters and limit
+    # into this turn's IR field by field. That is deterministic code
+    # deciding what the user meant, and it is what this phase removes.
+    #
+    # WHAT REPLACES IT is not new machinery — the model was already being
+    # handed the conversation. `_call_llm_for_ir` puts the previous
+    # RESOLVED IR and the recent turns in the prompt, with instructions to
+    # read the new message as a patch on that query. The model simply had
+    # no say, because the gate below preferred the merge whenever the turn
+    # looked elliptical.
+    #
+    # WHAT DETERMINISTIC CODE STILL DOES, and why none of it is
+    # interpretation: it STORES each resolved IR, RETRIEVES the prior one,
+    # and PASSES it to the model. Storage and retrieval are not opinions
+    # about meaning.
+    #
+    # conversation_context and ir_patcher are deliberately left in place:
+    # both still serve the degrade path below, which is reached whenever
+    # the provider is unreachable. Removing them would turn an outage into
+    # a conversation that forgets everything.
+    if interpretation.understood and not interpretation.ir.missing:
+        # THE MODEL ANSWERED. Its reading is the query's meaning, and the
+        # plan-based branches below — the shortcut, the level pinning, the
+        # ambiguity promotion, the patcher — are skipped entirely rather
+        # than being allowed to overrule it.
+        prior = conversation_memory.get(session_id)
+        routing.decide(
+            "Context",
+            "resolved by the model" if prior is not None else "no previous turn",
+            f"previous: {conversation_context.summarise(prior)}\n"
+            f"supplied to the model as the prior resolved query plus the recent "
+            f"turns; this turn's reading is the model's, not a field-by-field "
+            f"merge\n"
+            f"result: {conversation_context.summarise(interpretation.ir)}",
+        )
+        conversation_memory.set(session_id, interpretation.ir)
+        tracing.record_entities(entities)
+        audit.record_entities(entities)
+        audit.record_ir(interpretation.ir)
+        return _ir_resolution(interpretation.ir, entities, used_llm_fallback=True)
 
     # ---- Phase 1 routing gates -------------------------------------
     # All three run HERE, after extraction/cross-turn/carry have produced
@@ -1563,15 +1693,39 @@ def resolve(text: str, db: Session, session_id: str | None = None, _depth: int =
         # reads as a TEAM or COMPANY — a different entity that happens to
         # share a spelling, where no ranking settles anything and the
         # question is still the honest reply.
-        if not wants_group and _highest_role(levels) is not None:
+        # PIN A LEVEL THE NAME ACTUALLY GROUNDS AT. `advisor` is the right
+        # default only when the person IS one — the reasoning above is
+        # that a manager's profile is the same answer a single-role
+        # advisor gets, which presupposes an advisor row to answer from.
+        #
+        # A manager who is NOT on the master sheet as an advisor has no
+        # such row, and pinning `advisor` for them pinned a reading that
+        # does not exist: `_pin_level` strips every level the name DID
+        # ground at, the entity dict comes back with nothing in it, and
+        # the turn then looks subject-less to everything downstream. For
+        # "attendance of <a BCM>" that meant the canned attendance
+        # shortcut claimed it and answered with 176 advisors org-wide,
+        # the named person nowhere in the reply.
+        #
+        # `_highest_role` already answers "which role does this person
+        # actually hold", and is what the group branch above pins, so the
+        # senior-most grounded role is used when there is no advisor
+        # reading to prefer. Behaviour is unchanged for every name that
+        # does ground at `advisor`.
+        role = _highest_role(levels)
+        if not wants_group and role is not None:
+            pinned = "advisor" if "advisor" in levels else role
             routing.decide(
-                "Level", "pinned advisor",
+                "Level", f"pinned {pinned}",
                 f"{value!r} names one person wearing several hats and the turn "
                 "asks about them rather than about a measure or their team — "
-                "which hat they wear settles nothing a profile does not say",
+                + ("which hat they wear settles nothing a profile does not say"
+                   if pinned == "advisor" else
+                   f"they hold no advisor record, so {pinned!r} is the "
+                   "senior-most role they actually hold"),
             )
             return resolve(cleaned, db, session_id=session_id, _depth=_depth or 1,
-                           _pin=(value, "advisor"))
+                           _pin=(value, pinned))
 
         options = [hierarchy.label_for(lvl) for lvl in levels]
         audit.decision("routing", "clarify:ambiguous_entity",

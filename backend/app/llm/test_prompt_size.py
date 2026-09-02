@@ -211,8 +211,13 @@ def test_no_worked_example_was_dropped():
     # when written, and Phase 2 removed one unemittable `breakdown`
     # example and added three `group_metric` ones (an operation the model
     # is offered and had never been shown), plus the hierarchy and
-    # boolean examples added since.
-    assert len(EXAMPLES) == 37
+    # boolean examples added since, and one for a MANAGEMENT LEVEL WITHIN
+    # A NAMED GROUP — the only hierarchy shape with no example at all,
+    # measured producing four different interpretations from five
+    # equivalent phrasings, and one for a ROLE INSIDE A GROUP ("the Unit
+    # Head in AMD") — measured losing the scope entirely across eight
+    # equivalent phrasings of the same question.
+    assert len(EXAMPLES) == 39
     for ex in EXAMPLES:
         assert ex["utterance"] in block
 

@@ -205,11 +205,27 @@ def _authoritative_levels(entities: dict | None) -> dict[str, tuple[str, float]]
             by_value.setdefault(key, set()).add(level)
             scores[(key, level)] = max(scores.get((key, level), 0.0), score)
 
-    return {
+    # A PIN OUTRANKS A TIE. `nlu_pipeline._pin_level` records the level an
+    # ambiguous name was RESOLVED to — by the user answering "the BCM or
+    # the Advisor?", or by the role ranking. That is a closed question, so
+    # it must beat the model's own level even when both ground equally
+    # well; the comparative test in _apply_extraction_identity abstains on
+    # a tie, which left a pinned `zonal_head` losing to a guessed `bcm`
+    # (and `_exclude_more_senior_roles` then returned no rows at all).
+    #
+    # Expressed as a score above the 1.0 ceiling a gazetteer match can
+    # reach, so the existing comparison enforces it with no new branch.
+    pinned = entities.get("_resolved_level")
+    resolved = {
         value: (next(iter(levels)), scores[(value, next(iter(levels)))])
         for value, levels in by_value.items()
         if len(levels) == 1
     }
+    if pinned:
+        for value, (level, _score) in list(resolved.items()):
+            if level == pinned:
+                resolved[value] = (level, 2.0)
+    return resolved
 
 
 def _grounds_here(subject: Subject, db: Session) -> float:
@@ -296,11 +312,27 @@ def _retyped_subject(subject: Subject, db: Session, authoritative: dict,
     return subject.model_copy(update={"type": retyped.type})
 
 
-def _ground_subject(subject: Subject, db: Session) -> tuple[Subject, str | None]:
+def _ground_subject(subject: Subject, db: Session,
+                    floor: float = _MATCH_FLOOR) -> tuple[Subject, str | None]:
+    """Resolve a subject's VALUE within its stated level.
+
+    `floor` is how close a fuzzy match must be. The default 0.55 is the
+    rule-based path's, and it is only safe there because _retyped_subject
+    has already corrected the level.
+
+    PHASE 11: with that rewrite switched off, a wrong level reaches this
+    function intact — and at 0.55 the value is then matched inside the
+    WRONG gazetteer. "Blue Area" scores 0.60 against the company
+    "IMARAT", so a query about a team was silently answered about a
+    company: a real entity, a real number, and the wrong question.
+    Raising the floor is what turns that into "no such company", which is
+    the honest answer and the one grounding already gives (Phase 4 uses
+    0.80 for group levels, 0.90 for people, and reports TYPE_MISMATCH).
+    """
     gazetteer_fn = _SUBJECT_GAZETTEERS.get(subject.type)
     if gazetteer_fn is not None:
         match = best_match(
-            subject.value, gazetteer_fn(db), kind=hierarchy.match_kind_for(subject.type), floor=_MATCH_FLOOR
+            subject.value, gazetteer_fn(db), kind=hierarchy.match_kind_for(subject.type), floor=floor
         )
     else:
         # Phase 1 identity refactor: an advisor subject is resolved to a
@@ -380,9 +412,25 @@ def _reground_scope_subject(subject: Subject, db: Session) -> Subject | None:
 
 
 def validate_ir(ir: QueryIR, db: Session,
-                entities: dict | None = None) -> ValidationResult:
+                entities: dict | None = None, *,
+                allow_semantic_repair: bool = True) -> ValidationResult:
     """`entities` is deterministic extraction's output for the same
     message, when the caller has it.
+
+    `allow_semantic_repair=False` switches off the rewrites that change
+    what the query MEANS — the subject's type, and the hierarchy-read
+    triple (target_level / subject_of / relation). PHASE 11 passes it
+    from the LLM-first path, where those rewrites are deterministic code
+    overruling the model's interpretation without telling anyone. A
+    conflict is now reported by grounding and validation (Phases 4-5) as
+    TYPE_MISMATCH, which the pipeline can reject or ask about, instead of
+    being silently applied.
+
+    It stays TRUE by default for the deterministic callers — ir_patcher
+    and the pending-slot fill build their own IRs, so a "repair" there is
+    a module keeping its own output self-consistent, not one component
+    overruling another. Those callers pass no `entities` anyway, which is
+    what both rewrites need to fire at all.
 
     OPTIONAL, so the deterministic callers that build their own IRs
     (ir_patcher, the pending-slot fill) and every existing test keep
@@ -496,8 +544,62 @@ def validate_ir(ir: QueryIR, db: Session,
     # subject: the compiler filters by team and GROUPS BY company, so the
     # answer is AMD's revenue reported under a company's name. A wrong
     # answer in place of a wrong question is not an improvement.
-    ir.subjects = [_retyped_subject(s, db, _authoritative_levels(entities), ir)
-                   for s in ir.subjects]
+    if allow_semantic_repair:
+        ir.subjects = [_retyped_subject(s, db, _authoritative_levels(entities), ir)
+                       for s in ir.subjects]
+
+    # ---- A HIERARCHY READ ENUMERATES A LEVEL THE USER NAMED ----------
+    #
+    # "connects of Blue Area" asks for ONE team's figure. The model
+    # returns the advisors inside it instead, because it sets
+    #
+    #     target_level="advisor"  subject_of="team"  relation="subtree"
+    #
+    # on a sentence with no "under", no "beneath", and no word for the
+    # level it decided to enumerate. Those three fields make
+    # `is_hierarchy_read()` true, which suppresses the subject_level
+    # normalisation below — so the named entity stays a SCOPE and the
+    # answer becomes its members rather than its own figure.
+    #
+    # THE DISCRIMINATOR IS THE ABSENCE OF A LEVEL WORD, and it is
+    # structural rather than a keyword scan: a read enumerates a level, so
+    # a turn that never names one has nothing to enumerate.
+    #
+    #     "connects of Blue Area"              level_word = None
+    #     "connects of advisors in Blue Area"  level_word = advisor
+    #
+    # A LEVEL WORD IS NOT THE ONLY WAY TO NAME A READ. A turn can state
+    # the RELATIONSHIP and leave the level implicit, and those are the
+    # clearest hierarchy reads in the language:
+    #
+    #     "who reports directly to X"   level_word = None, relation_word
+    #     "who works under X"           level_word = None, relation_word
+    #
+    # Testing the level word alone deleted target_level and reset
+    # relation="direct" to "subtree" on exactly those turns — so "who
+    # reports DIRECTLY to X" was answered with X's whole subtree, the
+    # distinction the `relation` field exists to carry. Both signals are
+    # recorded by entity_extractor from the expressions that already own
+    # this vocabulary; neither is a keyword scan added here.
+    #
+    # Narrow by construction: it fires only when extraction actually ran,
+    # the IR claims a read, and the turn names NEITHER a level nor a
+    # relationship — so a genuine read ("advisors under Haseeb", "which
+    # BCMs work under X", "who reports to X") keeps all three fields, and
+    # an IR built without an entity dict is untouched.
+    if (allow_semantic_repair
+            and entities is not None
+            and ir.target_level is not None
+            and not entities.get("level_word")
+            and not entities.get("relation_word")):
+        _repair(ir, "target_level", ir.target_level, None,
+                "the turn names neither a level to enumerate nor a "
+                "hierarchy relationship, so it is not a hierarchy read — "
+                "the named entity is what the question is ABOUT, not a "
+                "scope to list the members of")
+        ir.target_level = None
+        ir.subject_of = None
+        ir.relation = "subtree"
 
     # ---- THE ANSWER IS ABOUT THE SUBJECT THAT WAS NAMED --------------
     #
@@ -530,7 +632,31 @@ def validate_ir(ir: QueryIR, db: Session,
     # Ordered BEFORE the metric block on purpose: the degrade there
     # (`is_answerable` -> primary_level) exists to rescue a level the
     # compiler cannot serve, so it must keep the last word over this.
+    # AN EXPLICIT LEVEL WORD SAYS THE SUBJECT IS A SCOPE.
+    #
+    # This block makes `subject_level` agree with the named subject, which
+    # is right when the subject IS the answer. It is wrong when the user
+    # named a different level to report at:
+    #
+    #   "revenue of advisors in Blue Area"
+    #       model: subject_level=advisor, subjects=[team Blue Area]  (correct)
+    #       here:  subject_level advisor -> team
+    #       answer: the TEAM's own revenue, not its advisors'
+    #
+    # The model had it right and the normalisation overwrote it. The
+    # discriminator is the same one that separates a hierarchy read from
+    # an own-figure query: the level word the user actually said. When it
+    # names a level OTHER than the subject's, the subject is a scope and
+    # `subject_level` is already the answer's level — leave it alone.
+    named_level = (entities or {}).get("level_word")
+    subject_is_scope = (
+        bool(named_level)
+        and ir.subjects
+        and named_level != ir.subjects[0].type
+        and named_level == ir.subject_level
+    )
     if (len(ir.subjects) == 1
+            and not subject_is_scope
             and ir.group_by is None
             and ir.target_level is None
             and ir.resolved_operation() not in _SUBJECT_IS_A_SCOPE
@@ -542,6 +668,48 @@ def validate_ir(ir: QueryIR, db: Session,
                     "about; the two fields disagreed and the compiler believes "
                     "subject_level")
         ir.subject_level = ir.subjects[0].type
+
+    # ---- ONE SUBJECT, ONE MEASURE, ITS OWN FIGURE --------------------
+    #
+    # `operations.py` defines group_metric as exactly this: "one group's
+    # own figure for one measure". An IR that IS that shape should say so,
+    # because the answer's KIND follows from the operation —
+    # response_planner renders group_metric as a single value and
+    # filtered_list as a table of members.
+    #
+    # Two identical questions were getting different shapes purely from
+    # the model's label:
+    #
+    #   "what is Blue Area's revenue"  group_metric   -> "Blue Area has 74,194,966 ..."
+    #   "connects of Blue Area"        filtered_list  -> a one-row table, "1. Blue Area"
+    #
+    # STRUCTURAL and narrow: exactly one subject, reported AT ITS OWN
+    # LEVEL (so it is the answer, not a scope), with a measure and nothing
+    # asking to look inside it. A list over MEMBERS keeps its shape,
+    # because its subject_level is the member level, not the subject's —
+    # "connects of advisors in Blue Area" has subject_level=advisor
+    # against a team subject and does not match. Nor does a
+    # metric-condition list, which names no subject at all.
+    #
+    # `leaderboard` is deliberately excluded: it is in _SUBJECT_IS_A_SCOPE
+    # because "top advisors in Blue Area" ranks the MEMBERS of the named
+    # group, and re-labelling that would collapse a ranking into one row.
+    # ... and never when the turn named a level OTHER than the subject's:
+    # "revenue of advisors in Blue Area" reports advisors, however the
+    # model labelled the operation.
+    named_level = (entities or {}).get("level_word")
+    if (ir.resolved_operation() == "filtered_list"
+            and len(ir.subjects) == 1
+            and ir.subjects[0].type == ir.subject_level
+            and not (named_level and named_level != ir.subjects[0].type)
+            and ir.target_level is None
+            and ir.group_by is None
+            and ir.primary_metric() is not None):
+        _repair(ir, "operation", "filtered_list", "group_metric",
+                "one subject, reported at its own level, with one measure and "
+                "nothing asking to look inside it — that is the subject's own "
+                "figure, and the answer is a value rather than a list of one")
+        ir.operation = "group_metric"
 
     # ---- metric (sort/primary) — presence AND confidence floor ----
     # A POPULATION is metric-free BY DEFINITION — "who matches this", with
@@ -699,7 +867,16 @@ def validate_ir(ir: QueryIR, db: Session,
         # the level the name actually belongs to and only has to resolve
         # the VALUE — the canonical spelling, its match confidence, and
         # (for an advisor) the wid.
-        grounded, problem = _ground_subject(s, db)
+        # PHASE 11: on the LLM path the stated level has not been
+        # corrected, so the value must clear the same floor the Phase 4
+        # grounder uses — read from it rather than restated, so the two
+        # cannot drift into disagreeing about what "matches" means.
+        if allow_semantic_repair:
+            subject_floor = _MATCH_FLOOR
+        else:
+            from app.llm.grounding import _floor_for
+            subject_floor = _floor_for(s.type)
+        grounded, problem = _ground_subject(s, db, floor=subject_floor)
         if problem:
             missing.append(problem)
             _repair(ir, "subjects", f"{s.type}:{s.value}", None,

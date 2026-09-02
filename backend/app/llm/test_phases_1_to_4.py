@@ -285,12 +285,16 @@ class TestPhase4Routing:
         _resolve(org, "top advisors by connects")
         assert calls
 
-    def test_plan_only_shapes_do_not(self, org, monkeypatch):
+    def test_plan_only_shapes_reach_the_llm_but_execute_on_the_plan(self, org, monkeypatch):
+        """PHASE 2. The capability gate no longer decides whether the model
+        is consulted — it only decides where the answer is EXECUTED. A
+        roster still runs on the plan, because no IR expresses it."""
         calls = []
         monkeypatch.setattr(semantic_parser, "call_llm_structured",
                             lambda p, s, schema_name=None: calls.append(p) or None)
-        _resolve(org, "all advisors in Blue Area")
-        assert not calls
+        resolution = _resolve(org, "all advisors in Blue Area")
+        assert calls, "every query reaches the model first"
+        assert resolution.kind == "plan"
 
     def test_the_prompt_never_asks_for_sql(self, org, monkeypatch):
         captured = []

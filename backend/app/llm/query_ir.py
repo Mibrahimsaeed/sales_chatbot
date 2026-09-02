@@ -274,6 +274,15 @@ class QueryIR(BaseModel):
     # never validated, and never rendered to the user — it is persisted in
     # ChatLog.resolved_ir and carried on the request trace.
     repairs: list[dict] = Field(default_factory=list)
+    # PHASE 6 — the principal this query was built for.
+    #
+    # CARRIED, NOT ENFORCED. There is no authorization policy in this
+    # system: tokens hold a `role` claim that nothing consumes, and the
+    # posture is an open decision. Populating a scope here from an
+    # invented policy would silently shrink results with no stated
+    # reason, so this records who asked and nothing reads it. When a
+    # policy is settled it is applied from this one field.
+    authorization_scope: Optional[dict] = None
 
     # ---- accessors -------------------------------------------------
     #

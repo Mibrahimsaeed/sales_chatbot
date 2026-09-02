@@ -126,52 +126,60 @@ def chain_db(db_session, monkeypatch):
     conversation_memory._store.clear()
 
 
-def test_follow_up_chain_patches_without_extra_llm_calls(chain_db, monkeypatch):
+def test_the_patcher_carries_a_follow_up_chain_when_the_model_is_down(chain_db, monkeypatch):
+    """PHASE 9 RE-POINTED THIS. It used to assert the patcher handled the
+    whole chain while the model was available — that was the arrangement
+    Phase 9 removed: follow-up understanding is the model's, because the
+    conversation is in its prompt and a field-by-field merge is
+    deterministic code deciding what the user meant.
+
+    WHAT THE PATCHER IS STILL FOR is this: the provider is unreachable
+    from turn 2 on, and the conversation must not forget. Scope, limit and
+    period each survive the turn after they were set, which is the
+    property that made the module worth keeping rather than deleting.
+    """
     llm_calls = []
+    answers = [{
+        "intent": "leaderboard",
+        "subject_level": "advisor",
+        "subjects": [],
+        "metric": {"key": "mtd_cleared", "confidence": 0.95},
+        "filters": [],
+        "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
+        "sort": {"metric": "mtd_cleared", "direction": "desc"},
+        "limit": 10,
+        "group_by": None,
+        "overall_confidence": 0.95,
+    }]
 
     def fake_llm(prompt, schema, schema_name):
         llm_calls.append(prompt)
-        return {
-            "intent": "leaderboard",
-            "subject_level": "advisor",
-            "subjects": [],
-            "metric": {"key": "mtd_cleared", "confidence": 0.95},
-            "filters": [],
-            "time_range": {"mode": "snapshot", "period": "MTD", "compare_to": None},
-            "sort": {"metric": "mtd_cleared", "direction": "desc"},
-            "limit": 10,
-            "group_by": None,
-            "overall_confidence": 0.95,
-        }
+        return answers.pop(0) if answers else None      # down from turn 2
 
     monkeypatch.setattr(semantic_parser, "call_llm_structured", fake_llm)
     monkeypatch.setattr(semantic_parser.settings, "nlu_mode", "llm_first")
     session = "chain-1"
 
-    # turn 1: full parse (one LLM call)
+    # turn 1: the model answers
     r1 = nlu_pipeline.resolve("show top advisors by revenue", chain_db, session_id=session)
     assert r1.kind == "ir"
-    assert len(llm_calls) == 1
 
-    # turn 2: "only Graana" — deterministic patch, no new LLM call
+    # turn 2 onwards: nothing comes back, and the chain still holds
     r2 = nlu_pipeline.resolve("only Graana", chain_db, session_id=session)
     assert r2.kind == "ir"
-    assert len(llm_calls) == 1
     assert any(f.field == "company" and f.value == "Graana" for f in r2.ir.filters)
 
-    # turn 3: "top 5" — patch again, filters retained
     r3 = nlu_pipeline.resolve("top 5", chain_db, session_id=session)
     assert r3.kind == "ir"
-    assert len(llm_calls) == 1
     assert r3.ir.limit == 5
     assert any(f.field == "company" and f.value == "Graana" for f in r3.ir.filters)
 
-    # turn 4: "ytd" — period patch, everything else retained
     r4 = nlu_pipeline.resolve("ytd", chain_db, session_id=session)
     assert r4.kind == "ir"
-    assert len(llm_calls) == 1
     assert r4.ir.time_range.period == "YTD"
     assert r4.ir.limit == 5
+
+    assert len(llm_calls) == 4, "the model is still ASKED every turn; it just fails"
 
 
 # ---------------------------------------------------------------------
