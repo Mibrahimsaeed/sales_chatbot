@@ -376,24 +376,45 @@ METRICS: dict[str, MetricDef] = {
         daily_target_rate=10.0,
         entity_levels=["advisor", "team"],
         primary_level="advisor",
-        # SOURCE: Sales Biometric -> "Answered Calls" -> `Connects MTD`,
-        # landed by the ETL in `calls.connects_mtd`. This read
-        # `SalesFunnel.mtd_new_connect + mtd_followup_connect` — the CCMC
-        # tab — until Phase 17 named the Answered Calls tab the
-        # authoritative source for connects. Both tabs report the measure
-        # and agree for 564 of the 584 advisors carried by both, so this
-        # is a provenance change rather than a numbers change; what it
-        # fixes is that "connects" now comes from the tab that owns it,
-        # at every window the family answers.
+        # SOURCE: the CCMC tab, as `SalesFunnel.mtd_new_connect +
+        # mtd_followup_connect` — connects is an ADDITIVE measure and this
+        # is its definition: the new connects plus the follow-up ones.
         #
-        # Its DAILY sibling already reads `calls.connects_daily` from the
-        # same tab and the same row, so MTD and DAILY are now like for
-        # like. The YTD sibling still reads SalesFunnel: the Answered
-        # Calls tab has no YTD column, and inventing one would be a
-        # fabricated binding — see the note on ytd_connects below.
+        # Phase 17 repointed this to `calls.connects_mtd` (Sales Biometric
+        # -> "Answered Calls" -> `Connects MTD`) on the grounds that the
+        # Answered Calls tab owns the measure. That is REVERSED here, on
+        # the owner's instruction, and the coverage measured against
+        # production is why it was the wrong call:
+        #
+        #     master-sheet advisors        561
+        #     with a `calls` row           547   <- 14 report NO connects
+        #     with a `sales_funnel` row    561
+        #     SUM(calls.connects_mtd)      190,314
+        #     SUM(new + followup)          190,241     (0.04% apart)
+        #
+        # The two tabs agree on the number and disagree on WHO they cover.
+        # Repointing therefore did not change the totals — it silently
+        # dropped 14 people (2.5%) out of every connects answer, because
+        # the metric is reached through an inner join on its own table and
+        # a missing row reads as no data rather than as zero.
+        #
+        # IT ALSO MAKES THE FAMILY CONSISTENT. `ytd_connects` below is the
+        # same additive pair over the YTD columns, so MTD and YTD are now
+        # like for like — computed the same way from the same tab, which
+        # is what lets a period swap mean only "a different window".
+        #
+        # The DAILY sibling stays on `calls.connects_daily`: the CCMC tab
+        # has no daily column, so there is nothing additive to sum there,
+        # and a fabricated binding would be worse than an asymmetric one.
         bindings={
-            "advisor": ColumnBinding(model=Calls, expr=Calls.connects_mtd),
-            "team": ColumnBinding(model=Calls, expr=Calls.connects_mtd),
+            "advisor": ColumnBinding(
+                model=SalesFunnel,
+                expr=SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect,
+            ),
+            "team": ColumnBinding(
+                model=SalesFunnel,
+                expr=SalesFunnel.mtd_new_connect + SalesFunnel.mtd_followup_connect,
+            ),
         },
     ),
 

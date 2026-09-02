@@ -75,7 +75,12 @@ def org(db_session):
         db_session.add(Calls(wid=wid, connects_mtd=connects,
                              answered_calls_mtd=connects))
         db_session.add(SalesFunnel(wid=wid, mtd_new_meeting=connects,
-                                   mtd_followup_meeting=0, mtd_cr=connects))
+                                   mtd_followup_meeting=0, mtd_cr=connects,
+                                   # `total_connects` is this table's
+                                   # additive pair; the Calls row above
+                                   # still supplies answered_calls_mtd.
+                                   mtd_new_connect=connects,
+                                   mtd_followup_connect=0))
         db_session.add(Performance(wid=wid, period=PerformancePeriod.MTD,
                                    cleared=connects * 100))
         db_session.add(Attendance(wid=wid, biometric_mtd_ontime=connects,

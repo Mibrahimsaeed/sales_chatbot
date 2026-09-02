@@ -122,35 +122,15 @@ It means ONE person, Faisal, occupies all three hierarchy positions.
 3. HIERARCHY CONTAINMENT
 =======================================================================
 
-The organisational hierarchy is:
+Read the hierarchy as CONTAINMENT: each level contains every
+organisational entity beneath it, and Advisor is the leaf.
 
-{chain}
+The chain itself, and what each level means, is stated once below under
+HIERARCHY LEVELS AND ROLES.
 
-Read this as a containment relationship.
-
-Each level contains the organisational entities beneath it.
-
-However, the underlying table is Advisor-centric: each physical row is
-still one Advisor and contains the full path leading to that Advisor.
-
-The hierarchy levels therefore describe the REPORTING PATH represented
-by each Advisor row.
-
-The hierarchy is:
-
-    Team
-    ->
-    Unit Head
-    ->
-    Zonal Head/Manager
-    ->
-    BCM
-    ->
-    Advisor
-
-Advisor is the leaf.
-
-Advisor SAP ID identifies the Advisor represented by the row.
+The underlying table is Advisor-centric, so those levels describe the
+REPORTING PATH carried by each Advisor row rather than separate records.
+Advisor SAP ID identifies the Advisor that row represents.
 
 =======================================================================
 4. HIGHEST-LEVEL PERSON RULE
@@ -404,139 +384,27 @@ Do not discard the outer Unit Head scope merely because the BCM is also
 named.
 
 =======================================================================
-11. DIRECT REPORTING — STRICT RULE
+11. DIRECT REPORTING — WHAT THE DATA MEANS
 =======================================================================
 
-"Directly reporting to", "reports directly to", "direct reports",
-"directly under", "immediately under", or equivalent wording represents
-a STRICT hierarchy relationship.
+Every hierarchy row is one Advisor and carries their COMPLETE reporting
+path. So an Advisor directly reports to a person only when that person's
+name occupies EVERY management column between them:
 
-Because every hierarchy row represents one Advisor and the row contains
-the complete reporting path, an Advisor is a DIRECT REPORT of a person
-only when that person's name occupies EVERY MANAGEMENT LEVEL BETWEEN
-THAT PERSON AND THE ADVISOR.
+    Unit Head = Faisal  AND  Zonal Head = Faisal  AND  BCM = Faisal
 
-For a Unit Head such as Faisal:
+    Row 1: Unit Head=Faisal, Zonal Head=Faisal, BCM=Faisal, Advisor=Ahmed
+           -> Ahmed reports DIRECTLY to Faisal.
+    Row 2: Unit Head=Faisal, Zonal Head=Ahmed Khan, BCM=Ahmed Khan, Advisor=Bilal
+           -> Bilal is INSIDE Faisal's scope but does NOT report directly
+              to him: another manager sits in between.
 
-    Unit Head = Faisal
-    AND
-    Zonal Head/Manager = Faisal
-    AND
-    BCM = Faisal
-    AND
-    Advisor = specific Advisor
+This is the difference between "under Faisal" (his whole scope — may
+include Bilal) and "directly reporting to Faisal" (must not). The word
+"directly" is never ignorable.
 
-Only rows satisfying ALL of those hierarchy conditions represent
-Advisors directly reporting to Faisal.
-
-This is NOT the same as Faisal's complete Unit Head scope.
-
-=======================================================================
-12. DIRECT REPORTING EXAMPLE
-=======================================================================
-
-Row 1:
-
-    Team = AMD
-    Unit Head = Faisal Hussain Naqvi
-    Zonal Head/Manager = Faisal Hussain Naqvi
-    BCM = Faisal Hussain Naqvi
-    Advisor = Ahmed
-    SAP ID = 100001
-
-Ahmed directly reports to Faisal.
-
-Row 2:
-
-    Team = AMD
-    Unit Head = Faisal Hussain Naqvi
-    Zonal Head/Manager = Ahmed Khan
-    BCM = Ahmed Khan
-    Advisor = Bilal
-    SAP ID = 100002
-
-Bilal does NOT directly report to Faisal.
-
-Bilal is inside Faisal's overall Unit Head scope, but Faisal is not the
-complete reporting-path manager immediately above Bilal.
-
-Therefore:
-
-    "under Faisal"
-
-may include Bilal.
-
-But:
-
-    "directly reporting to Faisal"
-
-must NOT include Bilal.
-
-=======================================================================
-13. DIRECT REPORTING QUERIES
-=======================================================================
-
-"How many advisors report directly to Faisal?"
-
-means:
-
-    Unit Head = Faisal
-    AND
-    Zonal Head/Manager = Faisal
-    AND
-    BCM = Faisal
-
-Then count UNIQUE Advisor SAP IDs.
-
-"Who reports directly to Faisal?"
-
-uses the same strict hierarchy condition and returns the Advisors from
-those rows.
-
-"Which advisors directly report to Faisal?"
-
-uses the same strict hierarchy condition.
-
-Do NOT broaden a direct-report query into the person's entire scope.
-
-=======================================================================
-14. "UNDER" VS "DIRECTLY REPORTING"
-=======================================================================
-
-The chatbot MUST distinguish these concepts.
-
------------------------------------------------------------------------
-UNDER
------------------------------------------------------------------------
-
-"Under Faisal"
-
-means Faisal's complete organisational scope according to his highest
-hierarchy level.
-
-If Faisal is a Unit Head:
-
-    Unit Head = Faisal
-
-Return descendants represented by those rows.
-
------------------------------------------------------------------------
-DIRECTLY REPORTING
------------------------------------------------------------------------
-
-"Directly reporting to Faisal"
-
-means the strict complete-path condition:
-
-    Unit Head = Faisal
-    AND
-    Zonal Head/Manager = Faisal
-    AND
-    BCM = Faisal
-
-Only Advisors satisfying the complete direct-reporting path qualify.
-
-The word "directly" MUST NOT be ignored.
+Which `relation` value expresses each is specified once, under CHOOSE
+RELATION BY MEANING in the output-schema section below.
 
 =======================================================================
 15. "FAISAL'S ADVISORS" DEFAULT SEMANTICS
@@ -578,122 +446,6 @@ not:
     AND BCM = Faisal
 
 =======================================================================
-16. TARGET LEVEL VS SCOPE PERSON
-=======================================================================
-
-The person defining a scope is NOT necessarily the entity the answer is
-about.
-
-Example:
-
-    "advisors under Faisal"
-
-Faisal is the SCOPE PERSON.
-
-Advisors are the ANSWER SUBJECTS.
-
-Therefore:
-
-    subject_of = unit_head
-    target_level = advisor
-    subject_level = advisor
-
-Do NOT set subject_level = unit_head merely because Faisal is named.
-
-Conversely:
-
-    "Faisal's connects"
-
-asks for Faisal's own metric.
-
-Therefore:
-
-    subject_level = unit_head
-
-The scope entity and answer entity may legitimately have different
-levels.
-
-=======================================================================
-17. HIERARCHY READS
-=======================================================================
-
-Hierarchy language identifies WHO belongs to a scope.
-
-It does not itself determine which metric is requested.
-
-Examples:
-
-    "advisors under Faisal"
-        -> hierarchy population query
-
-    "how many advisors under Faisal"
-        -> hierarchy population/count query
-
-    "connects of advisors under Faisal"
-        -> hierarchy-scoped metric query
-
-    "top advisors under Faisal by connects"
-        -> hierarchy-scoped ranking query
-
-For hierarchy reads:
-
-    target_level = level being requested
-    subject_of = level of the scope person
-    relation = direct or subtree
-    subjects = scope entity
-
-The target level must come from the user's wording when explicitly
-named.
-
-If the target level is NOT explicitly named, use the immediate child
-level of the scope level rather than automatically jumping to Advisor.
-
-=======================================================================
-18. RELATION: DIRECT VS SUBTREE
-=======================================================================
-
-Use:
-
-    relation = direct
-
-when the user explicitly means immediate/direct reporting, including:
-
-    directly
-    directly reports
-    reports directly
-    direct reports
-    directly reporting
-    immediately under
-    immediately reports to
-    personally manages
-    straight to
-
-Use:
-
-    relation = subtree
-
-for broad scope language such as:
-
-    under
-    beneath
-    within
-    in their organisation
-    reporting structure
-    people under them
-
-When wording does NOT explicitly restrict the relationship to immediate
-or direct reports, use subtree.
-
-IMPORTANT:
-
-"under" does NOT mean direct.
-
-"under Faisal" may include Advisors managed through another Zonal
-Head/Manager or BCM.
-
-"directly reporting to Faisal" requires the strict direct condition.
-
-=======================================================================
 19. HIERARCHY LEVELS AND ROLES
 =======================================================================
 
@@ -729,7 +481,8 @@ The organisational attributes are:
 
 Attributes describe entities but do NOT create reporting relationships.
 
-An attribute is never automatically:
+THE RULE: never treat an attribute as a STEP IN THE CHAIN. An attribute
+is never automatically:
 
     a parent
     a child
@@ -737,11 +490,16 @@ An attribute is never automatically:
     subject_of
     target_level of a hierarchy read
 
+The data is why. Every one of the 9 teams spans several offices, and
+every region spans several companies — so "the company above this
+region" names no single thing. A traversal built on an attribute
+silently returns the wrong population rather than failing.
+
 For example:
 
     "advisors in North Region"
 
-is a filter on the region attribute.
+is a filter on the region attribute — not a hierarchy traversal.
 
 It does NOT mean:
 
@@ -843,186 +601,38 @@ as Faisal's primary organisational identity.
 24. BUSINESS DATA FILTERING MODEL
 =======================================================================
 
-The hierarchy table establishes which Advisors belong to a Team,
-Unit Head, Zonal Head/Manager, or BCM.
+The hierarchy establishes WHICH Advisors belong to a Team, Unit Head,
+Zonal Head/Manager or BCM. Metrics are then computed over exactly those
+Advisors — downstream, by deterministic code.
 
-Business metrics should then be calculated using the Advisors identified
-by the hierarchy.
+YOUR OUTPUT IS THE SEMANTIC INTENT AND THE SCOPE, NEVER A NUMBER. Do not
+invent, estimate or calculate a figure. Naming the measure and the scope
+correctly IS the whole task; the value is not yours to produce.
 
-The LLM does NOT calculate database values.
-
-For example:
-
-    "What were Faisal's sales this month?"
-
-Semantic process:
-
-    1. Identify Faisal.
-    2. Search Faisal across hierarchy columns.
-    3. Determine Faisal's highest hierarchy level.
-    4. Highest level = Unit Head.
-    5. Establish scope using:
-           Unit Head = Faisal
-    6. Extract the unique Advisor SAP IDs represented by those rows.
-    7. Use those Advisor IDs to scope the business dataset.
-    8. Calculate the requested metric downstream.
-    9. Return the result.
-
-The LLM only represents the semantic intent and hierarchy scope.
-
-It must NEVER invent or calculate the numeric database result.
-
-=======================================================================
-25. ADVISOR-LEVEL DATA JOINING
-=======================================================================
-
-Because SAP ID exists only for Advisors, business datasets should
-preferably connect to the organisational hierarchy through Advisor SAP ID.
-
-Example:
-
-Hierarchy Table:
-
-    Team
-    Unit Head
-    Zonal Head
-    BCM
-    Advisor
-    Advisor SAP ID
-    Advisor WID
-
-joins with:
-
-Performance Table:
-
-    Advisor SAP ID
-    Cleared
-    Target
-    %
-
-and may join with:
-
-CCMC Table:
-
-    Advisor WID
-    Connects
-    Answered Calls
-    Meetings
-    ...
-
-This provides the reliable connection between organisational hierarchy
-and business performance.
-
-=======================================================================
-26. CORE ORGANIZATIONAL QUERY LOGIC
-=======================================================================
-
-Every organisational question should conceptually follow:
-
-    IDENTIFY PERSON / ENTITY
-          ->
-    DETERMINE HIGHEST ROLE
-          ->
-    DETERMINE SCOPE
-          ->
-    IDENTIFY TARGET ENTITY LEVEL
-          ->
-    IDENTIFY ADVISOR SAP IDs WHEN NEEDED
-          ->
-    QUERY BUSINESS DATA
-          ->
-    CALCULATE RESULT
-          ->
-    RESPOND
-
-For hierarchy-only questions:
-
-    IDENTIFY PERSON / ENTITY
-          ->
-    DETERMINE HIGHEST ROLE
-          ->
-    TRAVERSE HIERARCHY
-          ->
-    RESPOND
-
-The LLM does not execute these database operations itself. It expresses
-the semantic structure in QueryIR for downstream deterministic layers.
+(How a scope is established from a name is covered above under the
+highest-role rule.)
 
 =======================================================================
 27. OPERATIONAL INTERPRETATION
 =======================================================================
 
-Determine the operation from the COMPLETE semantic structure.
-
-Do NOT select an operation from one keyword.
-
-For example:
-
-    "under"
-
-does NOT automatically mean population.
-
-Compare:
+One hierarchy relationship, three different questions:
 
     "advisors under Faisal"
-
-with:
-
     "connects of advisors under Faisal"
-
-with:
-
     "top advisors under Faisal by connects"
 
-These are different query shapes even though they contain the same
-hierarchy relationship.
-
-Similarly:
+They share the word "under" and are not the same query shape. And
 
     "how many advisors under Faisal"
 
-does not change the target entity type.
+still targets Advisors — "how many" asks for the SIZE of that
+population, it does not change what the population is of.
 
-It still targets Advisors; "how many" asks for the size of that
-population.
-
-=======================================================================
-28. METRIC-BEARING HIERARCHY QUERIES
-=======================================================================
-
-When a query contains BOTH hierarchy scope language AND a metric:
-
-    hierarchy fields determine WHO is in scope
-    metric determines WHAT is reported
-    filters determine WHICH scoped entities qualify
-    sort/ranking determines HOW results are ordered
-
-Never discard a metric because hierarchy language is also present.
-
-Example:
-
-    "connects of advisors under Faisal"
-
-means:
-
-    scope person = Faisal
-    scope level = unit_head
-    target level = advisor
-    relation = subtree
-    metric = total_connects
-
-Example:
-
-    "top advisors under Faisal by connects"
-
-means:
-
-    scope person = Faisal
-    scope level = unit_head
-    target level = advisor
-    relation = subtree
-    metric = total_connects
-    ranking = descending
+WHICH operation each of those becomes is specified once, under
+OPERATION SELECTION in the output-schema section below. It is not
+restated here: two statements of one rule are two things to keep in
+agreement, and the pair had already drifted into different wordings.
 
 =======================================================================
 29. SALES FUNNEL AND BOOKINGS
@@ -1163,180 +773,6 @@ E. WHAT TIME PERIOD IS REQUESTED?
 
 Only after these semantic decisions should QueryIR fields be filled.
 
-=======================================================================
-35. REQUIRED INTERPRETATION EXAMPLES
-=======================================================================
-
-Question:
-
-    "Who is Faisal Hussain Naqvi?"
-
-Interpretation:
-
-    Faisal appears at multiple hierarchy levels.
-    Highest level = Unit Head.
-
-Therefore Faisal is primarily identified as a Unit Head.
-
------------------------------------------------------------------------
-
-Question:
-
-    "What team is Faisal in?"
-
-Interpretation:
-
-    Find rows where:
-        Unit Head = Faisal
-
-Return the corresponding Team value(s).
-
------------------------------------------------------------------------
-
-Question:
-
-    "How many advisors are under Faisal?"
-
-Interpretation:
-
-    Find rows where:
-        Unit Head = Faisal
-
-Count UNIQUE Advisor SAP IDs.
-
-This is a subtree/scope question.
-
------------------------------------------------------------------------
-
-Question:
-
-    "How many advisors report directly to Faisal?"
-
-Interpretation:
-
-    Find rows where:
-        Unit Head = Faisal
-        AND Zonal Head/Manager = Faisal
-        AND BCM = Faisal
-
-Count UNIQUE Advisor SAP IDs.
-
-This is a strict direct-report question.
-
------------------------------------------------------------------------
-
-Question:
-
-    "Who reports directly to Faisal?"
-
-Interpretation:
-
-    Same strict direct-report condition.
-
-Return Advisor names.
-
------------------------------------------------------------------------
-
-Question:
-
-    "Who are Faisal's zonals?"
-
-Interpretation:
-
-    Find unique Zonal Head/Manager values where:
-        Unit Head = Faisal
-
------------------------------------------------------------------------
-
-Question:
-
-    "Who are Faisal's BCMs?"
-
-Interpretation:
-
-    Find unique BCM values where:
-        Unit Head = Faisal
-
------------------------------------------------------------------------
-
-Question:
-
-    "How many advisors does Faisal have?"
-
-Interpretation:
-
-    By default:
-        Unit Head = Faisal
-
-Do NOT interpret this as direct reporting unless the user explicitly
-uses direct-reporting language.
-
------------------------------------------------------------------------
-
-Question:
-
-    "Which advisors directly report to the Unit Head in AMD?"
-
-Interpretation:
-
-    AMD identifies the Team scope.
-
-    "directly report" requires strict direct-report semantics.
-
-    "Unit Head" identifies the management level.
-
-    Do NOT invent a specific Unit Head person merely because a known
-    Unit Head happens to belong to AMD.
-
-    Preserve the Team scope and direct-report requirement in QueryIR.
-
-    If the QueryIR schema cannot represent an unspecified Unit Head
-    within a Team while preserving direct-report semantics, use the
-    valid clarification mechanism rather than inventing a person.
-
-=======================================================================
-36. CORE PRINCIPLE
-=======================================================================
-
-The hierarchy table is fundamentally an ADVISOR-CENTRIC ORGANIZATIONAL MAP.
-
-Each Advisor row describes the Advisor's complete reporting path.
-
-Therefore:
-
-    ONE ROW = ONE ADVISOR + ONE COMPLETE REPORTING PATH
-
-The chatbot must use COLUMN-BASED HIERARCHY FILTERING.
-
-Do NOT assume separate employee records exist for:
-
-    Unit Heads
-    Zonal Heads/Managers
-    BCMs
-
-The SAP ID is the unique identifier for the Advisor represented by each
-row.
-
-The name in the Unit Head, Zonal Head/Manager, and BCM columns is the
-person's hierarchy reference.
-
-When the same name appears in multiple hierarchy columns, it refers to
-the same person.
-
-The person's highest hierarchy occurrence determines their primary
-organisational identity.
-
-Most importantly:
-
-    "under" and "directly reporting to" are NOT equivalent.
-
-    "under" means the complete scope of the person's highest role.
-
-    "directly reporting to" requires the complete direct reporting path
-    through every intervening management column.
-
-The LLM must preserve these distinctions in QueryIR rather than
-approximating them.
 """
 
 
@@ -1661,8 +1097,10 @@ is named first.
 SUBJECT_LEVEL AND SUBJECTS MUST AGREE.
 
 When exactly one named subject is NOT a scope and the question asks for
-that entity's own figure, subject_level and the subject type describe
-the same entity.
+that entity's own figure, subject_level and subjects[0].type describe
+the same entity — so the two must agree. Emitting a group in "subjects"
+while "subject_level" says something else answers about a different
+entity than the one named.
 
 The two may legitimately differ for:
 
@@ -1714,25 +1152,38 @@ Use:
 - Asking a question that genuinely cannot be settled
   -> clarify_metric
 
-POPULATION VS FILTERED_LIST
+POPULATION vs RANKING
 
-Use population when the user asks WHO belongs to a population and does
-not impose a measure-based condition.
+Three shapes, separated by what the user asked to be DONE with a
+measure — not by whether a measure is mentioned.
 
-Examples:
+population — the question is WHO, and no measure is applied.
 
     "list the advisors in Blue Area"
     "advisors under Haseeb"
     "show all BCMs"
 
-A hierarchy or attribute scope is not automatically a metric filter.
+  Set "metric" to null for it. A hierarchy or attribute scope is not a
+  metric filter.
 
-Use filtered_list when the user imposes conditions on measures.
+  Do NOT invent a measure to rank a population by. Every measure is
+  read through its own table, and joining one DROPS the people who have
+  no row in it — so the list comes back shorter than the truth, with no
+  sign that anyone is missing. A ranking nobody asked for is not a
+  richer answer; it is a quieter wrong one.
 
-Examples:
+filtered_list — the question is WHO QUALIFIES, and a measure is the
+condition.
 
     "advisors with connects above 1000"
     "advisors under Haseeb with connects above 100"
+
+leaderboard — the user explicitly asked to ORDER by a measure.
+
+    "top advisors under Haseeb by connects"
+
+  Use it only when ranking was actually requested; see LEADERBOARD
+  below for the signals that count as asking.
 
 HIERARCHY-SCOPED METRICS
 
@@ -1891,6 +1342,22 @@ Hierarchy reads use:
 
 The scope entity goes in `subjects`.
 
+ALL THREE ARE NULL UNLESS THE QUERY IS ACTUALLY A HIERARCHY READ — that
+is, unless it names a scope entity AND asks for a level BENEATH it.
+They must agree with the question that was asked:
+
+    "top 3 teams by connects excluding Blue Area"   all three null
+    "advisors in Blue Area or DownTown"             all three null
+    "revenue by region"                             all three null
+    "advisors under Haseeb"                         target_level=advisor
+                                                    subject_of=unit_head
+
+Setting `target_level` because the query merely NAMES a level turns an
+ordinary ranking into a hierarchy read, and the answer is then scoped to
+a subtree the user never asked about. An attribute (company, office,
+region) is never `subject_of` or `target_level` — see the business
+model: it is not a step in the chain, so nothing sits "beneath" it.
+
 For a named Unit Head:
 
     subjects = [{{"type":"unit_head","value":"<name>"}}]
@@ -2022,62 +1489,12 @@ For operations supporting flat semantics:
 Set flat = true only when the user explicitly requests a flat or
 ungrouped list.
 
-HIERARCHY
+THE BUSINESS MODEL IS THE AUTHORITY
 
-The verified hierarchy is:
-
-{_chain_description()}
-
-The organisational attributes are:
-
-{_attribute_description()}
-
-Attributes do not become hierarchy traversal levels.
-
-ROLE INTERPRETATION
-
-{_role_vocabulary()}
-
-Only map a role when the user actually uses that role or an established
-role synonym.
-
-Do not infer a management role from a generic Team/company/region
-mention.
-
-BUSINESS MODEL
-
-The organisation's business semantics are defined by the authoritative
-business model above.
-
-If a field is ambiguous, re-read the business model before deciding.
-
-BOOKINGS RULE
-
-Never add bookings to a sales-funnel interpretation.
-
-If the user asks for a funnel, use only the sales-funnel concepts
-represented by the metric ontology.
-
-If the user explicitly asks about bookings, resolve bookings only if a
-valid booking metric exists.
-
-Never manufacture a booking metric.
-
-METRIC RULE
-
-Only use metric keys from the supplied metric catalog.
-
-Never invent a metric key.
-
-Do not confuse:
-
-    count with rate
-    rate with count
-    activity with performance
-    attendance with sales
-    team size with sales activity
-    connects with answered calls
-    counts with percentage rates
+The hierarchy, the role vocabulary, the funnel/bookings rule and the
+metric-key rules are stated once, in the authoritative business model
+above. Re-read it when a field is ambiguous; it is not repeated here,
+because two statements of one rule are two things to keep in agreement.
 
 PERIOD COMPARISON
 

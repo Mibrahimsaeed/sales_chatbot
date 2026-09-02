@@ -14,7 +14,9 @@ renders exactly as before (test 11), and a single-person answer is not a
 table (test 12).
 """
 
-from app.database.models import Advisor, Calls, Performance, PerformancePeriod
+from app.database.models import (
+    Advisor, Calls, Performance, PerformancePeriod, SalesFunnel,
+)
 from app.llm import aggregation
 from app.llm.query_compiler import compile_and_run
 from app.llm.query_ir import Filter, MetricRef, QueryIR, Sort, Subject
@@ -56,6 +58,11 @@ def _seed(db, wid, name, *, cleared=None, target=100, connects=None,
     if connects is not None or answered is not None:
         db.add(Calls(wid=wid, connects_mtd=connects or 0,
                      answered_calls_mtd=answered or 0))
+        # `total_connects` is the CCMC additive pair; `answered_calls*`
+        # stays on the Calls row above, which is the tab that owns it.
+        # Seeding both keeps each measure read from its own source.
+        db.add(SalesFunnel(wid=wid, mtd_new_connect=connects or 0,
+                           mtd_followup_connect=0))
 
 
 def _ir(**kw):

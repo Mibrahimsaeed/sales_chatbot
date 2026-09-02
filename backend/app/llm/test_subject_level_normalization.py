@@ -30,7 +30,7 @@ Synthetic entities throughout.
 
 import pytest
 
-from app.database.models import Advisor, Calls
+from app.database.models import Advisor, Calls, SalesFunnel
 from app.llm import entity_extractor
 from app.llm.ir_validator import validate_ir
 from app.llm.query_compiler import compile_and_run
@@ -51,6 +51,10 @@ def org(db_session):
                                rm="UH One", portfolio_lead="ZH One",
                                management_lead="BCM One", in_master_sheet=True))
         db_session.add(Calls(wid=wid, connects_mtd=10 * wid))
+        # `total_connects` reads the CCMC additive pair. Same figure as
+        # the Calls row, so every level's total below is unchanged.
+        db_session.add(SalesFunnel(wid=wid, mtd_new_connect=10 * wid,
+                                   mtd_followup_connect=0))
     db_session.commit()
     entity_extractor._cache["loaded_at"] = 0
     yield db_session

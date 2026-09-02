@@ -28,7 +28,9 @@ the old way compiles byte-identically, because the new fields default to
 
 import pytest
 
-from app.database.models import Advisor, Calls, Performance, PerformancePeriod
+from app.database.models import (
+    Advisor, Calls, Performance, PerformancePeriod, SalesFunnel,
+)
 from app.llm.query_compiler import (
     UncompilableFilterTree, compile_and_run, count_ir,
 )
@@ -55,6 +57,12 @@ def org(db_session):
                                rm="UH", portfolio_lead="ZH", management_lead=bcm,
                                in_master_sheet=True))
         db_session.add(Calls(wid=wid, connects_mtd=connects, answered_calls_mtd=connects // 10))
+        # `total_connects` is the CCMC additive pair (mtd_new_connect +
+        # mtd_followup_connect); the Calls row above still carries
+        # `answered_calls_mtd`, which is a different measure read from a
+        # different tab. Both are seeded so each is read from its own source.
+        db_session.add(SalesFunnel(wid=wid, mtd_new_connect=connects,
+                                   mtd_followup_connect=0))
         db_session.add(Performance(wid=wid, period=PerformancePeriod.MTD,
                                    cleared=cleared, target=100))
     db_session.commit()

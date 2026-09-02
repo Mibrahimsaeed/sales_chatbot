@@ -15,7 +15,9 @@ wrong. That is the class these tests exist to keep closed.
 
 import pytest
 
-from app.database.models import Advisor, Calls, Performance, PerformancePeriod
+from app.database.models import (
+    Advisor, Calls, Performance, PerformancePeriod, SalesFunnel,
+)
 from app.llm import entity_extractor, nlu_pipeline, operations, semantic_parser
 from app.llm.query_compiler import compile_and_run, count_ir
 from app.llm.query_ir import Filter, FilterGroup, MetricRef, QueryIR, Sort
@@ -36,6 +38,14 @@ def org(db_session, monkeypatch):
                                    cleared=wid * 10, target=100))
         if has_calls:
             db_session.add(Calls(wid=wid, connects_mtd=wid * 100, answered_calls_mtd=wid))
+            # The flag means "has a CONNECTS fact row", which is what the
+            # metric join drops on. `total_connects` reads the CCMC
+            # additive pair, so the row that decides it must be gated by
+            # the same flag — otherwise every advisor would have connects
+            # and the join would no longer shrink the population, which
+            # is the whole property this fixture exists to exercise.
+            db_session.add(SalesFunnel(wid=wid, mtd_new_connect=wid * 100,
+                                       mtd_followup_connect=0))
     db_session.commit()
     entity_extractor._cache["loaded_at"] = 0
     monkeypatch.setattr(semantic_parser, "call_llm_structured", lambda *a, **k: None)

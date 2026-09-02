@@ -27,7 +27,7 @@ any particular company.
 
 import pytest
 
-from app.database.models import Advisor, Calls
+from app.database.models import Advisor, Calls, SalesFunnel
 from app.llm import entity_extractor, hierarchy
 from app.llm.ir_validator import validate_ir
 from app.llm.metric_ontology import METRICS
@@ -56,6 +56,10 @@ def org(db_session):
                                rm=name, portfolio_lead=name, management_lead=name,
                                in_master_sheet=True))
         db_session.add(Calls(wid=wid, connects_mtd=_CONNECTS[wid]))
+        # `total_connects` reads the CCMC additive pair, so the same
+        # figure is seeded there; the per-level totals below are unchanged.
+        db_session.add(SalesFunnel(wid=wid, mtd_new_connect=_CONNECTS[wid],
+                                   mtd_followup_connect=0))
     db_session.commit()
     # The gazetteers `validate_ir` grounds subjects against are cached at
     # module level with a TTL, so a cache warmed by another test's fixture
