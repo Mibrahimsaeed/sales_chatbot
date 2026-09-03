@@ -128,8 +128,10 @@ def test_each_row_carries_all_three_measures(db, query, _level):
         assert row["value"] is not None
         # The primary joins the columns so the card can render the whole
         # table from one structure, with its own ranked value first.
+        # Team Size joins the connects bundle by reporting spec — appended
+        # last, so every existing column keeps its position.
         assert list(row[BUNDLE_COLUMNS_KEY]) == [
-            "total_connects", "answered_calls", "answered_calls_rate"]
+            "total_connects", "answered_calls", "answered_calls_rate", "team_size"]
 
 
 @pytest.mark.parametrize("query,_level", LEVELS)

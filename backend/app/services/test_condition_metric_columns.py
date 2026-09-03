@@ -355,7 +355,8 @@ def test_unconditional_bundled_leaderboard_keeps_its_bundle(db_session):
                  sort=Sort(metric="total_connects", direction="desc"), limit=10)
     keys, _ = _columns(db_session, ir)
 
-    assert keys == ["total_connects", "answered_calls", "answered_calls_rate"]
+    assert keys == ["total_connects", "answered_calls", "answered_calls_rate",
+                    "team_size"]
 
 
 # ---------------------------------------------------------------- 12

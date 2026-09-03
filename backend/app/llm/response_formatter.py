@@ -27,6 +27,14 @@ from app.llm.response_planner import plan_response
 from app.llm.query_compiler import effective_metric
 
 
+# Values a reply DERIVES rather than measures. They have no binding and no
+# ontology entry ON PURPOSE — nothing can query them, they only ever
+# accompany a figure that was measured — so their name and their unit are
+# stated here, at the one place that renders them.
+_DERIVED_LABELS = {"per_capita": "Per Capita"}
+_DERIVED_DECIMALS = {"per_capita": 2}
+
+
 def format_metric_value(metric_key: str | None, value) -> str:
     """One metric value, rendered with its unit.
 
@@ -50,6 +58,10 @@ def format_metric_value(metric_key: str | None, value) -> str:
 
     if value is None:
         return "no data"
+    # A derived ratio needs its own precision: rounded to whole numbers a
+    # per-capita of 1.5 and one of 2.4 both read as 2.
+    if metric_key in _DERIVED_DECIMALS:
+        return f"{value:,.{_DERIVED_DECIMALS[metric_key]}f}"
     if metric_key and is_percentage_metric(metric_key):
         return f"{value:,.1f}%".replace(".0%", "%")
     return f"{value:,.0f}"
@@ -733,6 +745,8 @@ def column_heading(metric_key: str | None) -> str:
     """
     from app.llm.metric_ontology import METRICS, measure_label
 
+    if metric_key in _DERIVED_LABELS:
+        return _DERIVED_LABELS[metric_key]
     label = measure_label(metric_key)
     metric = METRICS.get(metric_key)
     if metric and any(getattr(binding, "working_day_scaled", False)

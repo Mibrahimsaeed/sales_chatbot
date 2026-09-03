@@ -121,7 +121,13 @@ def test_meetings_bundles_its_rate():
                                  "client_registrations", "achievement_pct"])
 def test_every_other_measure_is_unbundled(key):
     """The bundle applies to two measures. Anything else answers exactly
-    as it did, which is what keeps this a targeted change."""
+    as it did, which is what keeps this a targeted change.
+
+    `client_registrations` STAYS here deliberately: its rate already
+    reaches the reader through `companion`, which states it in the
+    sentence, so bundling the pair as well would print the same figure
+    twice under two headings.
+    """
     assert bundle_for(key) == []
 
 

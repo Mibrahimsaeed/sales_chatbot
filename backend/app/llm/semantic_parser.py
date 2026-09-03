@@ -221,6 +221,89 @@ class Interpretation:
         return self.ir is not None
 
 
+def _resolve_unstated_person_level(ir, entities: dict, db: Session) -> None:
+    """A person named with no level is asked about at their HIGHEST role.
+
+    "connects of Naina" names a person and not a job. If Naina is a Unit
+    Head who also has an advisor row, answering from the advisor row is a
+    true statement about one row and a false one about her: it reports a
+    scope of one where the question meant her whole organisation.
+
+    THIS IS RESOLUTION, NOT REPAIR, and the difference is the user's own
+    words. Phase 11 switched off the rewrites that overruled a level the
+    query STATED; this fires only when the query stated none —
+    `entities["level_word"]` is empty — so nothing the user or the model
+    asserted is being contradicted. "connects of Naina as an advisor" and
+    "connects of unit head Naina" both name a level and are left exactly
+    as they are.
+
+    Reuses the existing ranking rather than adding one:
+    hierarchy_grounding.highest_level_of reads the levels a name grounds
+    at and picks the senior-most by hierarchy.CHAIN — the same answer
+    nlu_pipeline._authoritative_role gives on the rule-based path, so the
+    two paths cannot disagree about who somebody is.
+
+    Only ever promotes UP the chain, never down and never sideways.
+    """
+    from app.llm.nlu_pipeline import _ROLE_LEVELS
+
+    if entities.get("level_word"):
+        return                      # the query named a level; respect it
+    if len(ir.subjects) != 1:
+        return
+    subject = ir.subjects[0]
+    if subject.type not in _ROLE_LEVELS:
+        return                      # a team or an attribute is not a person
+
+    # A QUESTION ABOUT A PERSON IS NOT AN ENUMERATION.
+    #
+    # "connects of Naina" asks for HER figure. The model routinely returns
+    # target_level="advisor" with subject_of="unit_head" for it — a
+    # hierarchy read — and the answer then comes back as the eleven people
+    # under her, each with their own connects. Her own number is absent
+    # from a reply that looks entirely reasonable.
+    #
+    # A read enumerates a level, and this sentence names none: the same
+    # test that gates the promotion below, on the same evidence
+    # (`level_word`), settles this too. "advisors under Naina" names one
+    # and keeps its read; "connects of Naina as an advisor" names one and
+    # never reaches here at all.
+    if ir.target_level is not None:
+        routing.decide(
+            "Level", "not a hierarchy read",
+            f"the query names {subject.value!r} and no level to enumerate, so "
+            f"it asks for that person's own figure — the {ir.target_level!r} "
+            "reading would answer with the people beneath them instead",
+        )
+        ir.target_level = None
+        ir.subject_of = None
+        ir.relation = "subtree"
+
+    highest = hierarchy_grounding.highest_level_of(subject.value, db)
+    if highest is None or highest == subject.type:
+        return
+    if _ROLE_LEVELS.index(highest) >= _ROLE_LEVELS.index(subject.type):
+        return                      # nothing senior to promote to
+
+    routing.decide(
+        "Level", f"read {highest!r} not {subject.type!r}",
+        f"the query names {subject.value!r} and no level, and this person's "
+        f"own hierarchy puts them at {highest!r} — the senior role is who "
+        f"they are, and the {subject.type!r} reading is a scope of a "
+        "different size for the same name",
+    )
+    # BOTH fields, together. `subjects[].type` says what the subject IS
+    # and `subject_level` says where the answer is reported; moving one
+    # without the other is how a query comes to filter at one level and
+    # group at another.
+    was = subject.type
+    subject.type = highest
+    subject.resolved_id = subject.value
+    subject.resolved_wid = None     # a manager is addressed by name, not a wid
+    if ir.subject_level == was:
+        ir.subject_level = highest
+
+
 def interpret(text: str, entities: dict, db: Session,
               session_id: str | None = None) -> Interpretation:
     """THE mandatory first semantic step. Always calls the LLM.
@@ -275,6 +358,7 @@ def interpret(text: str, entities: dict, db: Session,
     # in the reply that it had happened. Conflicts now surface through
     # grounding (TYPE_MISMATCH) and validation, which reject or ask.
     result = validate_ir(ir, db, entities=entities, allow_semantic_repair=False)
+    _resolve_unstated_person_level(result.ir, entities, db)
     result.ir.nlu_mode = settings.nlu_mode
     model = from_query_ir(result.ir, level_word=entities.get("level_word"))
 

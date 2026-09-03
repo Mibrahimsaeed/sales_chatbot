@@ -127,9 +127,19 @@ def test_each_row_gets_its_own_wids_companion_values(db):
 
 def test_the_companion_matches_the_wid_keyed_service(db):
     """Same numbers as the single-person reply for that same wid — one
-    owner, so a person's row and their own answer cannot disagree."""
+    owner, so a person's row and their own answer cannot disagree.
+
+    TEAM SIZE IS EXEMPT, and deliberately so. The `team_size` metric read
+    at advisor level is 1 — its advisor binding is literal(1), so summing
+    one advisor row gives one. That is what the wid-keyed service returns
+    and it is the wrong answer to "Team Size": the size meant is the
+    person's TEAM. It is asserted against the team's headcount below
+    instead, which is the same owner every other headcount comes from.
+    """
     for row in _ask(db, "connects of all advisors")["data"]:
         for key, cell in row[BUNDLE_COLUMNS_KEY].items():
+            if key == "team_size":
+                continue
             assert cell["value"] == advisor_service.get_advisor_metric(
                 db, row["wid"], key), f"wid={row['wid']} {key}"
 
@@ -187,3 +197,16 @@ def test_a_single_person_query_is_unchanged(db):
     response = _ask(db, "connects of Unique Person")
     assert response["type"] == "advisor_metric"
     assert "400" in response["reply"]
+
+
+def test_team_size_is_the_advisors_team_not_one(db):
+    """The whole reason team_size is exempt above: the per-advisor read
+    is 1 for everybody, which renders as a plausible column of ones."""
+    from app.llm import aggregation
+
+    rows = _ask(db, "connects of all advisors")["data"]
+    assert rows, "no rows to check"
+    for row in rows:
+        cell = row[BUNDLE_COLUMNS_KEY]["team_size"]["value"]
+        assert cell == aggregation.headcount(db, "team", row["team"])
+        assert cell != 1.0 or aggregation.headcount(db, "team", row["team"]) == 1

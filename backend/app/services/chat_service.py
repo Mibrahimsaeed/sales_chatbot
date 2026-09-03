@@ -48,7 +48,7 @@ from app.services import (
 from app.core import audit, tracing
 from app.core.exception import NotFoundError
 from app.core.logger import get_logger
-from app.database.models import ChatLog
+from app.database.models import Advisor, ChatLog
 
 log = get_logger("services.chat_service")
 
@@ -523,6 +523,14 @@ def _dispatch(db: Session, resolution: Resolution, session_id: str | None = None
             db, answered, requested,
             lambda key: advisor_service.get_advisor_metric(db, advisor["wid"], key),
             plan.period,
+            # TEAM SIZE FOLLOWS THE PERSON'S ROLE, not the code path. An
+            # advisor has no team of their own, and a headcount beside
+            # their own connects reads as though the figure covered one.
+            # A manager answered here — the profile path serves them too —
+            # keeps it, because for them the number IS a group's.
+            team_size=_team_size_for_person(db, advisor.get("name"),
+                                            team=advisor.get("team"),
+                                            wid=advisor.get("wid")),
         )
         if bundle:
             block = format_metric_bundle(advisor["name"], bundle)
@@ -732,6 +740,18 @@ def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
     # `keys` is exactly what bundle_for returned and every existing
     # leaderboard renders unchanged.
     keys = _ordered_unique(([primary] if primary else []) + bundle + named + conditions)
+    # Team Size joins the answers that report it. Appended last so every
+    # existing column keeps its position, and only for those families, so
+    # no other leaderboard gains a column.
+    # Per Capita is DERIVED from two columns already on the row, so it is
+    # appended after them and computed below rather than fetched.
+    shows_per_capita = (_carries_per_capita(primary)
+                        and ir.grouping_level() != "advisor")
+    # Pipeline reports no headcount of its own; it gains one only where a
+    # per-capita is being shown, so an ADVISOR pipeline ranking renders
+    # exactly as it did before.
+    if (_carries_team_size(primary) or shows_per_capita) and "team_size" not in keys:
+        keys = keys + ["team_size"]
     # The bundle alone still needs two measures to be worth a table. A
     # CONDITION or a second NAMED measure earns its column at one: the
     # user named that metric, and "advisors with achievement below 50%"
@@ -754,8 +774,19 @@ def _attach_bundle_columns(db: Session, ir, rows) -> list[str]:
                 "display": _MISSING_CELL if value is None else format_metric_value(key, value),
                 "label": column_heading(key),
             }
+        if shows_per_capita:
+            # Both operands are the values already rendered on this row,
+            # so the division cannot disagree with the columns beside it.
+            value = _per_capita(cells[primary]["value"],
+                                cells["team_size"]["value"])
+            cells[_PER_CAPITA] = {
+                "value": value,
+                "display": _MISSING_CELL if value is None
+                else format_metric_value(_PER_CAPITA, value),
+                "label": column_heading(_PER_CAPITA),
+            }
         row[BUNDLE_COLUMNS_KEY] = cells
-    return keys
+    return keys + ([_PER_CAPITA] if shows_per_capita else [])
 
 
 _MISSING_CELL = "—"
@@ -820,6 +851,13 @@ def _companion_value(db: Session, ir, row, key: str):
     single-person reply already uses, and aggregation.metric_value is the
     scope-keyed one comparisons and summaries read.
     """
+    # TEAM SIZE IS NOT READ AT ADVISOR LEVEL. The metric's advisor binding
+    # is literal(1), so get_advisor_metric would return 1 for every row —
+    # a real number, correctly computed, for a question nobody asked. The
+    # size meant here is the row's TEAM.
+    if key == "team_size":
+        return _team_size_for(db, ir.subject_level, row.get("name"),
+                              team=row.get("team"), wid=row.get("wid"))
     if ir.subject_level == "advisor":
         wid = row.get("wid")
         if wid is None:
@@ -828,7 +866,95 @@ def _companion_value(db: Session, ir, row, key: str):
     return aggregation.metric_value(db, ir.subject_level, row.get("name"), key)
 
 
-def _metric_bundle_values(db: Session, answered, requested, fetch, period):
+# The measures whose answer carries a Team Size, by PERIOD FAMILY so the
+# MTD and YTD members of each are covered without a second list. Declared
+# rather than inferred: "which answers show headcount" is a reporting
+# decision, not a property of a metric.
+_TEAM_SIZE_FAMILIES = frozenset({
+    "connects", "client_registrations", "cr_rate", "meetings", "conversions",
+})
+
+# The measures reported PER HEAD as well as in total. A per-capita figure
+# only means something when the row is a GROUP: an advisor's own count
+# over their team's size is one person's work divided by their
+# colleagues, which is not a rate anybody asked for — so the level, not
+# just the measure, decides whether the column appears.
+_PER_CAPITA_FAMILIES = frozenset({"client_registrations", "meetings", "pipeline"})
+_PER_CAPITA = "per_capita"
+
+
+def _per_capita(total, team_size) -> float | None:
+    """`total` spread over `team_size`, or None when that cannot be said.
+
+    None for a missing or zero headcount — never an exception and never a
+    zero, which would read as "none per head" rather than "no team to
+    divide by". The formatter renders None as no data, the same as every
+    other absent cell.
+    """
+    if total is None or not team_size:
+        return None
+    return float(total) / float(team_size)
+
+
+def _carries_team_size(metric_key: str | None) -> bool:
+    from app.llm.metric_ontology import METRICS
+
+    metric = METRICS.get(metric_key) if metric_key else None
+    return bool(metric and metric.period_family in _TEAM_SIZE_FAMILIES)
+
+
+def _carries_per_capita(metric_key: str | None) -> bool:
+    from app.llm.metric_ontology import METRICS
+
+    metric = METRICS.get(metric_key) if metric_key else None
+    return bool(metric and metric.period_family in _PER_CAPITA_FAMILIES)
+
+
+def _team_size_for_person(db: Session, name: str | None, *,
+                          team: str | None = None,
+                          wid: int | None = None) -> float | None:
+    """Team Size for a NAMED PERSON, or None when they are only an advisor.
+
+    Reuses the highest-role resolution rather than asking which code path
+    is running: "does this person manage anybody" is the same question
+    however the reply was routed, and answering it twice is how the two
+    routes would come to disagree.
+    """
+    from app.llm.hierarchy_grounding import highest_level_of
+
+    if not name or highest_level_of(name, db) == "advisor":
+        return None
+    return _team_size_for(db, team=team, wid=wid)
+
+
+def _team_size_for(db: Session, level: str | None = None, value: str | None = None,
+                   *, team: str | None = None, wid: int | None = None) -> float | None:
+    """Team Size as a reader means it.
+
+    For a GROUP that is the group's own headcount. For a PERSON it is the
+    size of THEIR TEAM — deliberately NOT the `team_size` metric read at
+    advisor level, which is 1: its advisor binding is literal(1), so
+    summing one advisor row gives one. That number is arithmetically
+    honest and answers a question nobody asked, and nlu_pipeline already
+    carries a comment calling it "a plausible-looking wrong answer".
+
+    Counted by aggregation.headcount, the same owner comparisons and
+    summaries already use — so this adds a READ, not a calculation, and
+    cannot disagree with the headcount shown anywhere else.
+    """
+    if team is None and wid is not None:
+        advisor = db.query(Advisor.team).filter(Advisor.wid == wid).first()
+        team = advisor.team if advisor else None
+    if team:
+        return float(aggregation.headcount(db, "team", team))
+    # A person with no team has no team size; a group counts itself.
+    if level and value and level != "advisor":
+        return float(aggregation.headcount(db, level, value))
+    return None
+
+
+def _metric_bundle_values(db: Session, answered, requested, fetch, period,
+                          team_size: float | None = None):
     """The bundled measures for one subject, as [(key, value), ...].
 
     Phase 29. The ontology says WHICH measures answer together
@@ -857,7 +983,13 @@ def _metric_bundle_values(db: Session, answered, requested, fetch, period):
         return []
 
     known = {primary_key: primary_value}
-    return [(key, known[key] if key in known else fetch(key)) for key in keys]
+    entries = [(key, known[key] if key in known else fetch(key)) for key in keys]
+    # Team Size rides along on the answers that report it, valued through
+    # the helper above rather than through `fetch` — `fetch` is the
+    # advisor/group value owner, and for a person it would return 1.
+    if team_size is not None and _carries_team_size(primary_key):
+        entries.append(("team_size", team_size))
+    return entries
 
 
 def _team_member_rows(db: Session, ir) -> list | None:
@@ -967,6 +1099,14 @@ def _dispatch_ir(db: Session, resolution: Resolution, session_id: str | None = N
             db, [(primary, rows[0].get("value"))], [primary],
             lambda key: aggregation.metric_value(db, ir.subject_level, subject, key),
             period,
+            # Not for an advisor: this is one person's own figure, and a
+            # headcount beside it reads as though the number covered a
+            # team. A manager asked about without a level is promoted to
+            # their senior role before reaching here, so the headcount
+            # shown is always the scope of the figure it sits under.
+            team_size=(None if ir.subject_level == "advisor"
+                       else _team_size_for(db, ir.subject_level, subject,
+                                           team=rows[0].get("team"))),
         )
         if bundle:
             block = format_metric_bundle(subject, bundle)

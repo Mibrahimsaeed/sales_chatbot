@@ -2977,30 +2977,6 @@ means:
         team = Blue Area
     )
 
-HIERARCHY READS & METRIC SCOPING GUARDRAILS
-
-`target_level`, `subject_of`, and `relation` MUST ALL REMAIN NULL UNLESS
-THE QUERY IS AN EXPLICIT HIERARCHY READ TRAVERSAL.
-
-A named team (e.g., 'AMD' or 'Team A') being used as a scope or filter
-for a metric query (e.g. 'connects of unit head in AMD') is NOT a hierarchy
-read traversal.
-
-For 'connects of unit head in AMD':
-- `subject_level` = "unit_head"
-- `metric` = "total_connects"
-- `subjects` = [{{ "type": "team", "name": "AMD" }}]
-- `target_level` = null
-- `subject_of` = null
-- `relation` = null
-
-CRITICAL HIERARCHY RULE:
-- Units Heads sit UNDER Teams (a Team contains Unit Heads).
-- Do NOT invert parent/child relationships.
-- Prepositions like 'in', 'under', 'for', 'of' attached to a named Group
-  (e.g., Team AMD) make that named Group a direct filter/scope in `subjects`.
-  They MUST NOT trigger a hierarchy relationship question or clarification.
-
 Hierarchy reads use:
 
     target_level
@@ -3018,12 +2994,7 @@ Head scoped to the team TEAM-A, so subjects=[team TEAM-A] and
 subject_of=unit_head.
 The role is never itself a subject — no entity of that name was named.
 
-`relation`:
-
-    direct  = strict immediate/direct reporting
-    subtree = everyone beneath at any depth
-
-The scope entity goes in `subjects`.
+`relation`: direct = immediate reporting, subtree = everyone beneath.
 
 ALL THREE ARE NULL UNLESS THE QUERY IS ACTUALLY A HIERARCHY READ — that
 is, unless it names a scope entity AND asks for a level BENEATH it.
@@ -3031,7 +3002,8 @@ They must agree with the question that was asked:
 
     "advisors in Blue Area or DownTown"             all three null
     "connects of Blue Area"                         all three null
-    "connects of unit head in AMD"                  all three null
+    "connects of unit head in TEAM-A"               all three null
+        (a metric scoped to a group: subject_level=unit_head)
     "advisors under Haseeb"                         target_level=advisor
                                                     subject_of=unit_head
     "connects of advisors in Blue Area"             target_level=advisor
