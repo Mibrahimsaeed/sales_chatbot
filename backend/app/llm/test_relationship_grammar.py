@@ -170,6 +170,27 @@ def test_the_prompt_defines_subject_of_as_the_manager_level():
     assert "level of the scope entity" not in prompt
 
 
+def test_the_prompt_says_subjects_is_never_empty_for_a_role_manager():
+    """THE SCOPE-LOSS RULE. The prompt taught `subjects` as "the manager
+    you named" — two worked patterns, one for a named Unit Head and one
+    for a named Team. A query naming the manager by ROLE ("the unit head
+    in AMD") fits neither, so the slot went empty and the group went with
+    it. Measured: eight equivalent phrasings, scope lost on all eight."""
+    prompt = _prompt()
+    assert "ALWAYS HOLDS THE ENTITY THE QUERY NAMES" in prompt
+    assert "named by ROLE instead of by name" in prompt
+
+
+def test_the_prompt_attaches_in_x_as_scope():
+    """"in X"/"within X"/"at X" attach X as the scope. The prompt also
+    says "advisors in North Region" is a FILTER — true for an attribute
+    and the source of the confusion, so the two rules are now stated
+    together: what was named decides, not the word."""
+    prompt = _prompt()
+    assert '"in X", "within X", "at X" attach X as the SCOPE' in prompt
+    assert "what was named decides, not the word" in prompt
+
+
 def test_the_prompt_says_directly_does_not_create_the_relationship():
     assert "does not\ncreate it" in _prompt() or "does not create it" in _prompt()
 
@@ -206,12 +227,18 @@ def test_the_model_reads_every_reporting_phrasing_the_same_way(capsys):
     for text, shape in shapes.items():
         print(f"  {text}\n      {json.dumps(shape)}")
 
+    # SCOPE FIRST — it is the property this round fixed, and reporting it
+    # before the rest means a regression names itself.
+    for text, shape in shapes.items():
+        assert ("amd", "team") in shape["scope"], (
+            f"SCOPE LOST for {text!r}: ir_subjects={shape.get('ir_subjects')} "
+            f"ir_missing={shape.get('ir_missing')} scope={shape['scope']}")
+
     for text, shape in shapes.items():
         assert shape["requested_level"] == "advisor", f"{text}: {shape}"
         assert shape["relationship"] is not None, f"{text}: no relationship"
         assert shape["relationship"][1] == "direct", f"{text}: {shape}"
         assert shape["relationship"][2] == "unit_head", f"{text}: manager lost"
-        assert ("amd", "team") in shape["scope"], f"{text}: scope lost"
 
     assert len({json.dumps(s, sort_keys=True) for s in shapes.values()}) == 1, \
         "equivalent phrasings produced different structures"
@@ -240,3 +267,5 @@ def test_containment_phrasings_stay_subtree():
     for text, shape in shapes.items():
         assert shape["relationship"] is not None, f"{text}: no relationship"
         assert shape["relationship"][1] == "subtree", f"{text}: {shape}"
+        assert ("amd", "team") in shape["scope"], (
+            f"SCOPE LOST for {text!r}: {shape}")
